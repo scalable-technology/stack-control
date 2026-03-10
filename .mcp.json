@@ -1,12 +1,8 @@
 {
   "mcpServers": {
-    "scalable": {
-      "command": "ssh",
-      "args": ["-p", "2222", "git@localhost", "mcp", "/tyrauber/scalable"]
-    },
     "everytask": {
       "command": "ssh",
-      "args": ["-p", "2223", "git@localhost", "mcp", "/tyrauber/scalable"]
+      "args": ["-p", "2223", "git@localhost", "mcp", "/tyrauber/control"]
     }
   }
 }

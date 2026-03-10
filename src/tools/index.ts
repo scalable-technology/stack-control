@@ -9,6 +9,7 @@ import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { siliconTool } from './silicon.js';
 import { kernelTool } from './kernel.js';
 import { discoverTool } from './discover.js';
+import { nativeTool } from './native.js';
 
 /**
  * All available Control tools
@@ -17,10 +18,10 @@ export const tools: Tool[] = [
   siliconTool,
   kernelTool,
   discoverTool,
+  nativeTool,
   // Future layers (placeholders for now):
   // reactTool,      // Port from metro-devtools.ts
   // bridgeTool,     // Port from react-native.ts
-  // nativeTool,     // Port from lldb.ts + logs.ts
   // metalTool,      // Build new
   // deviceTool,     // Port from devices.ts
 ];
