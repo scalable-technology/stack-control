@@ -2,15 +2,10 @@
  * control/discover — Reverse Engineering Layer
  *
  * Tools for discovering undocumented behavior through controlled exploration.
- *
- * Philosophy: Controlled failure is learning.
- * When we crash to find the alignment limit, we document it.
- * When we hit the compile limit, we record it.
- * Knowledge is extracted from the edges of behavior.
+ * Read-only inspection tools. Use everytask dev({ method: "learn" }) to persist discoveries.
  *
  * Methods:
- * - discoveries   List known discoveries
- * - record        Record a new discovery
+ * - discoveries   List known discoveries (hardcoded reference)
  * - frameworks    List private frameworks
  * - symbols       Extract symbols from a binary/framework
  */
@@ -34,7 +29,7 @@ interface Discovery {
 }
 
 // =============================================================================
-// Known Discoveries (earned through crashes)
+// Known Discoveries (reference data - earned through crashes)
 // =============================================================================
 
 const KNOWN_DISCOVERIES: Discovery[] = [
@@ -72,9 +67,6 @@ const KNOWN_DISCOVERIES: Discovery[] = [
   },
 ];
 
-// In-memory storage for new discoveries (would persist to DB in full implementation)
-const sessionDiscoveries: Discovery[] = [];
-
 // =============================================================================
 // Input Schemas
 // =============================================================================
@@ -82,15 +74,6 @@ const sessionDiscoveries: Discovery[] = [];
 const DiscoveriesInput = z.object({
   method: z.literal('discoveries'),
   target: z.string().optional().describe('Filter by target (e.g., "ane")'),
-});
-
-const RecordInput = z.object({
-  method: z.literal('record'),
-  target: z.string(),
-  parameter: z.string(),
-  limit: z.unknown(),
-  discoveryMethod: z.enum(['fuzz', 'crash', 'observation', 'documentation']),
-  notes: z.string().optional(),
 });
 
 const FrameworksInput = z.object({
@@ -107,7 +90,6 @@ const SymbolsInput = z.object({
 
 const DiscoverInput = z.discriminatedUnion('method', [
   DiscoveriesInput,
-  RecordInput,
   FrameworksInput,
   SymbolsInput,
 ]);
@@ -117,7 +99,7 @@ const DiscoverInput = z.discriminatedUnion('method', [
 // =============================================================================
 
 function handleDiscoveries(input: z.infer<typeof DiscoveriesInput>): ToolResult {
-  let discoveries = [...KNOWN_DISCOVERIES, ...sessionDiscoveries];
+  let discoveries = [...KNOWN_DISCOVERIES];
 
   if (input.target) {
     discoveries = discoveries.filter(
@@ -130,28 +112,7 @@ function handleDiscoveries(input: z.infer<typeof DiscoveriesInput>): ToolResult 
     data: {
       count: discoveries.length,
       discoveries,
-      note: 'These discoveries were earned through crashes, observation, and documentation.',
-    },
-  };
-}
-
-function handleRecord(input: z.infer<typeof RecordInput>): ToolResult {
-  const discovery: Discovery = {
-    target: input.target,
-    parameter: input.parameter,
-    limit: input.limit,
-    discovered_at: new Date().toISOString(),
-    method: input.discoveryMethod,
-    notes: input.notes,
-  };
-
-  sessionDiscoveries.push(discovery);
-
-  return {
-    success: true,
-    data: {
-      recorded: discovery,
-      message: 'Discovery recorded for this session. Would persist to DB in full implementation.',
+      note: 'Reference data. Use dev({ method: "learn" }) to persist new discoveries.',
     },
   };
 }
@@ -200,7 +161,7 @@ function handleFrameworks(input: z.infer<typeof FrameworksInput>): ToolResult {
       count: frameworks.length,
       privateCount: frameworks.filter((f) => f.private).length,
       publicCount: frameworks.filter((f) => !f.private).length,
-      frameworks: frameworks.slice(0, 200), // Limit output
+      frameworks: frameworks.slice(0, 200),
       note:
         frameworks.length > 200
           ? `Showing 200 of ${frameworks.length}. Use filter to narrow results.`
@@ -228,7 +189,7 @@ function handleSymbols(input: z.infer<typeof SymbolsInput>): ToolResult {
     // Use nm to extract symbols
     const nmOutput = execSync(`nm -gU "${binaryPath}" 2>/dev/null || nm "${binaryPath}" 2>/dev/null`, {
       encoding: 'utf-8',
-      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      maxBuffer: 10 * 1024 * 1024,
       timeout: 30000,
     });
 
@@ -298,16 +259,13 @@ function handleSymbols(input: z.infer<typeof SymbolsInput>): ToolResult {
 
 export const discoverTool: Tool = {
   name: 'discover',
-  description: `Reverse engineering through controlled exploration.
+  description: `Reverse engineering through controlled exploration. Read-only inspection tools.
 
 **Methods:**
 
-• **discoveries** - List known discoveries
+• **discoveries** - List known discoveries (reference data)
   \`discover({ method: "discoveries" })\`
   \`discover({ method: "discoveries", target: "ane" })\`
-
-• **record** - Record a new discovery
-  \`discover({ method: "record", target: "ane", parameter: "max_tensor_rank", limit: 5, discoveryMethod: "crash" })\`
 
 • **frameworks** - List private frameworks
   \`discover({ method: "frameworks" })\`
@@ -316,36 +274,19 @@ export const discoverTool: Tool = {
 • **symbols** - Extract symbols from binary/framework
   \`discover({ method: "symbols", path: "/System/Library/PrivateFrameworks/ANECompiler.framework" })\`
 
-Philosophy: Controlled failure is learning. Knowledge is extracted from the edges of behavior.`,
+To persist new discoveries, use: dev({ method: "learn", topic: "...", content: "..." })`,
 
   inputSchema: {
     type: 'object',
     properties: {
       method: {
         type: 'string',
-        enum: ['discoveries', 'record', 'frameworks', 'symbols'],
+        enum: ['discoveries', 'frameworks', 'symbols'],
         description: 'Discovery operation to perform',
       },
       target: {
         type: 'string',
-        description: 'Target system (discoveries, record)',
-      },
-      parameter: {
-        type: 'string',
-        description: 'Parameter discovered (record)',
-      },
-      limit: {
-        oneOf: [{ type: 'number' }, { type: 'string' }, { type: 'object' }],
-        description: 'Discovered limit value (record) or max results (symbols)',
-      },
-      discoveryMethod: {
-        type: 'string',
-        enum: ['fuzz', 'crash', 'observation', 'documentation'],
-        description: 'How was this discovered (record)',
-      },
-      notes: {
-        type: 'string',
-        description: 'Additional notes (record)',
+        description: 'Target system (discoveries)',
       },
       filter: {
         type: 'string',
@@ -354,6 +295,10 @@ Philosophy: Controlled failure is learning. Knowledge is extracted from the edge
       path: {
         type: 'string',
         description: 'Path to binary/framework (symbols)',
+      },
+      limit: {
+        type: 'number',
+        description: 'Max results (symbols)',
       },
     },
     required: ['method'],
@@ -373,8 +318,6 @@ Philosophy: Controlled failure is learning. Knowledge is extracted from the edge
     switch (input.method) {
       case 'discoveries':
         return handleDiscoveries(input);
-      case 'record':
-        return handleRecord(input);
       case 'frameworks':
         return handleFrameworks(input);
       case 'symbols':
