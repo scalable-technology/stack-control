@@ -12,6 +12,7 @@ import { discoverTool } from './discover.js';
 import { nativeTool } from './native.js';
 import { reactTool } from './react.js';
 import { bridgeTool } from './bridge.js';
+import { deviceTool } from './device.js';
 
 /**
  * All available Control tools
@@ -23,9 +24,9 @@ export const tools: Tool[] = [
   nativeTool,
   reactTool,
   bridgeTool,
-  // Future layers (placeholders for now):
-  // metalTool,      // Build new
-  // deviceTool,     // Port from devices.ts
+  deviceTool,
+  // Future:
+  // metalTool,      // Build new - IOKit, private framework access
 ];
 
 /**
