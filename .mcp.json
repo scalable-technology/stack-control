@@ -3,6 +3,11 @@
     "everytask": {
       "command": "ssh",
       "args": ["-p", "2223", "git@localhost", "mcp", "/tyrauber/control"]
+    },
+    "control": {
+      "command": "node",
+      "args": ["dist/cli.js"],
+      "cwd": "/Users/tyrauber/Sites/control"
     }
   }
 }
