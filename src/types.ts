@@ -2,6 +2,10 @@
  * Control Types
  */
 
+// =============================================================================
+// Tool System
+// =============================================================================
+
 export interface ToolResult {
   success: boolean;
   data?: unknown;
@@ -10,8 +14,14 @@ export interface ToolResult {
 }
 
 export interface ToolContext {
-  db?: { connectionString: string };
   workspaceRoot?: string;
+}
+
+export interface Tool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (input: unknown, context: ToolContext) => Promise<ToolResult>;
 }
 
 // Layer prefixes for tool naming

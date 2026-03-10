@@ -9,16 +9,21 @@
  * - control/silicon  — ANE, GPU, memory buffers, IOSurfaces
  * - control/discover — Reverse engineering, probing, fuzzing
  * - control/kernel   — Kernel-level tracing, crash analysis
+ *
+ * Philosophy:
+ * We respect locks that protect the user.
+ * We question locks that constrain the user.
+ * We document what we find.
  */
 
-// Layer exports
-export * from './react';
-export * from './bridge';
-export * from './native';
-export * from './metal';
-export * from './silicon';
-export * from './discover';
-export * from './kernel';
+// Server exports
+export { createControlServer, runControlServer, type ControlServerConfig } from './server.js';
 
-// Re-export types
-export * from './types';
+// Tool exports
+export { tools, getTool, executeTool } from './tools/index.js';
+export { siliconTool } from './tools/silicon.js';
+export { kernelTool } from './tools/kernel.js';
+export { discoverTool } from './tools/discover.js';
+
+// Type exports
+export * from './types.js';

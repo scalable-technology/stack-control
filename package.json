@@ -5,9 +5,13 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "control": "./dist/cli.js"
+  },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsc",
+    "start": "node dist/cli.js",
     "test": "vitest",
     "lint": "eslint src"
   },
@@ -21,7 +25,10 @@
     "apple-neural-engine",
     "reverse-engineering",
     "turbomodules",
-    "native"
+    "native",
+    "apple-silicon",
+    "ios",
+    "macos"
   ],
   "author": "Ty Rauber & Claude",
   "license": "MIT",
@@ -30,6 +37,7 @@
     "url": "https://github.com/scalable-technology/control"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.23.0",
     "ws": "^8.17.0"
   },
