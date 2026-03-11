@@ -274,10 +274,16 @@ class MetroDevToolsClient extends EventEmitter {
           return { error: 'No React renderers found' };
         }
 
-        const renderer = renderers.values().next().value;
-        if (!renderer) return { error: 'Could not get renderer' };
+        // Find a renderer that has fiber roots
+        let roots = null;
+        for (const [id, renderer] of renderers) {
+          const r = hook.getFiberRoots(id);
+          if (r && r.size > 0) {
+            roots = r;
+            break;
+          }
+        }
 
-        const roots = hook.getFiberRoots(renderer.rendererID || 1);
         if (!roots || roots.size === 0) {
           return { error: 'No Fiber roots found' };
         }
