@@ -217,26 +217,22 @@ All layers implemented and working:
 ## Getting Started
 
 ```bash
-# Clone and build
-git clone https://github.com/tyrauber/control
-cd control
-pnpm install
-pnpm build
+npm install -g @scalable-technology/control
+```
 
-# Add to Claude Code (in your project's .mcp.json)
+Add to Claude Code (`.mcp.json`):
+```json
 {
   "mcpServers": {
     "control": {
-      "command": "node",
-      "args": ["/path/to/control/dist/mcp.js"]
+      "command": "npx",
+      "args": ["@scalable-technology/control"]
     }
   }
 }
-
-# Or add globally (~/.claude/settings.json under mcpServers)
 ```
 
-Then use the tools via MCP:
+Then use the tools:
 ```javascript
 react({ method: "tree" })
 bridge({ method: "module_list" })
