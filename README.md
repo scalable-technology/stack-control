@@ -44,74 +44,81 @@ One toolchain. Every layer. Full control.
 
 ## The Layers
 
-### `control/react`
-Inspect and manipulate the React component tree.
+### `react`
+Inspect the React component tree via Metro DevTools.
 
-```bash
-control/react tree                    # Full component tree with props/state
-control/react find Marker             # Find components by name
-control/react eval "myRef.current"    # Execute JS in app context
+```javascript
+react({ method: "status" })                          // List debuggable apps
+react({ method: "connect" })                         // Connect to Metro
+react({ method: "tree", maxDepth: 10 })              // Full component tree
+react({ method: "find", displayName: "Button" })     // Find components by name
+react({ method: "props", componentName: "Header" })  // Get props/state
+react({ method: "evaluate", expression: "..." })     // Execute JS in app context
 ```
 
-### `control/bridge`
-Understand and verify the native-to-JS boundary.
+### `bridge`
+Verify the native-to-JS boundary (TurboModules).
 
-```bash
-control/bridge status                 # List all TurboModules with health
-control/bridge status NativeANEModule # Detailed module status
-control/bridge diff NativeANEModule   # Compare iOS vs Android implementations
-control/bridge codegen                # Trace spec → codegen → native impl
+```javascript
+bridge({ method: "module_list" })                     // List all TurboModules with health
+bridge({ method: "module_list", status: "broken" })   // Filter by status
+bridge({ method: "module_status", name: "MyModule" }) // Detailed module status
+bridge({ method: "platform_diff", name: "MyModule" }) // Compare iOS vs Android
+bridge({ method: "type_mappings" })                   // Show platform type equivalences
 ```
 
-### `control/native`
-Debug native code (Swift, Objective-C, Kotlin, Java).
+### `native`
+Full LLDB integration for native debugging.
 
-```bash
-control/native crash                  # Full crash context in one call
-control/native build ios              # Analyze Xcode build logs
-control/native lldb attach            # Start LLDB session
-control/native lldb break main        # Set breakpoint
-control/native lldb bt                # Backtrace
+```javascript
+// Batch (stateless)
+native({ method: "crash_run", binary: "./test" })     // Run and capture crash
+native({ method: "memory_read", address: "0x..." })   // Read memory
+
+// Interactive (session-based)
+native({ method: "session_attach", binary: "./test" })
+native({ method: "breakpoint_set", sessionId: "...", location: "main" })
+native({ method: "continue", sessionId: "..." })
+native({ method: "backtrace", sessionId: "..." })
 ```
 
-### `control/metal`
-Access hardware APIs and private frameworks.
+### `device`
+iOS Simulator and Android Emulator management.
 
-```bash
-control/metal frameworks              # List private frameworks
-control/metal symbols ANECompiler     # Dump symbols from framework
-control/metal trace ./train           # Trace IOKit/syscalls
-control/metal iokit services          # List IOKit services in use
+```javascript
+device({ method: "list" })                            // List simulators/emulators
+device({ method: "boot", deviceId: "...", platform: "ios" })
+device({ method: "screenshot", deviceId: "..." })
+device({ method: "crash_logs", appName: "MyApp" })
+device({ method: "fingerprint" })                     // Detect native code changes
 ```
 
-### `control/silicon`
-Direct hardware control — ANE, GPU, memory buffers.
+### `silicon`
+Direct hardware control — ANE validation.
 
-```bash
-control/silicon ane status            # ANE compiler state, compile count
-control/silicon ane validate [1,32,1,513]  # Validate shape before kernel panic
-control/silicon ane profile ./train   # Profile ANE utilization
-control/silicon read 0x1F8A00000      # Read IOSurface memory
-control/silicon gpu utilization       # GPU stats
+```javascript
+silicon({ method: "ane_validate", dimensions: [1, 32, 32, 64], dtype: "fp16" })
+silicon({ method: "ane_status" })                     // ANE compiler state
+silicon({ method: "ane_info" })                       // Device capabilities
 ```
 
-### `control/discover`
+### `kernel`
+Kernel-level crash analysis.
+
+```javascript
+kernel({ method: "panic_list", limit: 5 })            // List recent kernel panics
+kernel({ method: "panic_analyze", path: "/path/to/panic.log" })
+kernel({ method: "panic_parse", log: "..." })         // Parse panic log content
+```
+
+### `discover`
 Reverse engineering and exploration tools.
 
-```bash
-control/discover probe ane.shape --fuzz 500-520  # Find limits through controlled failure
-control/discover map ANECompilerService          # Memory map a process
-control/discover diff state1 state2              # What changed?
-control/discover limits ane                      # Document discovered limits
-```
-
-### `control/kernel`
-When you need to go all the way down.
-
-```bash
-control/kernel trace ./train          # Kernel-level tracing
-control/kernel crash                  # Parse macOS kernel panic
-control/kernel checkpoint             # Save state before risky operation
+```javascript
+discover({ method: "discoveries" })                   // List known discoveries
+discover({ method: "discoveries", target: "ane" })    // Filter by target
+discover({ method: "frameworks", filter: "ANE" })     // List private frameworks
+discover({ method: "symbols", path: "/System/Library/PrivateFrameworks/..." })
 ```
 
 ## Who Is This For?
@@ -168,10 +175,12 @@ Control gives AI the tools to help at every layer.
 Control is built on:
 
 - **MCP (Model Context Protocol)** — Standard protocol for AI tool use
-- **PostgreSQL** — Indexes code, logs, symbols, crash reports
 - **LLDB** — Native debugging (batch and interactive)
+- **Metro DevTools** — React component inspection via CDP
 - **Reverse-engineered APIs** — ANE runtime, private frameworks
 - **Direct hardware access** — IOSurface, IOKit, Metal
+
+Control is **stateless by design** — pure inspection tools with no database. Use `everytask` or `scalable` for persistence.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -179,16 +188,12 @@ Control is built on:
 │                  (Claude, Cursor, VS Code, etc.)                │
 ├─────────────────────────────────────────────────────────────────┤
 │                         Control MCP                              │
-│        control/react | control/bridge | control/native          │
-│        control/metal | control/silicon | control/discover        │
+│   react | bridge | native | device | silicon | kernel | discover │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │   Metro     │  │    LLDB     │  │  Hardware   │              │
 │  │  DevTools   │  │   Bridge    │  │   Probes    │              │
 │  └─────────────┘  └─────────────┘  └─────────────┘              │
-├─────────────────────────────────────────────────────────────────┤
-│                       PostgreSQL Index                           │
-│         Code | Symbols | Logs | Crashes | Discoveries           │
 ├─────────────────────────────────────────────────────────────────┤
 │                         The Device                               │
 │              iOS / macOS / Android / Simulator                   │
@@ -197,37 +202,45 @@ Control is built on:
 
 ## Current Status
 
-### Working (from Scalable MCP)
+All layers implemented and working:
 
-| Layer | Tools | Status |
-|-------|-------|--------|
-| React | devtools_tree, devtools_find, devtools_eval | ✅ |
-| Bridge | module_status, platform_diff, codegen_trace | ✅ |
-| Native | lldb.*, crash_debug, build logs | ✅ |
-| Device | simulator control, screenshots, SQL | ✅ |
-
-### Building
-
-| Layer | Tools | Status |
-|-------|-------|--------|
-| Metal | framework analysis, symbol dump, IOKit trace | 🔲 |
-| Silicon | ANE validate, profile, memory read | 🔲 |
-| Discover | probe, fuzz, map, document | 🔲 |
-| Kernel | crash analysis, checkpointing | 🔲 |
+| Layer | Methods | Status |
+|-------|---------|--------|
+| **react** | connect, disconnect, status, tree, find, props, navigation, evaluate | ✅ |
+| **bridge** | module_list, module_status, platform_diff, type_mappings | ✅ |
+| **native** | crash_run, breakpoint_trace, session_attach, lldb commands | ✅ |
+| **device** | list, boot, shutdown, install, launch, logs, screenshot, crash_logs, fingerprint | ✅ |
+| **silicon** | ane_validate, ane_status, ane_info | ✅ |
+| **kernel** | panic_parse, panic_list, panic_analyze | ✅ |
+| **discover** | discoveries, frameworks, symbols | ✅ |
 
 ## Getting Started
 
 ```bash
-# Install
-npm install @control/mcp
+# Clone and build
+git clone https://github.com/tyrauber/control
+cd control
+pnpm install
+pnpm build
 
-# Add to Claude Code
-claude mcp add control
+# Add to Claude Code (in your project's .mcp.json)
+{
+  "mcpServers": {
+    "control": {
+      "command": "node",
+      "args": ["/path/to/control/dist/mcp.js"]
+    }
+  }
+}
 
-# Start controlling
-control/react tree
-control/bridge status
-control/native crash
+# Or add globally (~/.claude/settings.json under mcpServers)
+```
+
+Then use the tools via MCP:
+```javascript
+react({ method: "tree" })
+bridge({ method: "module_list" })
+native({ method: "crash_run", binary: "./test" })
 ```
 
 ## Origin Story
