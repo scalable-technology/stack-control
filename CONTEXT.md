@@ -4,7 +4,7 @@ This document captures the strategic thinking behind Control for future developm
 
 ## The Journey
 
-Started building debugging tools for Expo/React Native in `@scalable/mcp`. Then:
+Started building debugging tools for Expo/React Native. Then:
 
 1. **Built react-native-pglite** — PostgreSQL + PostGIS compiled for mobile
    - Needed: Device SQL execution, PGLite diagnostics
@@ -59,27 +59,19 @@ The name "Control" came from the realization that "Threshold" (our earlier idea)
 
 **Controlled failure is learning.** When we fuzz to find limits, crashes are data. The 64-byte ANE alignment? Someone crashed to find that. We systematize this with `control/discover`.
 
-## Code to Port
+## Implementation Status
 
-From `/Users/tyrauber/Sites/scalable/packages/mcp/src/tools/`:
+All layers implemented:
 
-| Source File | Destination | Key Functions |
-|-------------|-------------|---------------|
-| `metro-devtools.ts` | `control/react` | MetroDevToolsClient, getComponentTree, findComponents |
-| `react-native.ts` | `control/bridge` | module_list, module_status, platform_diff |
-| `lldb.ts` | `control/native` | crash_run, session_attach, breakpoint_*, step, backtrace |
-| `logs.ts` | `control/native` | crash_debug, build |
-| `devices.ts` | `control/device` | simulators, screenshots, device SQL, fingerprint |
-| `pglite-diagnostics.ts` | `control/device` | PGLite/PostGIS health |
-
-## Code to Build New
-
-| Layer | Tools | Description |
-|-------|-------|-------------|
-| `control/metal` | frameworks, symbols, iokit, trace | Private framework discovery, symbol extraction |
-| `control/silicon` | ane.*, gpu.*, memory.* | ANE compile tracking, shape validation, profiling |
-| `control/discover` | probe, fuzz, map, document | Systematic limit-finding through controlled failure |
-| `control/kernel` | crash, trace, checkpoint | Kernel panic analysis, checkpointing |
+| Layer | File | Key Methods |
+|-------|------|-------------|
+| react | `react.ts` | connect, tree, find, props, evaluate |
+| bridge | `bridge.ts` | module_list, module_status, platform_diff |
+| native | `native.ts` | crash_run, session_attach, breakpoint_*, backtrace |
+| device | `device.ts` | list, boot, screenshot, logs, fingerprint |
+| silicon | `silicon.ts` | ane_validate, ane_status, ane_info |
+| kernel | `kernel.ts` | panic_parse, panic_list, panic_analyze |
+| discover | `discover.ts` | discoveries, frameworks, symbols |
 
 ## Test Targets
 

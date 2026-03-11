@@ -6,8 +6,7 @@
     },
     "control": {
       "command": "node",
-      "args": ["dist/cli.js"],
-      "cwd": "/Users/tyrauber/Sites/control"
+      "args": ["/Users/tyrauber/Sites/control/dist/mcp.js"]
     }
   }
 }

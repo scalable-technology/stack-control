@@ -1,9 +1,5 @@
 # Claude Code Instructions — Control
 
-> **MCP Connected:** The `.mcp.json` connects to scalable's infrastructure. You have full access to `code()`, `device()`, `git()`, `logs()`, and knowledge tools from day one. You're not starting from scratch.
-
-## What This Is
-
 Control is an MCP server for full-stack development — from React components to silicon.
 
 **Not just debugging. CONTROL.**
@@ -22,7 +18,7 @@ discover   →  Private frameworks, symbols, discoveries
 
 ## Origin
 
-Started as debugging tools in `@scalable/mcp`. Grew as we built:
+Started as debugging tools for Expo/React Native. Grew as we built:
 - `react-native-pglite` — PostgreSQL + PostGIS on mobile
 - `react-native-ane` — LLM training on Apple Neural Engine
 
@@ -43,7 +39,7 @@ src/tools/
 ├── discover.ts   — Framework listing, symbol extraction, discoveries
 ```
 
-Control is **stateless by design**. Use `everytask` for persistence.
+Control is **stateless by design** — pure inspection tools, no database.
 
 ## Key Technical Knowledge
 
@@ -84,9 +80,9 @@ pnpm test
 pnpm build
 ```
 
-## Shared Knowledge — From Scalable
+## Shared Knowledge
 
-Control inherits knowledge from scalable. This is intentional. We earned these lessons.
+These patterns were learned through real debugging sessions.
 
 ### The Debugging Loop
 
@@ -144,36 +140,3 @@ Control inherits knowledge from scalable. This is intentional. We earned these l
 | void | Unit | void |
 | Promise | Promise | Promise |
 
-## Cross-Project References
-
-When working in control, you may need to reference:
-
-### Scalable Documentation
-- `.scalable/workflows/debug-pglite.md` — Full debugging workflow
-- `.scalable/packages/mcp.md` — MCP tool reference
-- `.agents/react-native/` — Generic RN patterns
-
-### Scalable Source (ported)
-All tools have been ported from `@scalable/mcp`:
-- `metro-devtools.ts` → `react.ts`
-- `react-native.ts` → `bridge.ts`
-- `lldb.ts` → `native.ts`
-- `devices.ts` → `device.ts`
-
-### ANE Knowledge (react-native-ane)
-- The ANE compiler lives at `/System/Library/PrivateFrameworks/ANECompiler.framework`
-- MIL (Machine Intermediate Language) is the instruction format
-- Use `aneinfo` to query device capabilities
-- Shapes must be statically known at compile time
-
-## Related Projects
-
-- `/Users/tyrauber/Sites/scalable` — Original MCP implementation, knowledge source
-- `/Users/tyrauber/Sites/react-native-ane` — ANE training (silicon testbed)
-- `/Users/tyrauber/Sites/react-native-pglite` — PGLite (native testbed)
-
-## Continuity Note
-
-This project maintains continuity with work done in scalable. The knowledge, patterns, and debugging wisdom here were earned through real crashes, real kernel panics, and real debugging sessions.
-
-When you pick this up, you're not starting fresh. You're continuing.

@@ -180,7 +180,7 @@ Control is built on:
 - **Reverse-engineered APIs** — ANE runtime, private frameworks
 - **Direct hardware access** — IOSurface, IOKit, Metal
 
-Control is **stateless by design** — pure inspection tools with no database. Use `everytask` or `scalable` for persistence.
+Control is **stateless by design** — pure inspection tools with no database.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
