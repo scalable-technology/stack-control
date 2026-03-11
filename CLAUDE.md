@@ -8,16 +8,16 @@ Control is an MCP server for full-stack development — from React components to
 
 **Not just debugging. CONTROL.**
 
-## The Vision
+## The Layers
 
 ```
-control/react     →  React component tree, props, state
-control/bridge    →  TurboModules, JSI, codegen verification
-control/native    →  LLDB, crash analysis, build logs
-control/metal     →  Private frameworks, IOKit, hardware APIs
-control/silicon   →  ANE, GPU, memory buffers, IOSurfaces
-control/discover  →  Reverse engineering, probing, fuzzing
-control/kernel    →  Kernel-level tracing, crash analysis
+react      →  Component tree, props, state (via Metro DevTools)
+bridge     →  TurboModules, platform diff, type mappings
+native     →  Full LLDB (batch + interactive), crash analysis
+device     →  Simulator/emulator control, screenshots, logs
+silicon    →  ANE validation, status, hardware info
+kernel     →  Kernel panic parsing and analysis
+discover   →  Private frameworks, symbols, discoveries
 ```
 
 ## Origin
@@ -30,43 +30,20 @@ We went from debugging React components to causing kernel panics. The tools evol
 
 ## Current State
 
-### Exists (port from @scalable/mcp)
+All layers implemented:
 
 ```
-packages/mcp/src/tools/
-├── metro-devtools.ts    → control/react (CDP connection to React DevTools)
-├── react-native.ts      → control/bridge (TurboModule health, platform diff)
-├── lldb.ts              → control/native (full LLDB integration)
-├── logs.ts              → control/native (crash_debug, build logs)
-├── devices.ts           → control/device (simulators, screenshots, device SQL)
-├── pglite-diagnostics.ts → control/device (PGLite health checks)
+src/tools/
+├── react.ts      — Component tree via Metro DevTools (CDP)
+├── bridge.ts     — TurboModule health, platform diff
+├── native.ts     — Full LLDB integration (batch + interactive)
+├── device.ts     — Simulator/emulator management, screenshots, logs
+├── silicon.ts    — ANE validation, status, info
+├── kernel.ts     — Kernel panic parsing and analysis
+├── discover.ts   — Framework listing, symbol extraction, discoveries
 ```
 
-### To Build
-
-```
-control/metal
-├── frameworks.ts        — Private framework analysis
-├── symbols.ts           — Symbol extraction
-├── iokit.ts             — IOKit service tracing
-├── trace.ts             — syscall/mach tracing
-
-control/silicon
-├── ane.ts               — ANE compile tracking, shape validation, profiling
-├── gpu.ts               — GPU utilization, Metal debugging
-├── memory.ts            — IOSurface read/write, memory mapping
-
-control/discover
-├── probe.ts             — Controlled failure to find limits
-├── fuzz.ts              — Parameter fuzzing
-├── map.ts               — Memory/process mapping
-├── document.ts          — Record discoveries
-
-control/kernel
-├── crash.ts             — macOS kernel panic analysis
-├── checkpoint.ts        — State saving before risky ops
-├── trace.ts             — Kernel-level tracing
-```
+Control is **stateless by design**. Use `everytask` for persistence.
 
 ## Key Technical Knowledge
 
@@ -176,11 +153,12 @@ When working in control, you may need to reference:
 - `.scalable/packages/mcp.md` — MCP tool reference
 - `.agents/react-native/` — Generic RN patterns
 
-### Scalable Source (to port)
-- `packages/mcp/src/tools/metro-devtools.ts` — CDP/React DevTools
-- `packages/mcp/src/tools/react-native.ts` — TurboModule health
-- `packages/mcp/src/tools/lldb.ts` — LLDB integration
-- `packages/mcp/src/tools/logs.ts` — Crash analysis
+### Scalable Source (ported)
+All tools have been ported from `@scalable/mcp`:
+- `metro-devtools.ts` → `react.ts`
+- `react-native.ts` → `bridge.ts`
+- `lldb.ts` → `native.ts`
+- `devices.ts` → `device.ts`
 
 ### ANE Knowledge (react-native-ane)
 - The ANE compiler lives at `/System/Library/PrivateFrameworks/ANECompiler.framework`
