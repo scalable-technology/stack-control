@@ -11,7 +11,7 @@ react      →  Component tree, props, state (via Metro DevTools)
 bridge     →  TurboModules, platform diff, type mappings
 native     →  Full LLDB (batch + interactive), crash analysis
 device     →  Simulator/emulator control, screenshots, logs
-silicon    →  ANE validation, status, hardware info
+silicon    →  ANE validation, GPU power/frequency monitoring
 kernel     →  Kernel panic parsing and analysis
 discover   →  Private frameworks, symbols, discoveries
 ```
@@ -34,7 +34,7 @@ src/tools/
 ├── bridge.ts     — TurboModule health, platform diff
 ├── native.ts     — Full LLDB integration (batch + interactive)
 ├── device.ts     — Simulator/emulator management, screenshots, logs
-├── silicon.ts    — ANE validation, status, info
+├── silicon.ts    — ANE validation, GPU power/frequency monitoring
 ├── kernel.ts     — Kernel panic parsing and analysis
 ├── discover.ts   — Framework listing, symbol extraction, discoveries
 ```
@@ -48,6 +48,13 @@ Control is **stateless by design** — pure inspection tools, no database.
 - 119 compile limit per process, then must restart
 - fp16 on ANE, fp32 for CPU crossover operations
 - Private API via reverse engineering (see maderix/ANE)
+
+### GPU (Metal/AGX)
+- M4 uses DVFS — can cause 3x performance variance on identical workloads
+- `powermetrics --samplers gpu_power` exposes real-time frequency (requires sudo)
+- P-states: ~1.5GHz (max) vs ~0.5GHz (throttled)
+- Pre-warm GPU with sustained load to stabilize high P-state
+- `iogpu.dynamic_lwm` sysctl controls adaptive power management
 
 ### TurboModules
 - Spec file → codegen → native implementation chain
