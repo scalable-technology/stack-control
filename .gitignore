@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+
+
+# Logs
+*.log
+
+# Test
+coverage/

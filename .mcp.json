@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "control": {
+      "command": "npx",
+      "args": ["stack-control"]
+    }
+  }
+}

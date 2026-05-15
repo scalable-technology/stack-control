@@ -1,0 +1,60 @@
+{
+  "name": "stack-control",
+  "version": "0.1.0",
+  "description": "Control the whole stack. From pixel to silicon. MCP server for full-stack debugging — React to silicon.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "stack-control": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "test": "vitest",
+    "lint": "eslint src"
+  },
+  "keywords": [
+    "mcp",
+    "react-native",
+    "expo",
+    "debugging",
+    "lldb",
+    "ane",
+    "apple-neural-engine",
+    "reverse-engineering",
+    "turbomodules",
+    "native",
+    "apple-silicon",
+    "ios",
+    "macos"
+  ],
+  "author": "Ty Rauber & Claude",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scalable-technology/stack-control"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
