@@ -11,7 +11,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CLA.md"
   ],
   "scripts": {
     "dev": "tsx watch src/cli.ts",
@@ -36,7 +37,7 @@
     "macos"
   ],
   "author": "Ty Rauber & Claude",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "https://github.com/scalable-technology/stack-control"

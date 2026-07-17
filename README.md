@@ -308,11 +308,15 @@ Not debug. Not observe. Not hope.
 
 ## License
 
-MIT
+AGPL-3.0-only. Open and stays open: use it, fork it, ship it, but what you ship stays open too. For closed-source use, commercial licenses are available from Scalable Technology, Inc.
+
+Copyright Scalable Technology, Inc. See [LICENSE](LICENSE).
 
 ## Contributing
 
 If you're building something hard — native packages with C dependencies, hardware access, private APIs — we want to hear from you. The goal is to make this kind of work accessible to more people.
+
+Contributions are accepted under the [CLA](CLA.md): you keep ownership of your work and grant Scalable Technology the rights that keep dual-licensing possible. Opening a pull request is agreement.
 
 ---
 
