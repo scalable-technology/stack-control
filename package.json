@@ -1,6 +1,6 @@
 {
   "name": "stack-control",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Control the whole stack. From pixel to silicon. MCP server for full-stack debugging — React to silicon.",
   "type": "module",
   "main": "dist/index.js",

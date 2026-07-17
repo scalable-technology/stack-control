@@ -26,6 +26,7 @@
  * - network        List captured network requests
  * - console        List captured console messages
  * - accessibility  Get accessibility tree
+ * - scene          Inspect a live three.js scene graph (__THREE_DEVTOOLS__ hook)
  */
 
 import { EventEmitter } from 'events';
@@ -144,6 +145,29 @@ let commandId = 0;
 const getCommandId = () => ++commandId;
 
 const MAX_COLLECTED_EVENTS = 1000;
+const MAX_SCENE_NODES = 500;
+
+/**
+ * three.js Scene (and renderer) constructors dispatch CustomEvent('observe')
+ * to window.__THREE_DEVTOOLS__ when it exists at construction time. Installing
+ * this hook at connect — into the current document AND every future document —
+ * means one reload is enough to capture scenes on any three.js app, no app-side
+ * code required.
+ */
+const THREE_HOOK_SCRIPT = `(() => {
+  if (window.__STACK_CONTROL_THREE__) return;
+  const store = { objects: [] };
+  let target = window.__THREE_DEVTOOLS__;
+  if (!target) {
+    target = new EventTarget();
+    window.__THREE_DEVTOOLS__ = target;
+  }
+  target.addEventListener('observe', (event) => {
+    const obj = event.detail;
+    if (obj && !store.objects.includes(obj)) store.objects.push(obj);
+  });
+  window.__STACK_CONTROL_THREE__ = store;
+})();`;
 
 class ChromeCDPClient extends EventEmitter {
   private ws: WebSocket | null = null;
@@ -254,6 +278,13 @@ class ChromeCDPClient extends EventEmitter {
           await this.sendCommand('DOM.enable');
           await this.sendCommand('Network.enable');
           await this.sendCommand('Console.enable');
+          // Non-fatal: three.js devtools hook for the `scene` method
+          await this.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+            source: THREE_HOOK_SCRIPT,
+          }).catch(() => {});
+          await this.sendCommand('Runtime.evaluate', {
+            expression: THREE_HOOK_SCRIPT,
+          }).catch(() => {});
           this.connected = true;
           resolve();
         } catch (error) {
@@ -437,6 +468,7 @@ class ChromeCDPClient extends EventEmitter {
     const response = await this.sendCommand('Runtime.evaluate', {
       expression,
       returnByValue: true,
+      awaitPromise: true,
     });
 
     if (response.error) {
@@ -577,6 +609,32 @@ const AccessibilityInput = z.object({
   method: z.literal('accessibility'),
 });
 
+const SceneInput = z.object({
+  method: z.literal('scene'),
+  match: z
+    .string()
+    .optional()
+    .describe(
+      'Case-insensitive regex over node name/type — returns matching nodes with their scene paths instead of the full graph'
+    ),
+  maxDepth: z
+    .number()
+    .optional()
+    .default(3)
+    .describe('Scene graph depth to serialize (default: 3)'),
+  handle: z
+    .string()
+    .optional()
+    .describe(
+      'JS expression returning a THREE.Scene/Object3D — app-convention fallback when __THREE_DEVTOOLS__ captured nothing (e.g. "window.__EVERYGAME__.scene")'
+    ),
+  sceneIndex: z
+    .number()
+    .optional()
+    .default(0)
+    .describe('Which discovered scene to inspect (default: 0)'),
+});
+
 const ClickInput = z.object({
   method: z.literal('click'),
   selector: z.string().describe('CSS selector of element to click'),
@@ -636,11 +694,42 @@ const ChromeInput = z.discriminatedUnion('method', [
   NetworkInput,
   ConsoleInput,
   AccessibilityInput,
+  SceneInput,
   ClickInput,
   TypeInput,
   PressInput,
   WaitInput,
 ]);
+
+// =============================================================================
+// Foreground guard
+// =============================================================================
+
+/**
+ * macOS occlusion trap: when a tab is hidden (background tab, minimized or
+ * fully occluded window), Chrome throttles requestAnimationFrame — rAF-driven
+ * apps appear frozen under inspection. Bring the tab to front before
+ * observing; if the page is still hidden the window is minimized, which CDP
+ * cannot undo, so return instructions instead.
+ */
+async function ensureForeground(c: ChromeCDPClient): Promise<string | undefined> {
+  try {
+    if ((await c.evaluate('document.hidden')) !== true) return undefined;
+    await c.sendCommand('Page.bringToFront');
+    await new Promise((r) => setTimeout(r, 150));
+    if ((await c.evaluate('document.hidden')) === true) {
+      return (
+        'Page is still hidden after Page.bringToFront — the Chrome window is likely minimized. ' +
+        'requestAnimationFrame is throttled, so animation-driven apps appear frozen. Unminimize with: ' +
+        `osascript -e 'tell application "Google Chrome" to activate' ` +
+        `-e 'tell application "System Events" to set value of attribute "AXMinimized" of every window of process "Google Chrome" to false'`
+      );
+    }
+    return 'Page was hidden (rAF throttled) — brought tab to front automatically.';
+  } catch {
+    return undefined;
+  }
+}
 
 // =============================================================================
 // Handlers
@@ -757,10 +846,11 @@ async function handleEvaluate(input: z.infer<typeof EvaluateInput>): Promise<Too
   }
 
   try {
+    const foreground = await ensureForeground(client);
     const result = await client.evaluate(input.expression);
     return {
       success: true,
-      data: { result },
+      data: foreground ? { result, foreground } : { result },
     };
   } catch (error) {
     return {
@@ -781,6 +871,8 @@ async function handleScreenshot(
   }
 
   try {
+    const foreground = await ensureForeground(client);
+
     const params: Record<string, unknown> = { format: input.format };
     if (input.quality !== undefined) {
       params.quality = input.quality;
@@ -827,6 +919,7 @@ async function handleScreenshot(
         format: input.format,
         path: filepath,
         bytes: Math.round(data.length * 0.75),
+        ...(foreground ? { foreground } : {}),
       },
     };
   } catch (error) {
@@ -1056,6 +1149,198 @@ async function handleAccessibility(): Promise<ToolResult> {
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Accessibility tree failed',
+    };
+  }
+}
+
+// =============================================================================
+// Scene Inspection (three.js)
+// =============================================================================
+
+/**
+ * Build the in-page probe. Runs entirely in page context, returns plain JSON.
+ * Node shape: {type, name, visible, pos, scale, verts, mat: {type, color,
+ * transparent, opacity, side}, instances, children|childCount}. mat.side is
+ * spelled out (FrontSide/BackSide/DoubleSide) — an invisible mesh with
+ * side: FrontSide viewed from behind is a classic render bug.
+ */
+function buildSceneProbe(input: z.infer<typeof SceneInput>): string {
+  const matchInit = input.match
+    ? `new RegExp(${JSON.stringify(input.match)}, 'i')`
+    : 'null';
+  const handleProbe = input.handle
+    ? `try { addScene((${input.handle}), 'handle'); } catch (error) { handleError = String(error); }`
+    : '';
+  return `(() => {
+  const MATCH = ${matchInit};
+  const MAX_DEPTH = ${input.maxDepth};
+  const SCENE_INDEX = ${input.sceneIndex};
+  const MAX_NODES = ${MAX_SCENE_NODES};
+
+  const store = window.__STACK_CONTROL_THREE__;
+  const scenes = [];
+  const seen = new Set();
+  let handleError = null;
+  const addScene = (obj, source) => {
+    if (obj && (obj.isScene || obj.isObject3D) && !seen.has(obj)) {
+      seen.add(obj);
+      scenes.push({ obj, source });
+    }
+  };
+  if (store) for (const o of store.objects) if (o && o.isScene) addScene(o, '__THREE_DEVTOOLS__');
+  ${handleProbe}
+  for (const key of ['scene', '__THREE_SCENE__']) {
+    try {
+      const v = window[key];
+      if (v && v.isScene) addScene(v, 'window.' + key);
+    } catch (e) {}
+  }
+
+  const renderers = store
+    ? store.objects
+        .filter((o) => o && (o.isWebGLRenderer || o.isWebGPURenderer || o.isRenderer))
+        .map((o) => (o.isWebGPURenderer ? 'WebGPURenderer' : o.isWebGLRenderer ? 'WebGLRenderer' : 'Renderer'))
+    : [];
+
+  if (scenes.length === 0) {
+    return {
+      error: 'no-scene-found',
+      hookInstalled: !!store,
+      capturedObjects: store ? store.objects.length : 0,
+      handleError,
+      hint: 'Hook is installed for future documents. Reload the page (chrome reload) so three.js Scene constructors register with __THREE_DEVTOOLS__, then call scene again. Or pass handle: a JS expression returning your THREE.Scene.',
+    };
+  }
+  if (SCENE_INDEX >= scenes.length) {
+    return { error: 'scene-index-out-of-range', sceneCount: scenes.length };
+  }
+
+  const root = scenes[SCENE_INDEX].obj;
+
+  const round = (n) => (typeof n === 'number' ? Math.round(n * 1000) / 1000 : n);
+  const vec = (v) => (v ? [round(v.x), round(v.y), round(v.z)] : undefined);
+  const SIDE = { 0: 'FrontSide(0)', 1: 'BackSide(1)', 2: 'DoubleSide(2)' };
+  const matInfo = (m) => {
+    if (!m) return undefined;
+    if (Array.isArray(m)) return m.map(matInfo);
+    const out = { type: m.type };
+    try {
+      if (m.color && m.color.isColor) out.color = '#' + m.color.getHexString();
+    } catch (e) {}
+    out.transparent = m.transparent;
+    out.opacity = round(m.opacity);
+    out.side = SIDE[m.side] !== undefined ? SIDE[m.side] : m.side;
+    if (m.visible === false) out.visible = false;
+    if (m.map) out.map = true;
+    if (m.wireframe) out.wireframe = true;
+    return out;
+  };
+
+  let nodeCount = 0;
+  let truncated = false;
+  const serialize = (node, depth) => {
+    nodeCount++;
+    const out = { type: node.type || 'Object3D' };
+    if (node.name) out.name = node.name;
+    out.visible = node.visible;
+    const p = vec(node.position);
+    if (p && (p[0] !== 0 || p[1] !== 0 || p[2] !== 0)) out.pos = p;
+    const s = vec(node.scale);
+    if (s && (s[0] !== 1 || s[1] !== 1 || s[2] !== 1)) out.scale = s;
+    if (node.geometry && node.geometry.attributes && node.geometry.attributes.position) {
+      out.verts = node.geometry.attributes.position.count;
+    }
+    if (node.material) out.mat = matInfo(node.material);
+    if (node.isInstancedMesh) out.instances = node.count;
+    const kids = node.children || [];
+    if (kids.length > 0) {
+      if (depth < MAX_DEPTH && nodeCount < MAX_NODES) {
+        out.children = kids.map((c) => serialize(c, depth + 1));
+      } else {
+        out.childCount = kids.length;
+        if (nodeCount >= MAX_NODES) truncated = true;
+      }
+    }
+    return out;
+  };
+
+  const sceneList = scenes.map((s, i) => ({
+    index: i,
+    source: s.source,
+    type: s.obj.type,
+    name: s.obj.name || undefined,
+    children: (s.obj.children || []).length,
+  }));
+
+  if (MATCH) {
+    const label = (n, i) => (n.name ? n.name : (n.type || 'Object3D') + '[' + i + ']');
+    const matches = [];
+    let total = 0;
+    const walk = (node, path) => {
+      total++;
+      if (MATCH.test(node.name || '') || MATCH.test(node.type || '')) {
+        matches.push({ path, node: serialize(node, 0) });
+      }
+      (node.children || []).forEach((c, i) => walk(c, path + '/' + label(c, i)));
+    };
+    walk(root, label(root, 0));
+    return {
+      scenes: sceneList,
+      renderers,
+      match: ${JSON.stringify(input.match ?? null)},
+      totalNodes: total,
+      matched: matches.length,
+      matches,
+      truncated,
+    };
+  }
+
+  return { scenes: sceneList, renderers, graph: serialize(root, 0), nodes: nodeCount, truncated };
+})()`;
+}
+
+async function handleScene(input: z.infer<typeof SceneInput>): Promise<ToolResult> {
+  if (!client?.isConnected()) {
+    return {
+      success: false,
+      error: 'Not connected. Use chrome({ method: "connect" }) first.',
+    };
+  }
+
+  try {
+    // Idempotent — covers documents loaded before this session's hook install
+    await client.evaluate(THREE_HOOK_SCRIPT);
+    const foreground = await ensureForeground(client);
+    const result = (await client.evaluate(buildSceneProbe(input))) as
+      | { error?: string; hint?: string; sceneCount?: number }
+      | undefined;
+
+    if (!result || typeof result !== 'object') {
+      return { success: false, error: 'Scene probe returned no result' };
+    }
+    if (result.error === 'no-scene-found') {
+      return {
+        success: false,
+        error: `No three.js scene found. ${result.hint || ''}`,
+        data: result,
+      };
+    }
+    if (result.error === 'scene-index-out-of-range') {
+      return {
+        success: false,
+        error: `sceneIndex ${input.sceneIndex} out of range — ${result.sceneCount} scene(s) available`,
+        data: result,
+      };
+    }
+
+    return {
+      success: true,
+      data: foreground ? { ...result, foreground } : result,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Scene inspection failed',
     };
   }
 }
@@ -1500,6 +1785,18 @@ export const chromeTool: Tool = {
 • **accessibility** - Get full accessibility tree
   \`chrome({ method: "accessibility" })\`
 
+• **scene** - Inspect a live three.js scene graph
+  \`chrome({ method: "scene" })\`
+  \`chrome({ method: "scene", match: "sail|boat" })\`
+  \`chrome({ method: "scene", handle: "window.__APP__.scene", maxDepth: 5 })\`
+  Discovers scenes via the __THREE_DEVTOOLS__ hook (installed automatically at
+  connect — reload once if the app loaded before you connected), a handle
+  expression, or window.scene. Per node: type, name, visible, pos, scale,
+  verts, mat {type, color, transparent, opacity, side}, instances,
+  children/childCount. Use match to grep large scenes — returns matching
+  nodes with their paths. Screenshot answers "does it look right"; scene
+  answers "why not" (e.g. mat.side: FrontSide on a mesh viewed from behind).
+
 • **click** - Click an element by CSS selector
   \`chrome({ method: "click", selector: "button.submit" })\`
   \`chrome({ method: "click", selector: "a.nav-link", clickCount: 2 })\`
@@ -1515,6 +1812,12 @@ export const chromeTool: Tool = {
 • **wait** - Wait for selector, network idle, or timeout
   \`chrome({ method: "wait", selector: ".loaded" })\`
   \`chrome({ method: "wait", networkIdle: true, timeout: 10000 })\`
+
+**Hidden-page handling:**
+evaluate, screenshot, and scene auto-detect document.hidden and bring the tab
+to front (macOS occlusion throttles rAF — animation-driven apps freeze under
+inspection). If the window is minimized, the result includes unminimize
+instructions in a "foreground" field.
 
 **Prerequisites:**
 Chrome must be launched with remote debugging enabled. On macOS:
@@ -1542,6 +1845,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
           'network',
           'console',
           'accessibility',
+          'scene',
           'click',
           'type',
           'press',
@@ -1601,6 +1905,24 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       requestId: {
         type: 'string',
         description: 'Get response body for a specific network request ID',
+      },
+      match: {
+        type: 'string',
+        description:
+          'scene: case-insensitive regex over node name/type — returns matching nodes + paths',
+      },
+      maxDepth: {
+        type: 'number',
+        description: 'scene: graph depth to serialize (default: 3)',
+      },
+      handle: {
+        type: 'string',
+        description:
+          'scene: JS expression returning a THREE.Scene/Object3D (app-convention fallback)',
+      },
+      sceneIndex: {
+        type: 'number',
+        description: 'scene: which discovered scene to inspect (default: 0)',
       },
       button: {
         type: 'string',
@@ -1675,6 +1997,8 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         return handleConsole(input);
       case 'accessibility':
         return handleAccessibility();
+      case 'scene':
+        return handleScene(input);
       case 'click':
         return handleClick(input);
       case 'type':

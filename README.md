@@ -153,9 +153,26 @@ chrome({ method: "navigate", url: "https://..." })      // Navigate to URL
 chrome({ method: "network" })                           // List captured requests
 chrome({ method: "console" })                           // List captured messages
 chrome({ method: "accessibility" })                     // Full accessibility tree
+chrome({ method: "scene" })                             // three.js scene graph dump
+chrome({ method: "scene", match: "sail|boat" })         // Grep scene nodes (name/type regex)
+chrome({ method: "scene", handle: "window.__APP__.scene" })  // App-convention fallback
 ```
 
 Chrome must be launched with: `--remote-debugging-port=9222`
+
+**three.js scene inspection.** `scene` serializes the live scene graph — per
+node: type, name, visible, pos, scale, verts, material (type, color,
+transparent, opacity, **side**), instance count. Scenes are discovered through
+the standard `__THREE_DEVTOOLS__` hook, which `connect` installs into the
+current and all future documents; if the app loaded before you connected,
+reload once. Works on any three.js app with no app-side code. Screenshot is
+pixel truth ("something's wrong"); scene is graph truth ("the sail is
+`side: FrontSide` viewed from behind — that's why").
+
+`evaluate` awaits Promises, so async expressions return resolved values.
+`evaluate`, `screenshot`, and `scene` auto-detect a hidden page (macOS
+occlusion throttles rAF, freezing animation-driven apps) and bring the tab to
+front, reporting what they did in a `foreground` field.
 
 ### `device`
 iOS Simulator and Android Emulator management.
