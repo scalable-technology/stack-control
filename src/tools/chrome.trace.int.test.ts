@@ -191,7 +191,9 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     expect((await call({ method: 'select', targetId: original!.id })).success).toBe(true);
   }, 60_000);
 
-  it('forgets a running trace when its tab closes under it', async () => {
+  it('starts clean when it reconnects after a tab closed under a running trace', async () => {
+    // Selecting the original tab tears the dead socket down, which is what clears the state here;
+    // the unexpected-close path itself is covered by the in-flight-stop test below.
     const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
     const doomed = (await created.json()) as { id: string };
     expect((await call({ method: 'select', targetId: doomed.id })).success).toBe(true);
@@ -210,6 +212,8 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
   }, 60_000);
 
   it('does not wait out the 120s limit when the tab dies while a stop is in flight', async () => {
+    // Racy by nature: if the stop finishes before the tab closes it passes either way; it fails
+    // (by timeout) only when a dead connection is left waiting, which is the regression it guards.
     const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
     const doomed = (await created.json()) as { id: string };
     expect((await call({ method: 'select', targetId: doomed.id })).success).toBe(true);

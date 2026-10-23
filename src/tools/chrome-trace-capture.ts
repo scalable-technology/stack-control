@@ -40,7 +40,7 @@ const COMPLETE_TIMEOUT_MS = 120_000;
 const READ_CHUNK_BYTES = 1 << 20;
 /** A trace file bigger than this is refused: a runaway page must not fill the disk. */
 const MAX_TRACE_BYTES = 512 * 1024 * 1024;
-/** Draining the stream may not take longer than this in total. */
+/** Draining the stream may not take longer than this in total; checked between reads, so it can overrun by one read. */
 const DRAIN_DEADLINE_MS = 5 * 60_000;
 /** Chrome-side trace buffer: recording stops at this size, so an open recording is bounded. */
 const TRACE_BUFFER_KB = 200 * 1024;
