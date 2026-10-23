@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_VITAL_ENTRIES, inpOf, lcpOf, pageVitals, pickMetrics } from './chrome-metrics.js';
+import {
+  MAX_VITAL_ENTRIES,
+  TAB_CHANGED,
+  createMetricsReader,
+  inpOf,
+  lcpOf,
+  pageVitals,
+  pickMetrics,
+  readMetrics,
+  type MetricsCdp,
+} from './chrome-metrics.js';
 import { worstSessionWindow } from './chrome-trace.js';
 
 describe('worstSessionWindow (CLS, shared by trace summaries and metrics)', () => {
@@ -266,5 +276,205 @@ describe('pageVitals', () => {
       expect(v!.inp!.interactions).toBe(MAX_VITAL_ENTRIES);
       expect(v!.lcp!.ms).toBe(MAX_VITAL_ENTRIES);
     });
+  });
+});
+
+describe('pageVitals: numbers outside a sane domain', () => {
+  const finiteOrNull = (v: unknown): boolean =>
+    v === null || (typeof v === 'number' && Number.isFinite(v)) ||
+    (typeof v === 'object' && Object.values(v as object).every((x) => typeof x === 'string' || finiteOrNull(x)));
+
+  it('ignores 1e308 values, so nothing overflows to Infinity', () => {
+    const v = pageVitals({
+      lcp: [{ startTime: 1e308, size: 1, element: 'p' }, { startTime: 10, size: 1e308, element: 'h1' }],
+      shifts: [
+        { value: 1e308, startTime: 0, hadRecentInput: false },
+        { value: 1e308, startTime: 1, hadRecentInput: false },
+        { value: 0.1, startTime: 1e308, hadRecentInput: false },
+      ],
+      events: [{ duration: 1e308, interactionId: 1, startTime: 0 }, { duration: 50, interactionId: 2, startTime: 1e308 }],
+    });
+    // The second event is ignored too: its startTime is a time, bounded like a duration.
+    expect(v).toEqual({ lcp: null, cls: 0, shiftCount: 0, inp: null });
+    expect(finiteOrNull(v)).toBe(true);
+  });
+
+  it('accepts the edges of each domain and rejects just past them and below 0', () => {
+    const v = pageVitals({
+      lcp: [{ startTime: 1e12, size: 1e15, element: 'p' }, { startTime: 1e12 + 1, size: 1, element: 'x' }, { startTime: 5, size: 1e15 + 1, element: 'y' }],
+      shifts: [
+        { value: 1000, startTime: 0, hadRecentInput: false },
+        { value: 1000.001, startTime: 1, hadRecentInput: false },
+        { value: -0.5, startTime: 2, hadRecentInput: false },
+        { value: 0.1, startTime: -1, hadRecentInput: false },
+      ],
+      events: [{ duration: 1e12, interactionId: 1, startTime: 0 }, { duration: -5, interactionId: 2, startTime: 0 }],
+    });
+    expect(v!.lcp).toEqual({ ms: 1e12, size: 1e15, element: 'p' });
+    expect(v!.cls).toBe(1000);
+    expect(v!.shiftCount).toBe(1);
+    expect(v!.inp).toEqual({ ms: 1e12, interactions: 1 });
+  });
+});
+
+interface FakeMetricsOptions {
+  /** Per method: 'reject' (no answer), 'error' (Chrome answers with an error), or the result to answer. */
+  answers?: Record<string, 'reject' | 'error' | unknown>;
+  /** Runs before a method is answered. */
+  onSend?: (method: string) => void | Promise<void>;
+}
+
+/** A fake CDP with Chrome's answers for one metrics call; records every command. */
+function fakeCdp(options: FakeMetricsOptions = {}) {
+  const sent: { method: string; params?: Record<string, unknown>; timeoutMs?: number }[] = [];
+  const defaults: Record<string, unknown> = {
+    'Performance.enable': {},
+    'Performance.getMetrics': { metrics: [{ name: 'Nodes', value: 42 }, { name: 'JSHeapUsedSize', value: 1000 }] },
+    'Performance.disable': {},
+    'Page.getFrameTree': { frameTree: { frame: { id: 'F1' } } },
+    'Page.createIsolatedWorld': { executionContextId: 77 },
+    'Runtime.evaluate': { result: { value: { lcp: [], shifts: [{ value: 0.25, startTime: 10, hadRecentInput: false }], events: [] } } },
+  };
+  const cdp: MetricsCdp = {
+    sendCommand: async (method, params, timeoutMs) => {
+      sent.push({ method, params, timeoutMs });
+      await options.onSend?.(method);
+      const answer = options.answers && method in options.answers ? options.answers[method] : defaults[method];
+      if (answer === 'reject') throw new Error(`Command ${method} timed out after 30s`);
+      if (answer === 'error') return { error: { message: `${method} refused` } };
+      return { result: answer };
+    },
+  };
+  return { cdp, sent, methods: () => sent.map((x) => x.method) };
+}
+
+describe('readMetrics', () => {
+  const always = () => true;
+
+  it('reads the counters, then the vitals in an isolated world', async () => {
+    const f = fakeCdp();
+    const r = await readMetrics(f.cdp, always);
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as { metrics: Record<string, unknown>; vitals: Record<string, unknown> };
+    expect(d.metrics.nodes).toBe(42);
+    expect(d.metrics.documents).toBeNull();
+    expect(d.vitals).toEqual({ lcp: null, cls: 0.25, shiftCount: 1, inp: null });
+    expect(f.methods()).toEqual([
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+      'Page.getFrameTree', 'Page.createIsolatedWorld', 'Runtime.evaluate',
+    ]);
+    expect(f.sent[4].params).toEqual({ frameId: 'F1', worldName: 'control-metrics' });
+    const evaluate = f.sent[5];
+    expect(evaluate.params).toMatchObject({ contextId: 77, returnByValue: true, awaitPromise: true });
+    expect(evaluate.timeoutMs).toBe(10_000);
+  });
+
+  it.each([
+    ['Page.createIsolatedWorld', 'error'],
+    ['Page.createIsolatedWorld', 'reject'],
+    ['Page.createIsolatedWorld', { executionContextId: 'not a number' }],
+    ['Page.getFrameTree', 'error'],
+    ['Page.getFrameTree', { frameTree: {} }],
+  ])('never falls back to the page world: %s answering %j gives vitals null', async (method, answer) => {
+    const f = fakeCdp({ answers: { [method]: answer } });
+    const r = await readMetrics(f.cdp, always);
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as { metrics: Record<string, unknown>; vitals: unknown; vitalsError?: string };
+    expect(d.metrics.nodes).toBe(42);
+    expect(d.vitals).toBeNull();
+    expect(d.vitalsError).toMatch(/separate JS world/);
+    expect(f.methods()).not.toContain('Runtime.evaluate');
+  });
+
+  it("gives vitals null and our own reason when the probe throws, without the page's text", async () => {
+    const f = fakeCdp({
+      answers: { 'Runtime.evaluate': { exceptionDetails: { text: 'page secret text', exception: { description: 'page secret text' } } } },
+    });
+    const r = await readMetrics(f.cdp, always);
+    expect(r.success).toBe(true);
+    const d = r.data as { vitals: unknown; vitalsError?: string };
+    expect(d.vitals).toBeNull();
+    expect(d.vitalsError).toBeTruthy();
+    expect(d.vitalsError).not.toMatch(/secret/);
+  });
+
+  it('keeps 1e308 values from the probe out of the result', async () => {
+    const f = fakeCdp({
+      answers: {
+        'Runtime.evaluate': {
+          result: {
+            value: {
+              lcp: [{ startTime: 1e308, size: 1e308, element: 'p' }],
+              shifts: [{ value: 1e308, startTime: 0 }, { value: 1e308, startTime: 1 }],
+              events: [{ duration: 1e308, interactionId: 3, startTime: 0 }],
+            },
+          },
+        },
+      },
+    });
+    const r = await readMetrics(f.cdp, always);
+    expect((r.data as { vitals: unknown }).vitals).toEqual({ lcp: null, cls: 0, shiftCount: 0, inp: null });
+  });
+
+  it.each(['reject', 'error'])('sends Performance.disable even when enable gets %s', async (answer) => {
+    const f = fakeCdp({ answers: { 'Performance.enable': answer } });
+    const r = await readMetrics(f.cdp, always);
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/^Could not read Chrome's metrics: /);
+    expect(f.methods()).toEqual(['Performance.enable', 'Performance.disable']);
+  });
+
+  it("fails with Chrome's message when getMetrics is refused, and still disables", async () => {
+    const f = fakeCdp({ answers: { 'Performance.getMetrics': 'error' } });
+    const r = await readMetrics(f.cdp, always);
+    expect(r).toEqual({ success: false, error: "Could not read Chrome's metrics: Performance.getMetrics refused" });
+    expect(f.methods()).toContain('Performance.disable');
+  });
+
+  it('ignores a failed disable', async () => {
+    const f = fakeCdp({ answers: { 'Performance.disable': 'reject' } });
+    expect((await readMetrics(f.cdp, always)).success).toBe(true);
+  });
+
+  it.each(['Performance.disable', 'Runtime.evaluate'])(
+    'refuses to mix tabs: a tab switch at %s gives an error, never data',
+    async (at) => {
+      let selected = true;
+      const f = fakeCdp({ onSend: (m) => { if (m === at) selected = false; } });
+      const r = await readMetrics(f.cdp, () => selected);
+      expect(r).toEqual({ success: false, error: TAB_CHANGED });
+      // Once the tab changed, nothing more is sent: the probe never runs in the new tab.
+      expect(f.methods().slice(f.methods().indexOf(at) + 1)).toEqual([]);
+    }
+  );
+
+  it('sends nothing when the tab already changed before it started', async () => {
+    const f = fakeCdp();
+    expect(await readMetrics(f.cdp, () => false)).toEqual({ success: false, error: TAB_CHANGED });
+    expect(f.sent).toEqual([]);
+  });
+});
+
+describe('createMetricsReader', () => {
+  const perf = (methods: string[]) => methods.filter((m) => m.startsWith('Performance.'));
+
+  it('runs overlapping calls one at a time, so one never disables the other mid-read', async () => {
+    const f = fakeCdp({ onSend: () => new Promise((r) => setTimeout(r, 5)) });
+    const read = createMetricsReader();
+    const [a, b] = await Promise.all([read(f.cdp, () => true), read(f.cdp, () => true)]);
+    expect(a.success && b.success).toBe(true);
+    expect(perf(f.methods())).toEqual([
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+    ]);
+  });
+
+  it('does not let a call that throws block the next one', async () => {
+    const f = fakeCdp();
+    const read = createMetricsReader();
+    const first = read(f.cdp, () => { throw new Error('boom'); });
+    const second = read(f.cdp, () => true);
+    await expect(first).rejects.toThrow('boom');
+    expect((await second).success).toBe(true);
   });
 });

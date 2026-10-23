@@ -1,12 +1,14 @@
 /**
  * control/chrome-metrics — a cheap snapshot of a page's counters and web vitals, without a trace
  *
- * Counters come from Chrome (Performance.getMetrics). Vitals come from the page itself: one
- * evaluate asks PerformanceObserver for what the browser has buffered since load. The page runs
- * that script in its own world, so a page that lies can mislead it, as it can mislead evaluate.
- * Everything it returns is checked here: lists must be arrays, numbers finite, strings short.
+ * Counters come from Chrome (Performance.getMetrics). Vitals come from one script that asks
+ * PerformanceObserver for what the browser has buffered since load. It runs in an isolated world
+ * Chrome makes for it, so the page's own scripts (a replaced PerformanceObserver or String
+ * prototype) are not there; the entries are the browser's. It never falls back to the page's
+ * world. What comes back is still checked here: arrays, finite numbers in a sane range, short strings.
  */
 
+import type { ToolResult } from '../types.js';
 import { truncate } from './chrome-trace-summary.js';
 import { worstSessionWindow } from './chrome-trace.js';
 
@@ -60,6 +62,20 @@ const MAX_METRICS = 500;
 export const MAX_VITAL_ENTRIES = 500;
 
 const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+
+/**
+ * The ranges a real entry falls in. A number outside is not the browser's, and finite values that
+ * large still overflow a sum or a rounding (two shifts of 1e308 make CLS Infinity).
+ */
+const DOMAIN = {
+  /** A layout-shift value is a fraction of the viewport; real ones are far below this. */
+  shiftValue: 1000,
+  /** Page times and durations in ms: about 31 years. */
+  ms: 1e12,
+  /** An LCP size in square pixels. */
+  size: 1e15,
+};
+const within = (n: unknown, max: number): n is number => finite(n) && n >= 0 && n <= max;
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /** The metrics array of a Performance.getMetrics result, reduced to our keys. A missing one is null. */
@@ -116,24 +132,24 @@ export function pageVitals(raw: unknown): PageVitals | null {
   const r = raw as { lcp?: unknown; shifts?: unknown; events?: unknown };
 
   const lcp = firstEntries(r.lcp)
-    .filter((e) => finite(e.startTime) && finite(e.size))
+    .filter((e) => within(e.startTime, DOMAIN.ms) && within(e.size, DOMAIN.size))
     .map((e) => ({ startTime: e.startTime as number, size: e.size as number, element: truncate(e.element) }));
   // Shifts right after input are expected and do not count, as in analyzeTrace.
   const shifts = firstEntries(r.shifts)
-    .filter((e) => finite(e.value) && finite(e.startTime) && e.hadRecentInput !== true)
+    .filter((e) => within(e.value, DOMAIN.shiftValue) && within(e.startTime, DOMAIN.ms) && e.hadRecentInput !== true)
     .map((e) => ({ t: e.startTime as number, score: e.value as number }));
   const events = firstEntries(r.events)
-    .filter((e) => finite(e.duration) && finite(e.interactionId))
+    .filter((e) => within(e.duration, DOMAIN.ms) && within(e.startTime, DOMAIN.ms) && finite(e.interactionId))
     .map((e) => ({ duration: e.duration as number, interactionId: e.interactionId as number }));
 
   return { lcp: lcpOf(lcp), cls: worstSessionWindow(shifts, 1), shiftCount: shifts.length, inp: inpOf(events) };
 }
 
 /**
- * Runs in the page (awaitPromise, returnByValue). Buffered observers replay what the browser kept
- * since load; the callback may run before the timer, so entries are kept from both it and
- * takeRecords. Returns plain numbers and a tag name, at most MAX_VITAL_ENTRIES of each kind.
- * Event timing reports only events of 40ms or more (durationThreshold).
+ * Runs in the isolated world (awaitPromise, returnByValue). Buffered observers replay what the
+ * browser kept since load; the callback may run before the timer, so entries are kept from both
+ * it and takeRecords. Returns plain numbers and a tag name, at most MAX_VITAL_ENTRIES of each kind,
+ * checked only with typeof and comparisons. Event timing reports only events of 40ms or more.
  */
 export const VITALS_PROBE = `new Promise((resolve, reject) => {
   const MAX = ${MAX_VITAL_ENTRIES};
@@ -158,7 +174,8 @@ export const VITALS_PROBE = `new Promise((resolve, reject) => {
       for (const [type, o] of observers) { keep(type, o.takeRecords()); o.disconnect(); }
       resolve({
         lcp: got['largest-contentful-paint'].map((e) => ({
-          startTime: e.startTime, size: e.size, element: e.element ? String(e.element.tagName).slice(0, 200).toLowerCase() : '',
+          startTime: e.startTime, size: e.size,
+          element: e.element && typeof e.element.tagName === 'string' && e.element.tagName.length <= 200 ? e.element.tagName.toLowerCase() : '',
         })),
         shifts: got['layout-shift'].map((e) => ({ value: e.value, startTime: e.startTime, hadRecentInput: e.hadRecentInput })),
         events: got.event.map((e) => ({ duration: e.duration, interactionId: e.interactionId, startTime: e.startTime })),
@@ -168,3 +185,94 @@ export const VITALS_PROBE = `new Promise((resolve, reject) => {
     }
   }, 0);
 })`;
+
+export interface MetricsCdp {
+  sendCommand(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number
+  ): Promise<{ result?: unknown; error?: { message: string } }>;
+}
+
+export const TAB_CHANGED = 'The selected tab changed while measuring; run metrics again.';
+
+/** A page that blocks its main thread holds the vitals probe; this bounds the wait for it. */
+const VITALS_TIMEOUT_MS = 10_000;
+
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The vitals, read in a world of our own, or our own words for why not. Never the page's text. */
+async function readVitals(cdp: MetricsCdp): Promise<{ vitals: PageVitals } | { vitalsError: string }> {
+  const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
+  let contextId: number;
+  try {
+    const tree = await cdp.sendCommand('Page.getFrameTree');
+    const frameId = (tree.result as { frameTree?: { frame?: { id?: unknown } } } | undefined)?.frameTree?.frame?.id;
+    if (tree.error || typeof frameId !== 'string') return { vitalsError: noWorld };
+    const world = await cdp.sendCommand('Page.createIsolatedWorld', { frameId, worldName: 'control-metrics' });
+    const id = (world.result as { executionContextId?: unknown } | undefined)?.executionContextId;
+    if (world.error || !finite(id)) return { vitalsError: noWorld };
+    contextId = id;
+  } catch {
+    return { vitalsError: noWorld };
+  }
+  try {
+    const r = await cdp.sendCommand(
+      'Runtime.evaluate',
+      { expression: VITALS_PROBE, contextId, returnByValue: true, awaitPromise: true },
+      VITALS_TIMEOUT_MS
+    );
+    const result = r.result as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
+    if (r.error) return { vitalsError: 'Chrome refused to run the vitals probe.' };
+    if (result?.exceptionDetails !== undefined) return { vitalsError: 'The vitals probe threw while reading performance entries.' };
+    const vitals = pageVitals(result?.result?.value);
+    return vitals ? { vitals } : { vitalsError: 'The vitals probe returned something other than performance entries.' };
+  } catch (error) {
+    // A timeout or a broken connection: the message is the client's own, not the page's.
+    return { vitalsError: `The vitals probe got no answer: ${messageOf(error)}` };
+  }
+}
+
+/**
+ * One snapshot: Chrome's counters, then the vitals. stillSelected says the tab measured is still
+ * the selected one; it is checked before, between and after, so counters of one tab are never
+ * returned with vitals of another.
+ */
+export async function readMetrics(cdp: MetricsCdp, stillSelected: () => boolean): Promise<ToolResult> {
+  const changed = { success: false, error: TAB_CHANGED };
+  if (!stillSelected()) return changed;
+  let metrics: ChromeMetrics;
+  try {
+    try {
+      const enabled = await cdp.sendCommand('Performance.enable');
+      if (enabled.error) throw new Error(enabled.error.message);
+      const r = await cdp.sendCommand('Performance.getMetrics');
+      if (r.error) throw new Error(r.error.message);
+      metrics = pickMetrics((r.result as { metrics?: unknown } | undefined)?.metrics);
+    } finally {
+      // An enable with no answer may still have turned the domain on: always ask to turn it off.
+      // A failed disable must not hide the reading.
+      await cdp.sendCommand('Performance.disable').catch(() => {});
+    }
+  } catch (error) {
+    if (!stillSelected()) return changed;
+    return { success: false, error: `Could not read Chrome's metrics: ${messageOf(error)}` };
+  }
+  if (!stillSelected()) return changed;
+  const vitals = await readVitals(cdp);
+  if (!stillSelected()) return changed;
+  return { success: true, data: { metrics, ...('vitals' in vitals ? vitals : { vitals: null, ...vitals }) } };
+}
+
+/**
+ * readMetrics, one call at a time: Performance is one domain per tab, so an overlapping call would
+ * turn it off under another's getMetrics. A call that fails does not hold up the next.
+ */
+export function createMetricsReader(): (cdp: MetricsCdp, stillSelected: () => boolean) => Promise<ToolResult> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (cdp, stillSelected) => {
+    const run = tail.then(() => readMetrics(cdp, stillSelected));
+    tail = run.catch(() => {});
+    return run;
+  };
+}
