@@ -69,7 +69,10 @@ export interface SinkOptions {
   overwrite?: boolean;
 }
 
-/** Where a trace is written. commit makes it final; abort removes everything the sink created. */
+/**
+ * Where a trace is written. commit makes it final. abort removes what the sink created, best
+ * effort and without throwing, except a complete trace whose final replace the OS refused.
+ */
 export interface TraceSink {
   path: string;
   fd: number;
@@ -93,8 +96,27 @@ function closer(fd: number): () => void {
 }
 
 /**
- * Check the path and create the file, before Chrome is asked to end the trace,
- * so a bad path costs the caller nothing: the recording keeps running.
+ * abort runs while another error is on its way out: a close error must not skip the removal,
+ * and neither may replace the error that caused the abort.
+ */
+function release(close: () => void, remove: () => void): void {
+  try {
+    close();
+  } catch {
+    // The removal below still runs.
+  }
+  try {
+    remove();
+  } catch {
+    // Best effort: the caller is already reporting the error that matters.
+  }
+}
+
+/**
+ * Check the path and create the file before Chrome is asked to end the trace, so a bad path
+ * never costs the recording: it keeps running. After the end, the one way a finished trace
+ * misses its path is the OS refusing the final replace (overwrite: true); the complete trace
+ * is then kept at the temp file the error names.
  */
 export function openTraceSink(options: SinkOptions): TraceSink {
   const ext = options.compress ? '.json.gz' : '.json';
@@ -117,10 +139,7 @@ export function openTraceSink(options: SinkOptions): TraceSink {
       fd,
       replaces: false,
       commit: close,
-      abort: () => {
-        close();
-        rmSync(fresh, { recursive: true, force: true });
-      },
+      abort: () => release(close, () => rmSync(fresh, { recursive: true, force: true })),
     };
   }
 
@@ -168,11 +187,8 @@ export function openTraceSink(options: SinkOptions): TraceSink {
       fd,
       replaces: false,
       commit: close,
-      abort: () => {
-        close();
-        // Created by us a moment ago, so ours to remove.
-        rmSync(target, { force: true });
-      },
+      // Created by us a moment ago, so ours to remove.
+      abort: () => release(close, () => rmSync(target, { force: true })),
     };
   }
 
@@ -181,18 +197,28 @@ export function openTraceSink(options: SinkOptions): TraceSink {
   const temp = join(parent, `.${basename(target)}.${randomBytes(6).toString('hex')}.tmp`);
   const fd = openSync(temp, 'wx', 0o600);
   const close = closer(fd);
+  let kept = false;
   return {
     path: target,
     fd,
     replaces: existing !== undefined,
     commit: () => {
       close();
-      renameSync(temp, target);
+      try {
+        renameSync(temp, target);
+      } catch (error) {
+        // The trace is complete and Chrome has ended it; deleting it now would lose the recording.
+        kept = true;
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Replacing ${target} was refused (${reason}). The trace is complete and kept at ${temp}; ` +
+            'move it into place yourself, or stop the next trace to another path.'
+        );
+      }
     },
-    abort: () => {
-      close();
-      rmSync(temp, { force: true });
-    },
+    abort: () => release(close, () => {
+      if (!kept) rmSync(temp, { force: true });
+    }),
   };
 }
 
