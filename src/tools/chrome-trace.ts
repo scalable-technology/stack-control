@@ -234,7 +234,35 @@ function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], 
     if (e.name === 'ProfileChunk' && e.ph === 'P') profiles.get(key(e))?.push(e);
   }
 
-  const buckets = new Map<string, Omit<HotFunction, 'selfMs' | 'selfPct'> & { selfUs: number }>();
+  type Bucket = Omit<HotFunction, 'selfMs' | 'selfPct'> & { selfUs: number };
+  const buckets = new Map<string, Bucket>();
+  // Worked out once per node, not per sample: a url can be a page's whole data: URL, and one
+  // node is sampled thousands of times. The bucket is null for (root), (idle) and (program).
+  const kinds = new Map<ProfileNode, { functionName: string; bucket: Bucket | null }>();
+  const kindOf = (node: ProfileNode) => {
+    let kind = kinds.get(node);
+    if (kind) return kind;
+    const frame = node.callFrame;
+    const functionName = stringOr(frame.functionName);
+    if (functionName === '(root)' || functionName === '(idle)' || functionName === '(program)') {
+      kind = { functionName, bucket: null };
+    } else {
+      const url = stringOr(frame.url);
+      const position = (value: number | undefined) =>
+        url && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + 1 : null;
+      const identity = JSON.stringify([functionName, url, String(frame.lineNumber), String(frame.columnNumber)]);
+      let bucket = buckets.get(identity);
+      if (!bucket) {
+        buckets.set(identity, (bucket = {
+          name: functionName || '(anonymous)', url,
+          line: position(frame.lineNumber), column: position(frame.columnNumber), selfUs: 0,
+        }));
+      }
+      kind = { functionName, bucket };
+    }
+    kinds.set(node, kind);
+    return kind;
+  };
   let sampledUs = 0;
   let idleUs = 0;
   let programUs = 0;
@@ -267,23 +295,11 @@ function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], 
       const durationUs = (samples[i + 1]?.time ?? sample.time) - sample.time;
       if (durationUs === 0) continue;
       sampledUs += durationUs;
-      const frame = sample.node.callFrame;
-      const functionName = stringOr(frame.functionName);
+      // Called only for samples with time, as before, so buckets are made in the same order.
+      const { functionName, bucket } = kindOf(sample.node);
       if (functionName === '(idle)') idleUs += durationUs;
       if (functionName === '(program)') programUs += durationUs;
-      if (functionName === '(root)' || functionName === '(idle)' || functionName === '(program)') continue;
-      const url = stringOr(frame.url);
-      const position = (value: number | undefined) =>
-        url && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + 1 : null;
-      const identity = JSON.stringify([functionName, url, String(frame.lineNumber), String(frame.columnNumber)]);
-      let bucket = buckets.get(identity);
-      if (!bucket) {
-        buckets.set(identity, (bucket = {
-          name: functionName || '(anonymous)', url,
-          line: position(frame.lineNumber), column: position(frame.columnNumber), selfUs: 0,
-        }));
-      }
-      bucket.selfUs += durationUs;
+      if (bucket) bucket.selfUs += durationUs;
     }
   }
   const busyUs = sampledUs - idleUs;

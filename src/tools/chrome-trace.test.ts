@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { analyzeTrace, type AnalyzeOptions, type TraceEvent } from './chrome-trace.js';
 
 const MAIN = { pid: 1, tid: 10 };
@@ -859,6 +859,31 @@ describe('analyzeTrace: cpu profile', () => {
     it('ignores nodes that are not an array instead of throwing', () => {
       const p = cpu([profile(), rawChunk({ cpuProfile: { nodes: { length: 1, 0: basicNodes[1] }, samples: [2, 2] }, timeDeltas: [1000, 1000] })]);
       expect(p).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+    });
+
+    it('serializes a node once, not once per sample, so a 1MB url is not copied per sample', () => {
+      // A page can run a script from a data: URL, so a frame's url can be its whole source.
+      const url = 'u'.repeat(1024 * 1024);
+      const nodes = [node(1, '(root)'), { id: 2, parent: 1, callFrame: { functionName: 'big', url, lineNumber: 0, columnNumber: 0 } }];
+      const events = withMain(profile(), rawChunk({ cpuProfile: { nodes, samples: Array(200).fill(2) }, timeDeltas: Array(200).fill(1000) }));
+      const stringify = JSON.stringify;
+      let large = 0;
+      // Counts without keeping the results, so the unfixed red run does not hold 200MB.
+      const spy = vi.spyOn(JSON, 'stringify').mockImplementation((...args: Parameters<typeof JSON.stringify>) => {
+        const out = stringify(...args);
+        if (typeof out === 'string' && out.length > 500_000) large++;
+        return out;
+      });
+      let p: ReturnType<typeof analyzeTrace>['profile'];
+      try {
+        p = analyzeTrace(events).profile;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(large).toBeLessThanOrEqual(2);
+      expect(p!.hot).toHaveLength(1);
+      expect(p!.hot[0]).toMatchObject({ name: 'big', line: 1, column: 1, selfMs: 199, selfPct: 100 });
+      expect(p!.hot[0].url).toBe(url);
     });
 
     it('treats a functionName or url that is not a string as empty', () => {
