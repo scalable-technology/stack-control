@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
 
@@ -155,5 +156,117 @@ describe('analyzeTrace: time by category (self time)', () => {
     expect(s.categoryMs.gc).toBeCloseTo(25, 5);
     expect(s.categoryMs.layout).toBeCloseTo(10, 5);
     expect(s.categoryMs.other).toBeCloseTo(35, 5);
+  });
+});
+
+describe('analyzeTrace: frames', () => {
+  const COMPOSITOR = { pid: 1, tid: 12 };
+
+  /** DrawFrame instant event on a compositor, ts in milliseconds. */
+  const draw = (tsMs: number, layerTreeId = 2): TraceEvent => ({
+    name: 'DrawFrame',
+    cat: 'disabled-by-default-devtools.timeline.frame',
+    ph: 'I',
+    ts: tsMs * 1000,
+    ...COMPOSITOR,
+    args: { layerTreeId, frameSeqId: Math.round(tsMs) },
+  });
+
+  /** Draws separated by the given gaps (ms), starting at t=1000. */
+  const drawsWithGaps = (gaps: number[], layerTreeId = 2): TraceEvent[] => {
+    const out = [draw(1000, layerTreeId)];
+    let t = 1000;
+    for (const g of gaps) {
+      t += g;
+      out.push(draw(t, layerTreeId));
+    }
+    return out;
+  };
+
+  const V = 1000 / 60;
+
+  it('reports 60 steady frames as about 60fps with nothing slow or dropped', () => {
+    const f = analyzeTrace(drawsWithGaps(Array(59).fill(V))).frames;
+    expect(f.count).toBe(60);
+    expect(f.fps).toBeCloseTo(60, 1);
+    expect(f.p50Ms).toBeCloseTo(V, 3);
+    expect(f.slow).toBe(0);
+    expect(f.dropped).toBe(0);
+  });
+
+  it('counts five 50ms gaps as 5 slow frames and 10 dropped vsync slots', () => {
+    const f = analyzeTrace(drawsWithGaps([...Array(55).fill(V), ...Array(5).fill(50)])).frames;
+    expect(f.slow).toBe(5);
+    expect(f.dropped).toBe(10); // round(50 / 16.67) = 3 slots, 2 missed, five times
+    expect(f.p50Ms).toBeCloseTo(V, 3);
+    expect(f.p99Ms).toBeCloseTo(50, 3);
+    expect(f.maxMs).toBeCloseTo(50, 3);
+  });
+
+  it('uses nearest-rank percentiles', () => {
+    // 100 gaps: 94 x 10ms, 6 x 100ms. Rank 95 of 100 is the first 100ms gap.
+    const f = analyzeTrace(drawsWithGaps([...Array(94).fill(10), ...Array(6).fill(100)])).frames;
+    expect(f.p50Ms).toBe(10);
+    expect(f.p95Ms).toBe(100);
+  });
+
+  it('gives null percentiles and 0 fps for under two draws', () => {
+    expect(analyzeTrace([]).frames).toMatchObject({ count: 0, fps: 0, p50Ms: null, slow: 0 });
+    expect(analyzeTrace([draw(1000)]).frames).toMatchObject({ count: 1, fps: 0, p50Ms: null });
+  });
+
+  it('measures only the compositor with the most draws', () => {
+    const noise = drawsWithGaps([200, 200], 7); // another layer tree, 3 draws
+    const f = analyzeTrace([...noise, ...drawsWithGaps(Array(9).fill(V), 2)]).frames;
+    expect(f.count).toBe(10);
+    expect(f.slow).toBe(0);
+  });
+
+  it('judges slow frames against the frame budget it is given', () => {
+    const gaps = Array(20).fill(25); // 25ms gaps: fine at 60Hz, slow at 120Hz
+    expect(analyzeTrace(drawsWithGaps(gaps)).frames.slow).toBe(0);
+    const f = analyzeTrace(drawsWithGaps(gaps), { frameBudgetMs: 1000 / 120 }).frames;
+    expect(f.slow).toBe(20);
+    expect(f.dropped).toBe(40); // round(25 / 8.33) = 3 slots, 2 missed, twenty times
+  });
+
+  it('rounds a gap to the nearest vsync slot when counting dropped frames', () => {
+    // 45ms is 2.7 slots at 60Hz: it lands on slot 3, so two were missed.
+    expect(analyzeTrace(drawsWithGaps([45])).frames.dropped).toBe(2);
+    // 40ms is 2.4 slots: it lands on slot 2, so one was missed.
+    expect(analyzeTrace(drawsWithGaps([40])).frames.dropped).toBe(1);
+  });
+
+  it('sorts draws by time before measuring gaps', () => {
+    const shuffled = drawsWithGaps(Array(9).fill(V)).reverse();
+    const f = analyzeTrace(shuffled).frames;
+    expect(f.slow).toBe(0);
+    expect(f.p50Ms).toBeCloseTo(V, 3);
+  });
+
+  describe('against a real Chrome trace', () => {
+    // Frame events cut from a headless Chrome trace of a page that stalls
+    // the main thread for 120ms every 20 animation frames (3s, 138 frames).
+    const events = (
+      JSON.parse(
+        readFileSync(new URL('./__fixtures__/frames-real.json', import.meta.url), 'utf8')
+      ) as { traceEvents: TraceEvent[] }
+    ).traceEvents;
+
+    it('finds the seven 120ms stalls', () => {
+      const f = analyzeTrace(events).frames;
+      expect(f.count).toBe(138);
+      expect(f.slow).toBe(7);
+      expect(f.p50Ms).toBeGreaterThan(16);
+      expect(f.p50Ms).toBeLessThan(17.5);
+      expect(f.maxMs).toBeGreaterThan(119);
+      expect(f.maxMs).toBeLessThan(121.5);
+    });
+
+    it('derives the same dropped-frame count Chrome logged itself', () => {
+      const chromeDropped = events.filter((e) => e.name === 'DroppedFrame').length;
+      expect(chromeDropped).toBeGreaterThan(0);
+      expect(analyzeTrace(events).frames.dropped).toBe(chromeDropped);
+    });
   });
 });

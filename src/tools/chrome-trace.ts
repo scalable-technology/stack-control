@@ -36,12 +36,77 @@ export interface CategoryMs {
   other: number;
 }
 
+export interface FrameStats {
+  /** DrawFrame events on the busiest compositor. */
+  count: number;
+  /** Draws per second across the span first to last draw; 0 under two draws. */
+  fps: number;
+  /** Frame time (gap between consecutive draws), nearest-rank; null under two draws. */
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+  maxMs: number | null;
+  /** Gaps longer than 1.5x the frame budget. */
+  slow: number;
+  /** Vsync slots missed: sum of round(gap / budget) - 1 over the gaps. */
+  dropped: number;
+}
+
+export interface AnalyzeOptions {
+  /** One vsync interval. Default 1000/60; pass 1000/120 for a 120Hz display. */
+  frameBudgetMs?: number;
+}
+
 export interface TraceSummary {
   windowMs: number;
   mainThread: { pid: number; tid: number } | null;
   busyPct: number;
   longTasks: LongTask[];
   categoryMs: CategoryMs;
+  frames: FrameStats;
+}
+
+const DEFAULT_FRAME_BUDGET_MS = 1000 / 60;
+
+/** Value at rank ceil(p * n) of an ascending array. */
+function nearestRank(sorted: number[], p: number): number {
+  return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
+}
+
+/**
+ * Frames from DrawFrame instants on the compositor with the most of them (a
+ * browser-level trace can hold several). Frame time is the gap between two
+ * consecutive draws, which is what the DevTools frame lane shows.
+ */
+function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
+  const byCompositor = new Map<string, number[]>();
+  for (const e of events) {
+    if (e.name !== 'DrawFrame') continue;
+    const key = `${e.pid}:${String(e.args?.layerTreeId)}`;
+    const list = byCompositor.get(key);
+    if (list) list.push(e.ts);
+    else byCompositor.set(key, [e.ts]);
+  }
+  let draws: number[] = [];
+  for (const list of byCompositor.values()) if (list.length > draws.length) draws = list;
+  draws.sort((a, b) => a - b);
+
+  const gaps = draws.slice(1).map((t, i) => (t - draws[i]) / 1000);
+  if (gaps.length === 0) {
+    return { count: draws.length, fps: 0, p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null, slow: 0, dropped: 0 };
+  }
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const spanS = (draws[draws.length - 1] - draws[0]) / 1_000_000;
+  return {
+    count: draws.length,
+    fps: spanS > 0 ? gaps.length / spanS : 0,
+    p50Ms: nearestRank(sorted, 0.5),
+    p95Ms: nearestRank(sorted, 0.95),
+    p99Ms: nearestRank(sorted, 0.99),
+    maxMs: sorted[sorted.length - 1],
+    slow: gaps.filter((g) => g > 1.5 * budgetMs).length,
+    dropped: gaps.reduce((n, g) => n + Math.max(0, Math.round(g / budgetMs) - 1), 0),
+  };
 }
 
 /** W3C Long Tasks: a task is long when it runs for more than 50ms. */
@@ -167,7 +232,7 @@ function selfTimeByCategory(spans: Span[]): CategoryMs {
   return out;
 }
 
-export function analyzeTrace(events: TraceEvent[]): TraceSummary {
+export function analyzeTrace(events: TraceEvent[], options: AnalyzeOptions = {}): TraceSummary {
   const timed = events.filter((e) => e.ph === 'X' && e.dur !== undefined);
   const main = findMainThread(events);
   const mainSpans = main
@@ -195,5 +260,6 @@ export function analyzeTrace(events: TraceEvent[]): TraceSummary {
         durationMs: (t.end - t.start) / 1000,
       })),
     categoryMs: selfTimeByCategory(mainSpans),
+    frames: analyzeFrames(events, options.frameBudgetMs ?? DEFAULT_FRAME_BUDGET_MS),
   };
 }
