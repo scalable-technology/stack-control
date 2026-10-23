@@ -202,13 +202,16 @@ const VITALS_TIMEOUT_MS = 10_000;
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /** The vitals, read in a world of our own, or our own words for why not. Never the page's text. */
-async function readVitals(cdp: MetricsCdp): Promise<{ vitals: PageVitals } | { vitalsError: string }> {
+/**
+ * The vitals, read in a world of our own, or our own words for why not. Never the page's text.
+ * frameId is the page target's id, which is its main frame's id: asking for the frame tree would
+ * bring every frame's name and URL (page data, any size) into Node just to find it.
+ */
+async function readVitals(cdp: MetricsCdp, frameId: string | undefined): Promise<{ vitals: PageVitals } | { vitalsError: string }> {
   const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
+  if (frameId === undefined) return { vitalsError: noWorld };
   let contextId: number;
   try {
-    const tree = await cdp.sendCommand('Page.getFrameTree');
-    const frameId = (tree.result as { frameTree?: { frame?: { id?: unknown } } } | undefined)?.frameTree?.frame?.id;
-    if (tree.error || typeof frameId !== 'string') return { vitalsError: noWorld };
     const world = await cdp.sendCommand('Page.createIsolatedWorld', { frameId, worldName: 'control-metrics' });
     const id = (world.result as { executionContextId?: unknown } | undefined)?.executionContextId;
     if (world.error || !finite(id)) return { vitalsError: noWorld };
@@ -238,7 +241,11 @@ async function readVitals(cdp: MetricsCdp): Promise<{ vitals: PageVitals } | { v
  * the selected one; it is checked before, between and after, so counters of one tab are never
  * returned with vitals of another.
  */
-export async function readMetrics(cdp: MetricsCdp, stillSelected: () => boolean): Promise<ToolResult> {
+export async function readMetrics(
+  cdp: MetricsCdp,
+  stillSelected: () => boolean,
+  frameId: string | undefined
+): Promise<ToolResult> {
   const changed = { success: false, error: TAB_CHANGED };
   if (!stillSelected()) return changed;
   let metrics: ChromeMetrics;
@@ -259,7 +266,7 @@ export async function readMetrics(cdp: MetricsCdp, stillSelected: () => boolean)
     return { success: false, error: `Could not read Chrome's metrics: ${messageOf(error)}` };
   }
   if (!stillSelected()) return changed;
-  const vitals = await readVitals(cdp);
+  const vitals = await readVitals(cdp, frameId);
   if (!stillSelected()) return changed;
   return { success: true, data: { metrics, ...('vitals' in vitals ? vitals : { vitals: null, ...vitals }) } };
 }
@@ -268,10 +275,14 @@ export async function readMetrics(cdp: MetricsCdp, stillSelected: () => boolean)
  * readMetrics, one call at a time: Performance is one domain per tab, so an overlapping call would
  * turn it off under another's getMetrics. A call that fails does not hold up the next.
  */
-export function createMetricsReader(): (cdp: MetricsCdp, stillSelected: () => boolean) => Promise<ToolResult> {
+export function createMetricsReader(): (
+  cdp: MetricsCdp,
+  stillSelected: () => boolean,
+  frameId: string | undefined
+) => Promise<ToolResult> {
   let tail: Promise<unknown> = Promise.resolve();
-  return (cdp, stillSelected) => {
-    const run = tail.then(() => readMetrics(cdp, stillSelected));
+  return (cdp, stillSelected, frameId) => {
+    const run = tail.then(() => readMetrics(cdp, stillSelected, frameId));
     tail = run.catch(() => {});
     return run;
   };

@@ -2093,7 +2093,8 @@ async function handleMetrics(): Promise<ToolResult> {
   const c = client;
   // The tab selected when the call was made: a switch while it waits or reads fails it.
   const epoch = c.selectionEpoch;
-  return readMetrics(c, () => client === c && c.selectionEpoch === epoch);
+  // A page target's id is its main frame's id; the epoch check covers a switch to another target.
+  return readMetrics(c, () => client === c && c.selectionEpoch === epoch, c.getCurrentTarget()?.id);
 }
 
 // =============================================================================

@@ -331,7 +331,6 @@ function fakeCdp(options: FakeMetricsOptions = {}) {
     'Performance.enable': {},
     'Performance.getMetrics': { metrics: [{ name: 'Nodes', value: 42 }, { name: 'JSHeapUsedSize', value: 1000 }] },
     'Performance.disable': {},
-    'Page.getFrameTree': { frameTree: { frame: { id: 'F1' } } },
     'Page.createIsolatedWorld': { executionContextId: 77 },
     'Runtime.evaluate': { result: { value: { lcp: [], shifts: [{ value: 0.25, startTime: 10, hadRecentInput: false }], events: [] } } },
   };
@@ -353,7 +352,7 @@ describe('readMetrics', () => {
 
   it('reads the counters, then the vitals in an isolated world', async () => {
     const f = fakeCdp();
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect(r.success, r.error).toBe(true);
     const d = r.data as { metrics: Record<string, unknown>; vitals: Record<string, unknown> };
     expect(d.metrics.nodes).toBe(42);
@@ -361,10 +360,11 @@ describe('readMetrics', () => {
     expect(d.vitals).toEqual({ lcp: null, cls: 0.25, shiftCount: 1, inp: null });
     expect(f.methods()).toEqual([
       'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
-      'Page.getFrameTree', 'Page.createIsolatedWorld', 'Runtime.evaluate',
+      'Page.createIsolatedWorld', 'Runtime.evaluate',
     ]);
-    expect(f.sent[4].params).toEqual({ frameId: 'F1', worldName: 'control-metrics' });
-    const evaluate = f.sent[5];
+    // The page target's id is its main frame's id: no frame tree (page names and URLs) is fetched.
+    expect(f.sent[3].params).toEqual({ frameId: 'T1', worldName: 'control-metrics' });
+    const evaluate = f.sent[4];
     expect(evaluate.params).toMatchObject({ contextId: 77, returnByValue: true, awaitPromise: true });
     expect(evaluate.timeoutMs).toBe(10_000);
   });
@@ -373,11 +373,9 @@ describe('readMetrics', () => {
     ['Page.createIsolatedWorld', 'error'],
     ['Page.createIsolatedWorld', 'reject'],
     ['Page.createIsolatedWorld', { executionContextId: 'not a number' }],
-    ['Page.getFrameTree', 'error'],
-    ['Page.getFrameTree', { frameTree: {} }],
   ])('never falls back to the page world: %s answering %j gives vitals null', async (method, answer) => {
     const f = fakeCdp({ answers: { [method]: answer } });
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect(r.success, r.error).toBe(true);
     const d = r.data as { metrics: Record<string, unknown>; vitals: unknown; vitalsError?: string };
     expect(d.metrics.nodes).toBe(42);
@@ -386,11 +384,21 @@ describe('readMetrics', () => {
     expect(f.methods()).not.toContain('Runtime.evaluate');
   });
 
+  it('gives vitals null, and sends no probe, without a target id to make the world in', async () => {
+    const f = fakeCdp();
+    const r = await readMetrics(f.cdp, always, undefined);
+    expect(r.success, r.error).toBe(true);
+    expect((r.data as { vitals: unknown }).vitals).toBeNull();
+    expect((r.data as { vitalsError?: string }).vitalsError).toMatch(/separate JS world/);
+    expect(f.methods()).not.toContain('Runtime.evaluate');
+    expect(f.methods()).not.toContain('Page.createIsolatedWorld');
+  });
+
   it("gives vitals null and our own reason when the probe throws, without the page's text", async () => {
     const f = fakeCdp({
       answers: { 'Runtime.evaluate': { exceptionDetails: { text: 'page secret text', exception: { description: 'page secret text' } } } },
     });
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect(r.success).toBe(true);
     const d = r.data as { vitals: unknown; vitalsError?: string };
     expect(d.vitals).toBeNull();
@@ -412,13 +420,13 @@ describe('readMetrics', () => {
         },
       },
     });
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect((r.data as { vitals: unknown }).vitals).toEqual({ lcp: null, cls: 0, shiftCount: 0, inp: null });
   });
 
   it.each(['reject', 'error'])('sends Performance.disable even when enable gets %s', async (answer) => {
     const f = fakeCdp({ answers: { 'Performance.enable': answer } });
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/^Could not read Chrome's metrics: /);
     expect(f.methods()).toEqual(['Performance.enable', 'Performance.disable']);
@@ -426,14 +434,14 @@ describe('readMetrics', () => {
 
   it("fails with Chrome's message when getMetrics is refused, and still disables", async () => {
     const f = fakeCdp({ answers: { 'Performance.getMetrics': 'error' } });
-    const r = await readMetrics(f.cdp, always);
+    const r = await readMetrics(f.cdp, always, 'T1');
     expect(r).toEqual({ success: false, error: "Could not read Chrome's metrics: Performance.getMetrics refused" });
     expect(f.methods()).toContain('Performance.disable');
   });
 
   it('ignores a failed disable', async () => {
     const f = fakeCdp({ answers: { 'Performance.disable': 'reject' } });
-    expect((await readMetrics(f.cdp, always)).success).toBe(true);
+    expect((await readMetrics(f.cdp, always, 'T1')).success).toBe(true);
   });
 
   it.each(['Performance.disable', 'Runtime.evaluate'])(
@@ -441,7 +449,7 @@ describe('readMetrics', () => {
     async (at) => {
       let selected = true;
       const f = fakeCdp({ onSend: (m) => { if (m === at) selected = false; } });
-      const r = await readMetrics(f.cdp, () => selected);
+      const r = await readMetrics(f.cdp, () => selected, 'T1');
       expect(r).toEqual({ success: false, error: TAB_CHANGED });
       // Once the tab changed, nothing more is sent: the probe never runs in the new tab.
       expect(f.methods().slice(f.methods().indexOf(at) + 1)).toEqual([]);
@@ -450,7 +458,7 @@ describe('readMetrics', () => {
 
   it('sends nothing when the tab already changed before it started', async () => {
     const f = fakeCdp();
-    expect(await readMetrics(f.cdp, () => false)).toEqual({ success: false, error: TAB_CHANGED });
+    expect(await readMetrics(f.cdp, () => false, 'T1')).toEqual({ success: false, error: TAB_CHANGED });
     expect(f.sent).toEqual([]);
   });
 });
@@ -461,7 +469,7 @@ describe('createMetricsReader', () => {
   it('runs overlapping calls one at a time, so one never disables the other mid-read', async () => {
     const f = fakeCdp({ onSend: () => new Promise((r) => setTimeout(r, 5)) });
     const read = createMetricsReader();
-    const [a, b] = await Promise.all([read(f.cdp, () => true), read(f.cdp, () => true)]);
+    const [a, b] = await Promise.all([read(f.cdp, () => true, 'T1'), read(f.cdp, () => true, 'T1')]);
     expect(a.success && b.success).toBe(true);
     expect(perf(f.methods())).toEqual([
       'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
@@ -472,8 +480,8 @@ describe('createMetricsReader', () => {
   it('does not let a call that throws block the next one', async () => {
     const f = fakeCdp();
     const read = createMetricsReader();
-    const first = read(f.cdp, () => { throw new Error('boom'); });
-    const second = read(f.cdp, () => true);
+    const first = read(f.cdp, () => { throw new Error('boom'); }, 'T1');
+    const second = read(f.cdp, () => true, 'T1');
     await expect(first).rejects.toThrow('boom');
     expect((await second).success).toBe(true);
   });

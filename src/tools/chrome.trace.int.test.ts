@@ -878,6 +878,16 @@ const HOSTILE_PAGE = `<!doctype html><body style="margin:0;font:16px sans-serif"
   }, 300);
 </script></body>`;
 
+// A page whose iframe carries a 5MB name: frame names and URLs are page data of any size.
+const BIG_FRAME_NAME_PAGE = `<!doctype html><body style="margin:0">
+<h1 style="font:64px sans-serif;margin:0">Heading beside a heavy iframe</h1>
+<script>
+  const f = document.createElement('iframe');
+  f.name = 'n'.repeat(5 << 20);
+  f.srcdoc = '<p>inner</p>';
+  document.body.appendChild(f);
+</script></body>`;
+
 interface MetricsData {
   metrics: Record<string, number | null>;
   vitals: {
@@ -935,7 +945,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
   beforeAll(async () => {
     browser = await launchTestBrowser();
     for (const [name, html] of Object.entries({
-      nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, hostile: HOSTILE_PAGE,
+      nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, hostile: HOSTILE_PAGE, bigFrame: BIG_FRAME_NAME_PAGE,
     })) {
       servers[name] = await servePage(html);
     }
@@ -1062,6 +1072,42 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect(d.vitals!.lcp?.element).toBe('h1');
     expect(d.vitals!.lcp!.ms).toBeGreaterThan(0);
     expect(d.vitals!.inp).toBe(null);
+  }, 60_000);
+
+  it('finds the main frame without the frame tree, so a 5MB iframe name never reaches Node', async () => {
+    await open(servers.bigFrame.url);
+    await until('document.querySelector("iframe")?.name.length === 5 << 20', 'the iframe with the big name');
+    let r: Awaited<ReturnType<typeof call>> | undefined;
+    const startedAt = Date.now();
+    const sent = await methodsSent(async () => {
+      r = await call({ method: 'metrics' });
+    });
+    const elapsed = Date.now() - startedAt;
+    expect(r!.success, r!.error).toBe(true);
+    expect(sent).not.toContain('Page.getFrameTree');
+    expect(sent).toContain('Page.createIsolatedWorld');
+    const d = r!.data as MetricsData;
+    expect(d.vitals).not.toBeNull();
+    expect(d.vitals!.lcp?.element).toBe('h1');
+    expect(JSON.stringify(d).length).toBeLessThan(2000);
+    expect(elapsed).toBeLessThan(5000);
+  }, 60_000);
+
+  it('uses the target id as the frame in a second tab it selected', async () => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?${servers.big.url}`, { method: 'PUT' });
+    const other = (await created.json()) as { id: string };
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.id !== other.id && x.url.startsWith('http'));
+    try {
+      expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
+      await until('document.readyState === "complete"', 'the second tab to load');
+      const d = await metrics();
+      expect(d.vitals, d.vitalsError).not.toBeNull();
+      expect(d.metrics.nodes).toBeGreaterThan(0);
+    } finally {
+      if (original) await call({ method: 'select', targetId: original.id });
+      await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
+    }
   }, 60_000);
 
   it('gives vitals null, and never runs the probe in the page world, when the isolated world cannot be made', async () => {
