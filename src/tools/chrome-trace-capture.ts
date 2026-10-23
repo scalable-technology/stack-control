@@ -408,8 +408,10 @@ interface ActiveTrace {
   compress: boolean;
 }
 
-const CLOSED_DURING_STOP =
-  'The connection to Chrome closed during stop; Chrome ends a trace with its session, so nothing was kept.';
+/** All a reset during stop proves: this trace is gone, by a teardown or by another call's stop. */
+const GONE_DURING_STOP =
+  'This trace is no longer active: the connection to Chrome closed or another call ended it while this stop was running. ' +
+  'Chrome ends a trace with its session; this call kept nothing.';
 
 /** An id mismatch shows only that this call's recording is not the active one, not why. */
 export const TRACE_GONE =
@@ -505,11 +507,11 @@ export class TraceRecorder {
       return { ...out, durationMs };
     } catch (error) {
       stillRunning = mayStillRun(error);
-      // No answer to the end because the session itself ended (the recorder was reset with it):
-      // Chrome ended the trace with the session, so it is not running.
+      // No answer to the end, and the recorder was reset meanwhile: by a teardown (Chrome ended the
+      // trace with its session) or by another call's stop. Either way it is not this call's to report.
       if (stillRunning && this.active !== trace) {
         stillRunning = false;
-        throw new Error(CLOSED_DURING_STOP, { cause: error });
+        throw new Error(GONE_DURING_STOP, { cause: error });
       }
       throw error;
     } finally {
@@ -567,11 +569,11 @@ export async function abandonTrace(
       }
     }
     if (end === undefined && !recorder.isCurrent(id)) {
-      // No answer because the session ended (the recorder was reset with it), and the trace with it.
-      // The first stop's message is left out: its "may still be running" is no longer true.
+      // The trace stopped being ours while the end went unanswered: a teardown or another call's stop.
+      // The first stop's message is left out: its "may still be running" is no longer known to be true.
       return (
-        `${failure} Stopping the trace failed, and then the connection to Chrome closed: ` +
-        'Chrome ends a trace with its session, so nothing was kept.'
+        `${failure} Stopping the trace failed, and then this trace was no longer active: the connection to Chrome ` +
+        'closed or another call ended it. Chrome ends a trace with its session; this call kept nothing.'
       );
     }
     if (end === undefined) {

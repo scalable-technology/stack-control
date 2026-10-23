@@ -529,7 +529,7 @@ describe('TraceRecorder', () => {
     expect(rec.running).toBe(false);
   });
 
-  it('says the connection closed, not "may still be running", when the session ends during the end', async () => {
+  it('says the trace is no longer active, not "may still be running", when the session ends during the end', async () => {
     const dir = tempDir();
     const rec = new TraceRecorder();
     // The socket drops while Tracing.end is in flight: teardown resets the recorder, then the end rejects.
@@ -537,7 +537,8 @@ describe('TraceRecorder', () => {
     const id = await rec.start(f.cdp, { compress: false });
     const error = (await rec.stop(f.cdp, { dir, id }).catch((e: unknown) => e)) as Error;
     expect(error.message).toBe(
-      'The connection to Chrome closed during stop; Chrome ends a trace with its session, so nothing was kept.'
+      'This trace is no longer active: the connection to Chrome closed or another call ended it while this stop was running. ' +
+        'Chrome ends a trace with its session; this call kept nothing.'
     );
     expect(error).not.toBeInstanceOf(TraceStillRunningError);
     expect(readdirSync(dir)).toEqual([]);
@@ -1083,7 +1084,7 @@ describe('abandonTrace', () => {
     expect(rec.running).toBe(false);
   });
 
-  it('says the connection closed when the session ends during its best-effort end', async () => {
+  it('says the trace is no longer active when the session ends during its best-effort end', async () => {
     const rec = new TraceRecorder();
     let ends = 0;
     // The first end gets no answer; the session ends during the second.
@@ -1091,8 +1092,8 @@ describe('abandonTrace', () => {
     const id = await rec.start(f.cdp, { compress: false });
     const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
     expect(message).toBe(
-      'Scroll failed. Stopping the trace failed, and then the connection to Chrome closed: ' +
-        'Chrome ends a trace with its session, so nothing was kept.'
+      'Scroll failed. Stopping the trace failed, and then this trace was no longer active: the connection to Chrome ' +
+        'closed or another call ended it. Chrome ends a trace with its session; this call kept nothing.'
     );
     expect(message).not.toMatch(/may still be running/);
     expect(rec.running).toBe(false);
