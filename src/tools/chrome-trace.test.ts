@@ -275,10 +275,99 @@ describe('analyzeTrace: frames', () => {
       expect(f.maxMs).toBeLessThan(121.5);
     });
 
-    it('derives the same dropped-frame count Chrome logged itself', () => {
-      const chromeDropped = events.filter((e) => e.name === 'DroppedFrame').length;
-      expect(chromeDropped).toBeGreaterThan(0);
-      expect(analyzeTrace(events).frames.dropped).toBe(chromeDropped);
+    it('agrees with Chrome on a page whose stalls stop the compositor too', () => {
+      // True here only because each 120ms stall also skips every draw. It is
+      // not general: see the DevTools trace below, where the two disagree.
+      const f = analyzeTrace(events).frames;
+      expect(f.chromeDropped).toBe(events.filter((e) => e.name === 'DroppedFrame').length);
+      expect(f.chromeDropped).toBeGreaterThan(0);
+      expect(f.dropped).toBe(f.chromeDropped);
+    });
+  });
+});
+
+describe('analyzeTrace: frames Chrome logged as dropped', () => {
+  const drawAt = (tsMs: number, seq: number, layerTreeId = 2): TraceEvent => ({
+    name: 'DrawFrame',
+    cat: 'disabled-by-default-devtools.timeline.frame',
+    ph: 'I',
+    ts: tsMs * 1000,
+    pid: 1,
+    tid: 12,
+    args: { layerTreeId, frameSeqId: seq },
+  });
+  const dropAt = (tsMs: number, seq: number, layerTreeId = 2): TraceEvent => ({
+    name: 'DroppedFrame',
+    cat: 'disabled-by-default-devtools.timeline.frame',
+    ph: 'I',
+    ts: tsMs * 1000,
+    pid: 1,
+    tid: 12,
+    args: { layerTreeId, frameSeqId: seq, hasPartialUpdate: true },
+  });
+
+  it('counts DroppedFrame events and how many were drawn anyway', () => {
+    const f = analyzeTrace([
+      drawAt(1000, 1),
+      drawAt(1016.7, 2),
+      drawAt(1033.4, 3),
+      drawAt(1050.1, 4),
+      dropAt(1016.7, 2), // seq 2 also has a DrawFrame: drawn anyway
+      dropAt(1033.4, 3), // drawn anyway
+      dropAt(1040, 99), // seq 99 never drawn
+    ]).frames;
+    expect(f.chromeDropped).toBe(3);
+    expect(f.chromeDroppedDrawn).toBe(2);
+  });
+
+  it('ignores DroppedFrame events from other compositors', () => {
+    const f = analyzeTrace([
+      drawAt(1000, 1),
+      drawAt(1016.7, 2),
+      dropAt(1016.7, 2),
+      dropAt(1016.7, 2, 7), // another layer tree
+    ]).frames;
+    expect(f.chromeDropped).toBe(1);
+  });
+
+  it('does not match a drop and a draw that both lack a frameSeqId', () => {
+    const noSeq = (name: string, tsMs: number): TraceEvent => ({
+      name,
+      ph: 'I',
+      ts: tsMs * 1000,
+      pid: 1,
+      tid: 12,
+      args: { layerTreeId: 2 },
+    });
+    const f = analyzeTrace([noSeq('DrawFrame', 1000), noSeq('DrawFrame', 1016), noSeq('DroppedFrame', 1010)]).frames;
+    expect(f.chromeDropped).toBe(1);
+    expect(f.chromeDroppedDrawn).toBe(0);
+  });
+
+  it('reports drops even when there are fewer than two draws', () => {
+    const f = analyzeTrace([drawAt(1000, 1), dropAt(1005, 5)]).frames;
+    expect(f.count).toBe(1);
+    expect(f.chromeDropped).toBe(1);
+  });
+
+  describe('against a real DevTools Performance trace', () => {
+    // Frame events only, cut from an 11s scroll recording of a WebGPU page.
+    // The compositor held ~59fps, yet Chrome logged 87 dropped frames, 77 of
+    // them drawn anyway: gap-based numbers alone would call this page smooth.
+    const events = (
+      JSON.parse(
+        readFileSync(new URL('./__fixtures__/frames-devtools.json', import.meta.url), 'utf8')
+      ) as { traceEvents: TraceEvent[] }
+    ).traceEvents;
+
+    it('sees the drops that the draw gaps cannot', () => {
+      const f = analyzeTrace(events).frames;
+      expect(f.count).toBe(655);
+      expect(f.fps).toBeGreaterThan(58);
+      expect(f.slow).toBe(3);
+      expect(f.dropped).toBe(12); // gap-derived: looks nearly clean
+      expect(f.chromeDropped).toBe(87);
+      expect(f.chromeDroppedDrawn).toBe(77);
     });
   });
 });
