@@ -18,7 +18,9 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_TRACE_CATEGORIES,
+  TRACE_GONE,
   TraceRecorder,
+  abandonTrace,
   openTraceSink,
   startTrace,
   stopTrace,
@@ -34,6 +36,7 @@ vi.mock('node:fs', async (importOriginal) => {
     ...real,
     closeSync: vi.fn(real.closeSync),
     lstatSync: vi.fn(real.lstatSync),
+    openSync: vi.fn(real.openSync),
     renameSync: vi.fn(real.renameSync),
     rmSync: vi.fn(real.rmSync),
   };
@@ -61,6 +64,8 @@ interface FakeOptions {
   complete?: Record<string, unknown>;
   readError?: string;
   endError?: string;
+  /** The first n Tracing.end calls get no answer: they reject, as a CDP timeout does. */
+  endRejects?: number;
   /** Runs when IO.read call number n (0-based) arrives, before its chunk is returned. */
   onRead?: (n: number) => void;
 }
@@ -74,9 +79,14 @@ function fake(options: FakeOptions = {}) {
   let waiting = false;
   let signal: AbortSignal | undefined;
   let reads = 0;
+  let endRejects = options.endRejects ?? 0;
   const cdp: TraceCdp = {
     sendCommand: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       sent.push({ method, params });
+      if (method === 'Tracing.end' && endRejects > 0) {
+        endRejects--;
+        throw new Error('Command Tracing.end timed out after 30s');
+      }
       if (method === 'Tracing.end' && options.endError) return { error: { message: options.endError } };
       if (method === 'IO.read') {
         options.onRead?.(reads++);
@@ -371,6 +381,77 @@ describe('TraceRecorder', () => {
     const out = await rec.stop(fake().cdp, { dir });
     expect(out.compressed).toBe(true);
     expect(out.path.endsWith('.json.gz')).toBe(true);
+  });
+
+  it('reserves on start before Chrome answers, so an overlapping start is refused', async () => {
+    const { cdp, sent } = fake();
+    const rec = new TraceRecorder();
+    const first = rec.start(cdp, { compress: false });
+    const second = rec.start(cdp, { compress: false });
+    await expect(second).rejects.toThrow(/already running/);
+    const id = await first;
+    expect(calls(sent, 'Tracing.start')).toHaveLength(1);
+    expect(rec.running).toBe(true);
+    expect(rec.isCurrent(id)).toBe(true);
+  });
+
+  it('refuses a stop for a trace that is gone and leaves the new one alone', async () => {
+    const dir = tempDir();
+    const f = fake();
+    const rec = new TraceRecorder();
+    const old = await rec.start(f.cdp, { compress: false });
+    rec.reset();
+    const next = await rec.start(f.cdp, { compress: false });
+    await expect(rec.stop(f.cdp, { dir, id: old })).rejects.toThrow(/The trace this call started is gone/);
+    expect(calls(f.sent, 'Tracing.end')).toEqual([]);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(rec.isCurrent(next)).toBe(true);
+    const out = await rec.stop(f.cdp, { dir, id: next });
+    expect(existsSync(out.path)).toBe(true);
+    expect(rec.running).toBe(false);
+  });
+
+  it('does not clear a trace started while an older stop was still draining', async () => {
+    const dir = tempDir();
+    const rec = new TraceRecorder();
+    let next: Promise<number> | undefined;
+    const draining = fake({
+      onRead: () => {
+        // The old session went away mid-drain and someone started a new trace.
+        rec.reset();
+        next = rec.start(fake().cdp, { compress: false });
+      },
+    });
+    await rec.start(draining.cdp, { compress: false });
+    await rec.stop(draining.cdp, { dir });
+    const id = await next!;
+    expect(rec.running).toBe(true);
+    expect(rec.isCurrent(id)).toBe(true);
+  });
+
+  it('keeps the trace running when Tracing.end gets no answer, and a second stop works', async () => {
+    const dir = tempDir();
+    const f = fake({ endRejects: 1 });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    await expect(rec.stop(f.cdp, { dir, id })).rejects.toThrow(
+      /Stop did not complete; the trace may still be running\. Try stop again, or disconnect to end it/
+    );
+    expect(rec.running).toBe(true);
+    expect(readdirSync(dir)).toEqual([]); // the file for the failed stop was removed
+    const out = await rec.stop(f.cdp, { dir, id });
+    expect(existsSync(out.path)).toBe(true);
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(2);
+    expect(rec.running).toBe(false);
+  });
+
+  it('treats the trace as over when Chrome answers Tracing.end with an error', async () => {
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    await expect(rec.stop(fake({ endError: 'not tracing' }).cdp, { dir: tempDir() })).rejects.toThrow(
+      /Chrome refused to end the trace: not tracing/
+    );
+    expect(rec.running).toBe(false);
   });
 
   it('reset forgets a running trace', async () => {
@@ -678,6 +759,17 @@ describe('TraceRecorder: stop to a chosen path', () => {
 describe('openTraceSink', () => {
   const closes = (fd: number) => vi.mocked(fs.closeSync).mock.calls.filter(([n]) => n === fd).length;
 
+  it('throws the create error even when removing the fresh directory also fails', () => {
+    const dir = tempDir();
+    vi.mocked(fs.openSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error('EMFILE: too many open files, open'), { code: 'EMFILE' });
+    });
+    vi.mocked(fs.rmSync).mockImplementationOnce(() => {
+      throw new Error('EBUSY: resource busy, rm');
+    });
+    expect(() => openTraceSink({ compress: false, dir })).toThrow(/EMFILE/);
+  });
+
   it('refuses a path that is already taken by the time it opens it', () => {
     const dir = tempDir();
     const target = join(dir, 'out.json');
@@ -745,6 +837,18 @@ describe('openTraceSink', () => {
 });
 
 describe('validateOutPath', () => {
+  it.skipIf(process.getuid?.() === 0)('refuses a parent it cannot write to, and creates nothing', () => {
+    const dir = tempDir();
+    const locked = join(dir, 'locked');
+    mkdirSync(locked, 0o500);
+    try {
+      expect(() => validateOutPath({ compress: false, outPath: join(locked, 'a.json') })).toThrow(/not writable/);
+      expect(readdirSync(locked)).toEqual([]);
+    } finally {
+      fs.chmodSync(locked, 0o700);
+    }
+  });
+
   it('resolves a free path and creates nothing', () => {
     const dir = tempDir();
     expect(validateOutPath({ compress: true, outPath: `${dir}/sub/../a.json.gz` })).toEqual({
@@ -780,5 +884,65 @@ describe('validateOutPath', () => {
     expect(validateOutPath({ compress: false, outPath: target, overwrite: true })).toEqual({ target, parent: dir, exists: true });
     expect(readFileSync(target, 'utf8')).toBe('old');
     expect(readdirSync(dir)).toEqual(['b.json']);
+  });
+});
+
+describe('abandonTrace', () => {
+  const tracesIn = () => readdirSync(tmpdir()).filter((n) => n.startsWith('control-trace-'));
+
+  it('touches nothing when the trace it started is gone', async () => {
+    const f = fake();
+    const rec = new TraceRecorder();
+    const old = await rec.start(f.cdp, { compress: false });
+    rec.reset();
+    const other = await rec.start(f.cdp, { compress: false });
+    expect(await abandonTrace(rec, f.cdp, old, 'Scroll failed.')).toBe(`Scroll failed. ${TRACE_GONE}`);
+    expect(calls(f.sent, 'Tracing.end')).toEqual([]);
+    expect(rec.isCurrent(other)).toBe(true);
+  });
+
+  it('stops privately and says where the partial trace is', async () => {
+    const f = fake();
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    const path = /^Scroll failed\. The partial trace was kept at (\S+)\.$/.exec(message)?.[1];
+    expect(path, message).toBeDefined();
+    dirs.push(dirname(path!));
+    expect(existsSync(path!)).toBe(true);
+    expect(rec.running).toBe(false);
+  });
+
+  it('says what Chrome refused and sends nothing more when Chrome answers the end with an error', async () => {
+    const f = fake({ endError: 'not tracing' });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const before = tracesIn();
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    expect(message).toBe('Scroll failed. Stopping the trace also failed: Chrome refused to end the trace: not tracing');
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(1);
+    expect(rec.running).toBe(false);
+    expect(tracesIn()).toEqual(before);
+  });
+
+  it('keeps the trace running and says so when Chrome answers neither end', async () => {
+    const f = fake({ endRejects: 2 });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    expect(message).toMatch(/the trace may still be running\. Try chrome\(\{ method: "trace", action: "stop" \}\) again, or disconnect/);
+    expect(message).not.toMatch(/nothing was kept|partial trace was kept/);
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(2);
+    expect(rec.isCurrent(id)).toBe(true);
+  });
+
+  it('forgets the trace once Chrome answers the second end', async () => {
+    const f = fake({ endRejects: 1 });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    expect(message).toMatch(/Chrome then ended the trace; nothing was kept\.$/);
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(2);
+    expect(rec.running).toBe(false);
   });
 });

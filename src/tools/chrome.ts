@@ -41,7 +41,7 @@ import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
 import { waitForCdpEvent } from './cdp-events.js';
-import { TraceRecorder, validateOutPath } from './chrome-trace-capture.js';
+import { TRACE_GONE, TraceRecorder, TraceStillRunningError, abandonTrace, validateOutPath } from './chrome-trace-capture.js';
 import { summarizeTraceFile } from './chrome-trace-summary.js';
 
 // =============================================================================
@@ -785,7 +785,7 @@ const ProfileInput = z.object({
     .max(30000)
     .optional()
     .default(5000)
-    .describe('How long to record, in ms (1000-30000, default: 5000)'),
+    .describe('Target recording length in ms (1000-30000, default: 5000); a stalled page can run longer'),
   scroll: ScrollFields.optional().describe('A scroll gesture to run during the recording: the scroll method\'s fields'),
   categories: traceCategories.describe('Chrome trace categories (default: the DevTools Performance set plus frame and input)'),
   compress: traceCompress.describe('gzip the file (.json.gz, which DevTools opens); false writes plain .json'),
@@ -1894,12 +1894,15 @@ async function handleTrace(input: z.infer<typeof TraceInput>): Promise<ToolResul
   }
 }
 
-/** How trace stop and profile end: stop to the chosen path, then summarize the file. Throws if the stop fails. */
+/**
+ * How trace stop and profile end: stop to the chosen path, then summarize the file. Throws if the
+ * stop fails. With an id, it stops only that trace (see TraceRecorder.stop).
+ */
 async function stopAndSummarize(
   c: ChromeCDPClient,
-  options: { outPath?: string; overwrite?: boolean; summary: boolean }
+  options: { outPath?: string; overwrite?: boolean; summary: boolean; id?: number }
 ): Promise<Record<string, unknown>> {
-  const out = await recorder.stop(c, { outPath: options.outPath, overwrite: options.overwrite });
+  const out = await recorder.stop(c, { outPath: options.outPath, overwrite: options.overwrite, id: options.id });
   // After the file is final and the recorder cleared: the summary can only add to a stop that worked.
   // summarizeTraceFile does not throw; the catch keeps that promise here even if it ever did.
   const summarized = options.summary
@@ -1926,30 +1929,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const messageOf = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
 
 /**
- * Ends a profile that failed after its trace started: Chrome must not be left tracing. What it
- * recorded is kept in a fresh private directory, never at the caller's outPath, and not summarized.
+ * Ends a profile that failed after its trace started; see abandonTrace. A recorder on another
+ * connection holds someone else's trace, so nothing is touched there.
  */
-async function abandonProfile(c: ChromeCDPClient, failure: string): Promise<string> {
-  // Teardown cleared the recorder: Chrome ended the trace with the session. A recorder on a new
-  // connection belongs to someone else's trace and is not ours to stop.
-  if (client !== c || !recorder.running) {
-    return `${failure} The connection to Chrome closed during the profile and Chrome ended the trace with it; nothing was kept.`;
-  }
-  try {
-    const out = await recorder.stop(c);
-    return `${failure} The partial trace was kept at ${out.path}.`;
-  } catch (error) {
-    if (recorder.running) {
-      // Not even the private file could be made: end the recording anyway rather than leave Chrome tracing.
-      await c.sendCommand('Tracing.end').catch(() => {});
-      recorder.reset();
-    }
-    return `${failure} Stopping the trace also failed: ${messageOf(error, 'unknown error')}`;
-  }
+async function abandonProfile(c: ChromeCDPClient, id: number, failure: string): Promise<string> {
+  if (client !== c) return `${failure} ${TRACE_GONE}`;
+  return abandonTrace(recorder, c, id, failure);
 }
 
 async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolResult> {
-  // Every check that costs nothing runs before the trace starts, so a bad call records nothing.
+  // The cheap checks run before the trace starts, so a call they refuse records nothing: the
+  // connection, a running trace, the scroll estimate, and outPath's metadata and parent. A
+  // destination that turns bad after the check fails the profile after recording (see below).
   if (!client?.isConnected()) {
     return { success: false, error: 'Not connected. Use chrome({ method: "connect" }) first.' };
   }
@@ -1963,12 +1954,13 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
     };
   }
   if (input.scroll) {
+    // An estimate from distance and speed: a stalled page can make the real gesture longer.
     const scrollMs = Math.ceil(scrollExpectedMs(input.scroll));
     if (SETTLE_MS + scrollMs > input.durationMs) {
       return {
         success: false,
         error:
-          `The scroll takes about ${scrollMs}ms and starts ${SETTLE_MS}ms in, so it does not fit in durationMs ${input.durationMs}. ` +
+          `The scroll is estimated at about ${scrollMs}ms and starts ${SETTLE_MS}ms in, so it does not fit in durationMs ${input.durationMs}. ` +
           'Raise durationMs (up to 30000), or shorten or speed up the scroll.',
       };
     }
@@ -1982,16 +1974,19 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
   }
 
   let foreground: string | undefined;
+  let id: number;
   try {
     // Hidden pages throttle rAF, so the recording would not show real frame work.
     foreground = await ensureForeground(c);
-    await recorder.start(c, { categories: input.categories, compress: input.compress });
+    id = await recorder.start(c, { categories: input.categories, compress: input.compress });
   } catch (error) {
     return { success: false, error: messageOf(error, 'Could not start the trace') };
   }
   const startedAt = Date.now();
 
-  // From here every way out stops the trace.
+  // From here every way out tries to stop this trace, and only this one. The recording lasts about
+  // durationMs: a stalled page can stretch the scroll (limited to 60s) and each CDP command has
+  // its own timeout. When Chrome may still be tracing, the error says so.
   let scroll: ToolResult | undefined;
   let failure: string | undefined;
   try {
@@ -2009,21 +2004,21 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
   } catch (error) {
     failure = messageOf(error, 'The profile failed');
   }
-  if (failure !== undefined) return { success: false, error: await abandonProfile(c, failure) };
+  if (failure !== undefined) return { success: false, error: await abandonProfile(c, id, failure) };
 
   try {
-    const data = await stopAndSummarize(c, input);
+    const data = await stopAndSummarize(c, { ...input, id });
     return {
       success: true,
       data: { ...data, ...(scroll ? { scroll: scroll.data } : {}), ...(foreground ? { foreground } : {}) },
     };
   } catch (error) {
     const message = messageOf(error, 'Trace failed');
-    // A path that turned bad after the check leaves the trace running; stop it privately instead.
-    if (recorder.running && client === c) return { success: false, error: await abandonProfile(c, message) };
-    if (client !== c || !c.isConnected()) {
-      return { success: false, error: `${message} The connection to Chrome closed during the profile and Chrome ended the trace with it; nothing was kept.` };
+    // The destination turned bad after the check, so the stop never reached Chrome: stop privately.
+    if (!(error instanceof TraceStillRunningError) && client === c && recorder.isCurrent(id)) {
+      return { success: false, error: await abandonProfile(c, id, message) };
     }
+    // Gone, refused, or no answer to Tracing.end: the stop's own message says which.
     return { success: false, error: message };
   }
 }
@@ -2313,7 +2308,9 @@ export const chromeTool: Tool = {
   final replace, the complete trace is kept at the temp file the error names;
   if the final close fails, the file is removed, since it may be incomplete.
   One trace at a time per connection. Tracing adds overhead; the first ~200ms
-  of a recording include profiler start-up.
+  of a recording include profiler start-up. If Chrome refuses to end the
+  trace, it is over; if Chrome does not answer, the trace may still be
+  running: stop again, or disconnect to end it.
   stop also returns a summary of the file it wrote: long tasks, busy %, time
   by category, frames, vitals (LCP, CLS) and the hottest functions.
   -> { path, bytes, ..., summary: { windowMs, busyPct, longTaskCount,
@@ -2332,14 +2329,23 @@ export const chromeTool: Tool = {
 
 • **profile** - trace, an optional scroll, stop and summary in one call. It
   starts a trace, waits 500ms for the profiler to settle, runs the scroll if
-  given (the scroll method's fields), waits out durationMs (1000-30000,
-  default 5000), then stops exactly like trace stop.
+  given (the scroll method's fields), and records for about durationMs
+  (1000-30000, default 5000), then stops like trace stop. durationMs is a
+  target, not a deadline: a stalled page can run longer (a scroll is limited
+  to 60s).
   \`chrome({ method: "profile", durationMs: 5000, scroll: { distance: 2400, speed: 800 } })\`
   -> { path, bytes, durationMs, dataLoss, summary, scroll: { requestedPx, scrolledPx, ... } }
-  categories, compress, outPath, overwrite and summary work as on trace. A bad
-  outPath, a running trace, or a scroll that does not fit in durationMs is
-  refused before anything records. If the scroll fails, the trace is stopped
-  and kept in a private temp directory (not at outPath), and the error says where.
+  categories, compress, outPath, overwrite and summary work as on trace. These
+  are refused before anything records: a running trace, a scroll whose
+  estimated time does not fit in durationMs, and an outPath that fails its
+  checks (absolute, extension, parent is a writable directory, existing file
+  rules). A destination that turns bad after that check fails the profile
+  after it recorded. When a profile fails after it started, it stops only its
+  own trace and keeps what could be written in a private temp directory (not
+  at outPath); the error says where, or that nothing was kept (a failure while
+  writing the stream removes the partial file), or that the trace may still be
+  running (stop again, or disconnect to end it). A switch of tab ends the
+  profile's trace with its session.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
   \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
   \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
@@ -2521,7 +2527,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       },
       durationMs: {
         type: 'number',
-        description: 'profile: how long to record in ms (1000-30000, default: 5000)',
+        description: 'profile: target recording length in ms (1000-30000, default: 5000); a stalled page can run longer',
       },
       scroll: {
         type: 'object',
