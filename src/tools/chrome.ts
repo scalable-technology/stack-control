@@ -28,6 +28,7 @@
  * - accessibility  Get accessibility tree
  * - scene          Inspect a live three.js scene graph (__THREE_DEVTOOLS__ hook)
  * - scroll         Scroll with a real wheel or touch gesture (compositor-driven)
+ * - trace          Record a Chrome trace to a file (start, then stop)
  */
 
 import { EventEmitter } from 'events';
@@ -38,6 +39,7 @@ import WebSocket from 'ws';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
+import { TraceRecorder } from './chrome-trace-capture.js';
 
 // =============================================================================
 // Types
@@ -332,6 +334,7 @@ class ChromeCDPClient extends EventEmitter {
 
   private handleCDPEvent(event: CDPResponse): void {
     const params = event.params || {};
+    this.emit('cdp', event);
 
     switch (event.method) {
       case 'Network.requestWillBeSent': {
@@ -463,6 +466,32 @@ class ChromeCDPClient extends EventEmitter {
         },
         reject,
       });
+    });
+  }
+
+  /** Resolve with the params of the next event of this method. The listener is registered before this returns. */
+  waitForEvent(method: string, timeoutMs: number): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      const onEvent = (event: CDPResponse) => {
+        if (event.method !== method) return;
+        cleanup();
+        resolve(event.params ?? {});
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error(`Connection closed while waiting for ${method}`));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out after ${timeoutMs / 1000}s waiting for ${method}`));
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.off('cdp', onEvent);
+        this.off('close', onClose);
+      };
+      this.on('cdp', onEvent);
+      this.on('close', onClose);
     });
   }
 
@@ -725,6 +754,22 @@ const ScrollInput = z.object({
     .describe('Pause between repeats in ms (default: 250)'),
 });
 
+const TraceInput = z.object({
+  method: z.literal('trace'),
+  action: z.enum(['start', 'stop']).describe('start recording, or stop and write the trace file'),
+  categories: z
+    .array(z.string().regex(/^[A-Za-z0-9_.:*-]+$/).max(200))
+    .min(1)
+    .max(60)
+    .optional()
+    .describe('start only: Chrome trace categories (default: the DevTools Performance set plus frame and input)'),
+  compress: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('start only: gzip the file (.json.gz, which DevTools opens); false writes plain .json'),
+});
+
 const ChromeInput = z.discriminatedUnion('method', [
   ConnectInput,
   DisconnectInput,
@@ -744,6 +789,7 @@ const ChromeInput = z.discriminatedUnion('method', [
   PressInput,
   WaitInput,
   ScrollInput,
+  TraceInput,
 ]);
 
 // =============================================================================
@@ -783,6 +829,7 @@ async function ensureForeground(c: ChromeCDPClient): Promise<string | undefined>
 async function handleConnect(input: z.infer<typeof ConnectInput>): Promise<ToolResult> {
   try {
     const c = getClient(input.port);
+    recorder.reset(); // a new connection starts with no recording
     await c.connect(input.targetId);
     const target = c.getCurrentTarget();
     return {
@@ -1783,6 +1830,56 @@ async function handleWait(input: z.infer<typeof WaitInput>): Promise<ToolResult>
 // =============================================================================
 
 // =============================================================================
+// Trace
+// =============================================================================
+
+/** The recording for the current connection. Reset whenever the connection changes. */
+const recorder = new TraceRecorder();
+
+async function handleTrace(input: z.infer<typeof TraceInput>): Promise<ToolResult> {
+  if (!client?.isConnected()) {
+    return {
+      success: false,
+      error: 'Not connected. Use chrome({ method: "connect" }) first.',
+    };
+  }
+  const c = client;
+
+  try {
+    if (input.action === 'start') {
+      // Hidden pages throttle rAF, so the recording would not show real frame work.
+      const foreground = recorder.running ? undefined : await ensureForeground(c);
+      await recorder.start(c, { categories: input.categories, compress: input.compress });
+      return {
+        success: true,
+        data: {
+          tracing: true,
+          compress: input.compress,
+          ...(input.categories ? { categories: input.categories } : {}),
+          ...(foreground ? { foreground } : {}),
+        },
+      };
+    }
+
+    const out = await recorder.stop(c);
+    return {
+      success: true,
+      data: {
+        ...out,
+        ...(out.dataLoss
+          ? { warning: 'Chrome reported data loss: its trace buffer filled and events were dropped. Record a shorter run.' }
+          : {}),
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Trace failed',
+    };
+  }
+}
+
+// =============================================================================
 // Scroll
 // =============================================================================
 
@@ -2044,6 +2141,18 @@ export const chromeTool: Tool = {
   (cause not established); compare requestedPx with scrolledPx. The measurement
   runs in the page's own JS world, so a page that lies can mislead it, as with
   evaluate. A single call is limited to 60s of gesture time.
+
+• **trace** - Record a Chrome trace (what the DevTools Performance panel records)
+  to a file: no DevTools, no manual export. start, do the thing to measure
+  (scroll, click, navigate), then stop. The file is a streamed .json.gz that
+  DevTools and Perfetto open; it is never returned inline (traces run to
+  hundreds of MB). Written owner-only (mode 0600) under the temp directory:
+  traces hold URLs and source text, so keep them local.
+  \`chrome({ method: "trace", action: "start" })\`
+  \`chrome({ method: "trace", action: "stop" })\`  -> { path, bytes, durationMs, dataLoss }
+  \`chrome({ method: "trace", action: "start", compress: false })\`
+  One trace at a time per connection. Tracing adds overhead; the first ~200ms
+  of a recording include profiler start-up.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
   \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
   \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
@@ -2086,6 +2195,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
           'press',
           'wait',
           'scroll',
+          'trace',
         ],
         description: 'Chrome operation to perform',
       },
@@ -2193,6 +2303,20 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         type: 'boolean',
         description: 'Wait for no network activity for 500ms',
       },
+      action: {
+        type: 'string',
+        enum: ['start', 'stop'],
+        description: 'trace: start recording, or stop and write the trace file',
+      },
+      categories: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'trace start: Chrome trace categories (default: DevTools Performance set plus frame and input)',
+      },
+      compress: {
+        type: 'boolean',
+        description: 'trace start: gzip the file as .json.gz (default: true); false writes plain .json',
+      },
       distance: {
         type: 'number',
         description: 'scroll: pixels to scroll vertically (positive = down, negative = up)',
@@ -2266,6 +2390,8 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         return handleWait(input);
       case 'scroll':
         return handleScroll(input);
+      case 'trace':
+        return handleTrace(input);
       default:
         return {
           success: false,
