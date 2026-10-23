@@ -41,7 +41,14 @@ import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
 import { waitForCdpEvent } from './cdp-events.js';
-import { TRACE_GONE, TraceRecorder, TraceStillRunningError, abandonTrace, validateOutPath } from './chrome-trace-capture.js';
+import {
+  TRACE_GONE,
+  TraceRecorder,
+  TraceStartUncertainError,
+  TraceStillRunningError,
+  abandonTrace,
+  validateOutPath,
+} from './chrome-trace-capture.js';
 import { summarizeTraceFile } from './chrome-trace-summary.js';
 
 // =============================================================================
@@ -1980,6 +1987,12 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
     foreground = await ensureForeground(c);
     id = await recorder.start(c, { categories: input.categories, compress: input.compress });
   } catch (error) {
+    if (error instanceof TraceStartUncertainError) {
+      // Chrome may be recording this call's trace: end it the way every failure after a start does.
+      const why = messageOf(error.cause, 'no answer');
+      const failure = `Chrome did not answer the start of the trace (${why}), so it may have been running.`;
+      return { success: false, error: await abandonProfile(c, error.id, failure) };
+    }
     return { success: false, error: messageOf(error, 'Could not start the trace') };
   }
   const startedAt = Date.now();

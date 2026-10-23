@@ -269,6 +269,10 @@ export function openTraceSink(options: SinkOptions): TraceSink {
   };
 }
 
+/** Chrome answered Tracing.start with an error: it did not start this trace. */
+class StartRefusedError extends Error {}
+
+/** Throws StartRefusedError when Chrome answers with an error; any other throw means no answer. */
 export async function startTrace(cdp: TraceCdp, options: StartOptions): Promise<void> {
   const r = await cdp.sendCommand('Tracing.start', {
     traceConfig: {
@@ -280,7 +284,7 @@ export async function startTrace(cdp: TraceCdp, options: StartOptions): Promise<
     streamFormat: 'json',
     streamCompression: options.compress ? 'gzip' : 'none',
   });
-  if (r.error) throw new Error(r.error.message);
+  if (r.error) throw new StartRefusedError(r.error.message);
 }
 
 /** Write the whole buffer; fs.writeSync may write fewer bytes than asked. Returns the length. */
@@ -300,6 +304,21 @@ export function writeAll(write: (buf: Buffer, offset: number) => number, buf: Bu
  * because Chrome ends a trace with its session.
  */
 export class TraceStillRunningError extends Error {}
+
+/**
+ * Tracing.start got no answer (timeout or a broken transport), so Chrome may be recording. The
+ * recorder keeps the trace as running, so stop can end it; the id lets the caller that started it
+ * (profile) end exactly this trace.
+ */
+export class TraceStartUncertainError extends Error {
+  constructor(
+    message: string,
+    readonly id: number,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+  }
+}
 
 const mayStillRun = (error: unknown) =>
   error instanceof TraceStillRunningError || (error instanceof Error && error.cause instanceof TraceStillRunningError);
@@ -381,7 +400,10 @@ export async function stopTrace(
 
 interface ActiveTrace {
   id: number;
-  /** Set when Chrome has answered Tracing.start; null while it is starting. */
+  /**
+   * Set when Chrome has answered Tracing.start, or when the start got no answer (then the moment
+   * it was sent); null while it is starting.
+   */
   startedAt: number | null;
   compress: boolean;
 }
@@ -421,11 +443,25 @@ export class TraceRecorder {
     // Reserved before the await, so a second start that overlaps this one is refused.
     const trace: ActiveTrace = { id: this.nextId++, startedAt: null, compress: options.compress };
     this.active = trace;
+    // A monotonic mark, so an unanswered start can be dated to its send without a second Date.now().
+    const sentMark = performance.now();
     try {
       await startTrace(cdp, options);
     } catch (error) {
-      if (this.active === trace) this.active = null;
-      throw error;
+      // Cleared with its session (Chrome ends a trace with it), or Chrome answered that it did not start.
+      if (this.active !== trace || error instanceof StartRefusedError) {
+        if (this.active === trace) this.active = null;
+        throw error;
+      }
+      // No answer: Chrome may be recording. Keep it as running so stop can end it. Chrome began, if
+      // at all, after the send, so durationMs counts from the send: an upper bound.
+      trace.startedAt = Date.now() - (performance.now() - sentMark);
+      throw new TraceStartUncertainError(
+        'Start did not complete; the trace may be running. Stop it with chrome({ method: "trace", action: "stop" }), ' +
+          `or disconnect to end it. (${error instanceof Error ? error.message : String(error)})`,
+        trace.id,
+        { cause: error }
+      );
     }
     trace.startedAt = Date.now();
     return trace.id;

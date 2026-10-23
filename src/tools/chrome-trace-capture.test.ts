@@ -20,6 +20,7 @@ import {
   DEFAULT_TRACE_CATEGORIES,
   TRACE_GONE,
   TraceRecorder,
+  TraceStartUncertainError,
   abandonTrace,
   openTraceSink,
   startTrace,
@@ -66,6 +67,8 @@ interface FakeOptions {
   endError?: string;
   /** The first n Tracing.end calls get no answer: they reject, as a CDP timeout does. */
   endRejects?: number;
+  /** Tracing.start gets no answer: it rejects, as a CDP timeout or a broken socket does. */
+  startRejects?: boolean;
   /** tracingComplete never arrives: the wait rejects at its timeout, or when its signal aborts. */
   completeNever?: boolean;
   /** Runs when IO.read call number n (0-based) arrives, before its chunk is returned. */
@@ -85,6 +88,7 @@ function fake(options: FakeOptions = {}) {
   const cdp: TraceCdp = {
     sendCommand: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       sent.push({ method, params });
+      if (method === 'Tracing.start' && options.startRejects) throw new Error('Command Tracing.start timed out after 30s');
       if (method === 'Tracing.end' && endRejects > 0) {
         endRejects--;
         throw new Error('Command Tracing.end timed out after 30s');
@@ -465,6 +469,59 @@ describe('TraceRecorder', () => {
     await expect(rec.stop(fake({ endError: 'not tracing' }).cdp, { dir: tempDir() })).rejects.toThrow(
       /Chrome refused to end the trace: not tracing/
     );
+    expect(rec.running).toBe(false);
+  });
+
+  it('keeps the trace when Tracing.start gets no answer, so a following stop ends it', async () => {
+    const dir = tempDir();
+    const f = fake({ startRejects: true });
+    const rec = new TraceRecorder();
+    const failed = await rec.start(f.cdp, { compress: false }).catch((e: unknown) => e);
+    expect(failed).toBeInstanceOf(TraceStartUncertainError);
+    expect((failed as Error).message).toMatch(
+      /^Start did not complete; the trace may be running\. Stop it with chrome\(\{ method: "trace", action: "stop" \}\), or disconnect to end it\. \(Command Tracing\.start timed out after 30s\)$/
+    );
+    expect(rec.running).toBe(true);
+    const id = (failed as TraceStartUncertainError).id;
+    expect(rec.isCurrent(id)).toBe(true);
+    // A second start is refused: Chrome may be recording the first.
+    await expect(rec.start(f.cdp, { compress: false })).rejects.toThrow(/already running/);
+    const out = await rec.stop(f.cdp, { dir });
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(1);
+    expect(existsSync(out.path)).toBe(true);
+    expect(out.durationMs).toBeGreaterThanOrEqual(0);
+    expect(rec.running).toBe(false);
+  });
+
+  it('measures an unanswered start from the moment the command was sent', async () => {
+    const dir = tempDir();
+    const rec = new TraceRecorder();
+    let release!: () => void;
+    const answered = new Promise<void>((r) => (release = r));
+    const f = fake();
+    (f.cdp.sendCommand as any).mockImplementationOnce(async () => {
+      await answered;
+      throw new Error('socket closed');
+    });
+    const failing = rec.start(f.cdp, { compress: false }).catch((e: unknown) => e);
+    await new Promise((r) => setTimeout(r, 120));
+    release();
+    expect(await failing).toBeInstanceOf(TraceStartUncertainError);
+    const out = await rec.stop(f.cdp, { dir });
+    expect(out.durationMs).toBeGreaterThanOrEqual(100);
+  });
+
+  it('forgets an unanswered start when the session is reset while it waits', async () => {
+    const rec = new TraceRecorder();
+    const f = fake();
+    (f.cdp.sendCommand as any).mockImplementationOnce(async () => {
+      rec.reset();
+      throw new Error('socket closed');
+    });
+    const failed = await rec.start(f.cdp, { compress: false }).catch((e: unknown) => e);
+    // Chrome ends a trace with its session, so nothing may be running: the plain error comes back.
+    expect(failed).not.toBeInstanceOf(TraceStartUncertainError);
+    expect((failed as Error).message).toBe('socket closed');
     expect(rec.running).toBe(false);
   });
 
@@ -970,6 +1027,19 @@ describe('abandonTrace', () => {
     expect(message).not.toMatch(/nothing was kept|partial trace was kept/);
     expect(calls(f.sent, 'Tracing.end')).toHaveLength(2);
     expect(rec.isCurrent(id)).toBe(true);
+  });
+
+  it('stops a trace whose start got no answer, by the id the start error carries', async () => {
+    const f = fake({ startRejects: true });
+    const rec = new TraceRecorder();
+    const failed = (await rec.start(f.cdp, { compress: false }).catch((e: unknown) => e)) as TraceStartUncertainError;
+    expect(failed).toBeInstanceOf(TraceStartUncertainError);
+    const message = await abandonTrace(rec, f.cdp, failed.id, 'Start failed.');
+    const path = /^Start failed\. The partial trace was kept at (\S+)\.$/.exec(message)?.[1];
+    expect(path, message).toBeDefined();
+    dirs.push(dirname(path!));
+    expect(calls(f.sent, 'Tracing.end')).toHaveLength(1);
+    expect(rec.running).toBe(false);
   });
 
   it('forgets the trace once Chrome answers the second end', async () => {

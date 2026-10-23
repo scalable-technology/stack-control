@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
 import { boundSummary, type BoundedSummary } from './chrome-trace-summary.js';
 import { chromeTool } from './chrome.js';
@@ -669,6 +670,82 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
       await call({ method: 'select', targetId: original!.id });
       await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
     }
+  }, 60_000);
+
+  /**
+   * Lose the answer to these CDP methods: the command still reaches Chrome when `deliver` says so,
+   * then the send throws, as a broken socket does. Chrome acts, and the tool never hears back.
+   */
+  const loseAnswers = (methods: Record<string, { deliver: boolean }>) => {
+    const real = WebSocket.prototype.send;
+    return vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      const method = typeof data === 'string' ? (JSON.parse(data) as { method?: string }).method : undefined;
+      const lost = method !== undefined ? methods[method] : undefined;
+      if (lost?.deliver) (real as (...a: unknown[]) => void).call(this, data, ...rest);
+      if (lost) throw new Error(`injected: lost the answer to ${method}`);
+      return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
+  };
+
+  it('ends its own trace when Chrome does not answer the start, and sends no scroll', async () => {
+    await open(tall.url);
+    const spy = loseAnswers({ 'Tracing.start': { deliver: true } });
+    let r;
+    try {
+      r = await profile({ durationMs: 2000, scroll: { distance: 1200, speed: 800 } });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/^Chrome did not answer the start of the trace \(injected: lost the answer to Tracing\.start\), so it may have been running\./);
+    const kept = /The partial trace was kept at (\S+)\.$/.exec(r.error ?? '')?.[1];
+    expect(kept, r.error).toBeDefined();
+    made.push(dirname(kept!));
+    // Chrome did start: it refuses Tracing.end when nothing is tracing, and here the end gave a file.
+    expect(Array.isArray(readTrace(kept!))).toBe(true);
+    await sleep(300);
+    expect(await evaluate('window.scrollY')).toBe(0);
+    await expectNotRecording();
+  }, 60_000);
+
+  it('says the trace may still be running when Chrome answers neither its start nor its ends', async () => {
+    await open(quiet.url);
+    // Tracing.end never reaches Chrome, so the trace really is still running afterwards.
+    const spy = loseAnswers({ 'Tracing.start': { deliver: true }, 'Tracing.end': { deliver: false } });
+    let r;
+    try {
+      r = await profile({ durationMs: 1000 });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/so it may have been running\./);
+    expect(r.error).toMatch(/the trace may still be running\. Try chrome\(\{ method: "trace", action: "stop" \}\) again, or disconnect/);
+    expect(r.error).not.toMatch(/nothing was kept|partial trace was kept/);
+    // The advice works: a plain stop ends it and keeps the file.
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+    made.push(dirname((stop.data as TraceData).path));
+    expect(readTrace((stop.data as TraceData).path).length).toBeGreaterThan(10);
+  }, 60_000);
+
+  it('trace start without an answer says the trace may be running, and stop ends it', async () => {
+    await open(quiet.url);
+    const spy = loseAnswers({ 'Tracing.start': { deliver: true } });
+    let s;
+    try {
+      s = await call({ method: 'trace', action: 'start' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(s.success).toBe(false);
+    expect(s.error).toMatch(
+      /^Start did not complete; the trace may be running\. Stop it with chrome\(\{ method: "trace", action: "stop" \}\), or disconnect to end it\./
+    );
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+    made.push(dirname((stop.data as TraceData).path));
+    expect(readTrace((stop.data as TraceData).path).length).toBeGreaterThan(10);
   }, 60_000);
 
   it('replaces an existing file at outPath with overwrite: true', async () => {
