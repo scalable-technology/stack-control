@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
@@ -11,8 +11,7 @@ import {
   chromeAvailable,
   launchTestBrowser,
   servePage,
-  toolTraceDir,
-  traceDirsIn,
+  usePrivateTmpdir,
   type TestBrowser,
   type TestServer,
 } from './chrome-test-browser.js';
@@ -30,17 +29,11 @@ vi.mock('./chrome-trace-summary.js', async (importOriginal) => {
   };
 });
 
-/** Every directory the tool made for a trace in this file, removed after each test (the tool keeps them). */
-const written = new Set<string>();
-const call = async (input: Record<string, unknown>) => {
-  const r = await chromeTool.handler(input, {});
-  for (const dir of traceDirsIn(r)) written.add(dir);
-  return r;
-};
-afterEach(() => {
-  for (const dir of written) rmSync(dir, { recursive: true, force: true });
-  written.clear();
-});
+// Browser profiles and every trace the tool keeps land in this file's own temp directory, removed
+// after the last test; counts of trace directories cannot see other suites running alongside.
+const sharedTmp = tmpdir();
+const privateTmp = usePrivateTmpdir();
+const call = (input: Record<string, unknown>) => chromeTool.handler(input, {});
 
 const evaluate = async (expression: string): Promise<unknown> => {
   const r = await call({ method: 'evaluate', expression });
@@ -109,24 +102,10 @@ describe('chrome trace: input validation', () => {
     expect(r.error).toMatch(/^Not connected/);
   });
 
-  it('cleans up only the directories the tool makes for a trace, never a test\'s outPath', () => {
-    const t = tmpdir();
-    expect(toolTraceDir(join(t, 'control-trace-abc123', 'trace.json.gz'))).toBe(join(t, 'control-trace-abc123'));
-    expect(toolTraceDir(join(t, 'control-trace-abc123', 'trace.json'))).toBe(join(t, 'control-trace-abc123'));
-    expect(toolTraceDir(join(t, 'control-trace-out-x', 'scroll.json.gz'))).toBeUndefined();
-    expect(toolTraceDir(join(t, 'control-trace-abc123', 'scroll.json.gz'))).toBeUndefined();
-    expect(toolTraceDir(join(t, 'control-profile-test-x', 'trace.json.gz'))).toBeUndefined();
-    expect(toolTraceDir(join(t, 'a', 'control-trace-abc123', 'trace.json.gz'))).toBeUndefined();
-    expect(toolTraceDir(join('/srv', 'control-trace-abc123', 'trace.json.gz'))).toBeUndefined();
-    expect(toolTraceDir(`${t}/control-trace-abc123/../control-trace-abc123/trace.json.gz`)).toBeUndefined();
-    expect(toolTraceDir('trace.json.gz')).toBeUndefined();
-    const kept = join(t, 'control-trace-kept01', 'trace.json.gz');
-    expect(traceDirsIn({ data: { path: kept } })).toEqual([join(t, 'control-trace-kept01')]);
-    expect(traceDirsIn({ error: `Scroll failed. The partial trace was kept at ${kept}.` })).toEqual([
-      join(t, 'control-trace-kept01'),
-    ]);
-    expect(traceDirsIn({ data: { path: 42 } })).toEqual([]);
-    expect(traceDirsIn({ error: 'Not connected.' })).toEqual([]);
+  it('runs in a private temp directory inside the shared one', () => {
+    expect(tmpdir()).toBe(privateTmp());
+    expect(dirname(privateTmp())).toBe(sharedTmp);
+    expect(basename(privateTmp())).toMatch(/^control-int-/);
   });
 
   it('says to connect first when there is no connection', async () => {
@@ -155,8 +134,9 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
 
   afterAll(async () => {
     await call({ method: 'disconnect' });
-    await server?.close();
+    // Browser first: a server's close waits on the connections Chrome holds open.
     await browser?.close();
+    await server?.close();
   }, 30_000);
 
   it('records a gzipped trace that parses and names the renderer main thread', async () => {
@@ -171,6 +151,7 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     expect(statSync(d.path).size).toBe(d.bytes);
     expect(statSync(d.path).mode & 0o777).toBe(0o600);
     expect(statSync(dirname(d.path)).mode & 0o777).toBe(0o700);
+    expect(dirname(dirname(d.path))).toBe(privateTmp());
     const events = readTrace(d.path);
     expect(events.length).toBeGreaterThan(100);
     expect(countOf(events, 'RunTask')).toBeGreaterThan(0);

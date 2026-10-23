@@ -1,14 +1,24 @@
+import { tmpdir } from 'node:os';
+import { basename } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromeTool } from './chrome.js';
 import {
   chromeAvailable,
   launchTestBrowser,
   servePage,
+  usePrivateTmpdir,
   type TestBrowser,
   type TestServer,
 } from './chrome-test-browser.js';
 
+// Browser profiles land in this file's own temp directory, removed after the last test.
+const privateTmp = usePrivateTmpdir();
 const call = (input: Record<string, unknown>) => chromeTool.handler(input, {});
+
+it('runs in a private temp directory', () => {
+  expect(tmpdir()).toBe(privateTmp());
+  expect(basename(privateTmp())).toMatch(/^control-int-/);
+});
 
 const evaluate = async (expression: string): Promise<unknown> => {
   const r = await call({ method: 'evaluate', expression });
@@ -114,8 +124,9 @@ describe.skipIf(!chromeAvailable)('chrome scroll: real input in headless Chrome'
 
   afterAll(async () => {
     await call({ method: 'disconnect' });
-    await server?.close();
+    // Browser first: a server's close waits on the connections Chrome holds open.
     await browser?.close();
+    await server?.close();
   }, 30_000);
 
   it('scrolls down by the requested distance with a real wheel gesture', async () => {
@@ -269,8 +280,9 @@ describe.skipIf(!chromeAvailable)('chrome scroll: a page that lies', () => {
 
   afterAll(async () => {
     await call({ method: 'disconnect' });
-    await server?.close();
+    // Browser first: a server's close waits on the connections Chrome holds open.
     await browser?.close();
+    await server?.close();
   }, 30_000);
 
   it('returns an error, not an exception, when the page lies about scroll positions', async () => {

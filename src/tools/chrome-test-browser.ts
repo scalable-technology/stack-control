@@ -11,7 +11,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, normalize } from 'node:path';
+import { join } from 'node:path';
+import { afterAll, beforeAll } from 'vitest';
 
 export const CHROME_PATH =
   process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -93,24 +94,26 @@ export async function servePage(html: string): Promise<TestServer> {
 }
 
 /**
- * The directory the tool made for a trace stopped without outPath, or undefined. The tool keeps
- * that file by design, so the tests remove it. Only a match for what openTraceSink writes counts:
- * trace.json[.gz] in a mkdtemp `control-trace-XXXXXX` directly under the OS temp directory. A
- * test's own outPath, or anything else, is never named, so cleanup cannot remove it.
+ * Give this test file its own temp directory: os.tmpdir() reads TMPDIR on every call, so browser
+ * profiles and the traces the tool keeps land there, and other suites counting temp directories in
+ * parallel never see them. Removed with all it holds after the file's last test. Call at the top
+ * level of a test file, so its hooks run around every describe's.
  */
-export function toolTraceDir(path: string): string | undefined {
-  if (!isAbsolute(path) || normalize(path) !== path) return undefined;
-  if (!/^trace\.json(\.gz)?$/.test(basename(path))) return undefined;
-  const dir = dirname(path);
-  if (dirname(dir) !== tmpdir() || !/^control-trace-[A-Za-z0-9]{6}$/.test(basename(dir))) return undefined;
-  return dir;
-}
-
-/** The tool-made trace directories a chrome result names: its data.path, or "kept at <path>" in its error. */
-export function traceDirsIn(result: { data?: unknown; error?: string }): string[] {
-  const paths: string[] = [];
-  const path = (result.data as { path?: unknown } | undefined)?.path;
-  if (typeof path === 'string') paths.push(path);
-  for (const m of (result.error ?? '').matchAll(/kept at (\/\S+?)\.?(?=\s|;|$)/g)) paths.push(m[1]);
-  return paths.map(toolTraceDir).filter((d): d is string => d !== undefined);
+export function usePrivateTmpdir(): () => string {
+  let dir: string | undefined;
+  let previous: string | undefined;
+  beforeAll(() => {
+    previous = process.env.TMPDIR;
+    dir = mkdtempSync(join(tmpdir(), 'control-int-'));
+    process.env.TMPDIR = dir;
+  });
+  afterAll(() => {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+  return () => {
+    if (!dir) throw new Error('usePrivateTmpdir: read before its beforeAll ran');
+    return dir;
+  };
 }
