@@ -944,6 +944,7 @@ async function handleStatus(input: z.infer<typeof StatusInput>): Promise<ToolRes
         port: input.port,
         browser: version?.Browser || null,
         connected: client?.isConnected() ?? false,
+        trace: { running: recorder.started },
         currentTarget: client?.getCurrentTarget()
           ? {
               id: client.getCurrentTarget()!.id,
@@ -964,6 +965,7 @@ async function handleStatus(input: z.infer<typeof StatusInput>): Promise<ToolRes
       data: {
         port: input.port,
         connected: false,
+        trace: { running: recorder.started },
         error: `Chrome not reachable on port ${input.port}. Launch with: --remote-debugging-port=${input.port}`,
       },
     };
@@ -2327,6 +2329,7 @@ export const chromeTool: Tool = {
 
 • **status** - List available tabs and connection state
   \`chrome({ method: "status" })\`
+  trace.running is true once a trace has started on this connection.
 
 • **select** - Switch to a different tab
   \`chrome({ method: "select", targetId: "ABC123" })\`

@@ -45,6 +45,15 @@ const HOSTILE_PAGE = `<!doctype html><body style="margin:0"><script>
   Math.round = () => '1);window.__pwned=1;(1';
 </script><div style="height:5000px"></div></body>`;
 
+/** Poll until the tab shows this url, fully loaded; throws after about 5s. */
+const loaded = async (url: string) => {
+  for (let i = 0; i < 50; i++) {
+    if ((await evaluate(`location.href === ${JSON.stringify(url)} && document.readyState === "complete"`)) === true) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`${url} did not finish loading`);
+};
+
 const scrollY = async () => (await evaluate('window.scrollY')) as number;
 // Reset to the top. A gesture's momentum outlives the CDP call that returned, and scrolling to
 // the top while it is still running leaves the next gesture scrolling further than asked, so
@@ -290,14 +299,14 @@ describe.skipIf(!chromeAvailable)('chrome scroll: a page that lies', () => {
     const liar = await servePage(HOSTILE_POSITIONS_PAGE);
     try {
       await call({ method: 'navigate', url: liar.url });
-      await new Promise((r) => setTimeout(r, 800));
+      await loaded(liar.url);
       const r = await call({ method: 'scroll', distance: 300 });
       expect(r.success).toBe(false);
       expect(r.error).toMatch(/non-numeric scroll position/i);
     } finally {
       // Put the shared tab back on this describe's page for the tests that follow.
       await call({ method: 'navigate', url: server.url });
-      await new Promise((r) => setTimeout(r, 800));
+      await loaded(server.url);
       await liar.close();
     }
   }, 30_000);

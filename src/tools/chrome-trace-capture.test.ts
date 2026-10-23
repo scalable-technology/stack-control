@@ -544,6 +544,28 @@ describe('TraceRecorder', () => {
     expect(rec.running).toBe(false);
   });
 
+  it('says started only once Chrome answered the start, or the start got no answer', async () => {
+    const rec = new TraceRecorder();
+    expect(rec.started).toBe(false);
+    let answer!: () => void;
+    const f = fake();
+    (f.cdp.sendCommand as any).mockImplementationOnce(() => new Promise((r) => (answer = () => r({ result: {} }))));
+    const starting = rec.start(f.cdp, { compress: false });
+    expect(rec.running).toBe(true); // reserved
+    expect(rec.started).toBe(false); // but Chrome has not answered
+    answer();
+    await starting;
+    expect(rec.started).toBe(true);
+    await rec.stop(f.cdp, { dir: tempDir() });
+    expect(rec.started).toBe(false);
+    await rec.start(f.cdp, { compress: false });
+    rec.reset();
+    expect(rec.started).toBe(false);
+    const lost = new TraceRecorder();
+    await lost.start(fake({ startRejects: true }).cdp, { compress: false }).catch(() => {});
+    expect(lost.started).toBe(true);
+  });
+
   it('reset forgets a running trace', async () => {
     const rec = new TraceRecorder();
     await rec.start(fake().cdp, { compress: false });

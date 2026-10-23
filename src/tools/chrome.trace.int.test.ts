@@ -235,6 +235,22 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     }
   }, 60_000);
 
+  it('reports in status whether a trace is running', async () => {
+    const running = async () => {
+      const st = await call({ method: 'status', port: browser.port });
+      expect(st.success, st.error).toBe(true);
+      return (st.data as { trace?: { running?: unknown } }).trace?.running;
+    };
+    expect(await running()).toBe(false);
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    expect(await running()).toBe(true);
+    expect((await call({ method: 'trace', action: 'stop' })).success).toBe(true);
+    expect(await running()).toBe(false);
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    expect((await call({ method: 'connect', port: browser.port })).success).toBe(true); // a reset
+    expect(await running()).toBe(false);
+  }, 60_000);
+
   it('refuses to stop when nothing is recording and to start twice', async () => {
     const none = await call({ method: 'trace', action: 'stop' });
     expect(none.success).toBe(false);
@@ -352,6 +368,31 @@ const QUIET_PAGE = `<!doctype html><body style="margin:0;font:16px sans-serif">
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Poll a page expression until it is true; throws, naming what never happened, after about 5s. */
+const until = async (expression: string, what: string) => {
+  for (let i = 0; i < 50; i++) {
+    if ((await evaluate(expression)) === true) return;
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for ${what}`);
+};
+/** Two animation frames: what changed before them has been laid out and painted. */
+const twoFrames = () => evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))');
+const BANNER_IN = 'document.body.firstElementChild?.textContent === "Late banner"';
+
+/**
+ * Wait, by polling status, until a trace has started on this connection (Chrome answered its
+ * start). Throws if none has within about 2.5s, so a test never acts on a start that did not happen.
+ */
+const traceStarted = async (port: number) => {
+  for (let i = 0; i < 50; i++) {
+    const st = await call({ method: 'status', port });
+    if ((st.data as { trace?: { running?: boolean } } | undefined)?.trace?.running === true) return;
+    await sleep(50);
+  }
+  throw new Error('No trace started within 2.5s: the profile never got its trace going');
+};
+
 describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chrome', () => {
   let browser: TestBrowser;
   let busy: TestServer;
@@ -369,13 +410,18 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
     throw new Error(`${url} did not finish loading`);
   };
 
-  /** Start, let profiler start-up pass, run the page's trigger (if any), wait it out, stop. */
-  const record = async (stop: Record<string, unknown>, trigger?: string): Promise<TraceData> => {
+  /** Start, let profiler start-up pass, run the page's trigger (if any) until its effect is painted, stop. */
+  const record = async (stop: Record<string, unknown>, trigger?: { run: string; done: string }): Promise<TraceData> => {
     const s = await call({ method: 'trace', action: 'start' });
     expect(s.success, s.error).toBe(true);
     await sleep(500);
-    if (trigger) await evaluate(trigger);
-    await sleep(600);
+    if (trigger) {
+      await evaluate(trigger.run);
+      await until(trigger.done, 'the trigger to take effect');
+      await twoFrames();
+    } else {
+      await sleep(600);
+    }
     const e = await call({ method: 'trace', action: 'stop', ...stop });
     expect(e.success, e.error).toBe(true);
     const d = e.data as TraceData;
@@ -407,7 +453,7 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
 
   it('summarizes a long task and a layout shift on a busy page', async () => {
     await open(busy.url);
-    const d = await record({}, 'busyThenShift(), true');
+    const d = await record({}, { run: 'busyThenShift(), true', done: BANNER_IN });
     expect(d.summarySkipped).toBeUndefined();
     expect(d.summary).toBeDefined();
     const s = d.summary!;
@@ -645,7 +691,7 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect(original).toBeDefined();
     try {
       const running = profile({ durationMs: 3000 });
-      await sleep(800);
+      await traceStarted(browser.port);
       // The select ends the profile's trace with its session; trace B on the new tab is someone else's.
       expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
       expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
@@ -670,8 +716,8 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect(original).toBeDefined();
     try {
       const running = profile({ durationMs: 3000, scroll: { distance: 1200, speed: 800 } });
-      // Inside the 500ms settle: the scroll has not been sent yet.
-      await sleep(250);
+      // The trace has started, and the 500ms settle leaves room: the scroll has not been sent yet.
+      await traceStarted(browser.port);
       expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
       const r = await running;
       expect(r.success).toBe(false);
@@ -928,7 +974,8 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
     await sleep(500);
     await evaluate('busyThenShift(), true');
-    await sleep(600);
+    await until(BANNER_IN, 'the late banner');
+    await twoFrames();
     const stop = await call({ method: 'trace', action: 'stop' });
     expect(stop.success, stop.error).toBe(true);
     const traced = (stop.data as TraceData).summary!.vitals.cls;
@@ -940,8 +987,12 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
 
   it('reports the LCP of a big-text page', async () => {
     await open(servers.big.url);
-    await sleep(300);
-    const d = await metrics();
+    // LCP is reported after the heading paints: poll for it rather than guess how long that takes.
+    let d = await metrics();
+    for (let i = 0; i < 30 && d.vitals?.lcp == null; i++) {
+      await sleep(100);
+      d = await metrics();
+    }
     expect(d.vitals!.lcp).not.toBeNull();
     expect(d.vitals!.lcp!.ms).toBeGreaterThan(0);
     expect(d.vitals!.lcp!.size).toBeGreaterThan(0);
@@ -952,9 +1003,13 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     await open(servers.click.url);
     const clicked = await call({ method: 'click', selector: '#slow' });
     expect(clicked.success, clicked.error).toBe(true);
-    await sleep(500);
-    expect(await evaluate('document.getElementById("slow").textContent')).toBe('Clicked');
-    const d = await metrics();
+    await until('document.getElementById("slow").textContent === "Clicked"', 'the click handler');
+    // The event entry is reported after the next paint: poll for it rather than guess.
+    let d = await metrics();
+    for (let i = 0; i < 30 && d.vitals?.inp == null; i++) {
+      await sleep(100);
+      d = await metrics();
+    }
     console.log(`INP after one slow click: ${JSON.stringify(d.vitals!.inp)}`);
     expect(d.vitals!.inp).not.toBeNull();
     expect(d.vitals!.inp!.ms).toBeGreaterThanOrEqual(100);
@@ -988,8 +1043,8 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
 
   it("reads the browser's real entries on a page that replaces PerformanceObserver and breaks slice", async () => {
     await open(servers.hostile.url);
-    await sleep(800);
-    expect(await evaluate('document.body.firstElementChild.textContent')).toBe('Late banner');
+    await until(BANNER_IN, 'the late banner');
+    await twoFrames();
     const r = await call({ method: 'metrics' });
     expect(r.success, r.error).toBe(true);
     const size = JSON.stringify(r.data).length;

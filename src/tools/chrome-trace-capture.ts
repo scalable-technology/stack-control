@@ -430,6 +430,14 @@ export class TraceRecorder {
     return this.active !== null;
   }
 
+  /**
+   * True once a trace has started: Chrome answered its start, or the start got no answer (then it
+   * may be recording). False while a start is still in flight, though running is already true.
+   */
+  get started(): boolean {
+    return this.active?.startedAt != null;
+  }
+
   /** True while the trace with this id is the one recording. */
   isCurrent(id: number): boolean {
     return this.active?.id === id;
