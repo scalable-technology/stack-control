@@ -562,7 +562,12 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect(c.success, c.error).toBe(true);
   }, 60_000);
 
-  afterEach(() => {
+  afterEach(async () => {
+    // A test that timed out under heavy load can leave its trace running; end it here so the
+    // tests after it start clean instead of failing with "already running".
+    const left = await call({ method: 'trace', action: 'stop', summary: false });
+    const leftPath = (left.data as { path?: string } | undefined)?.path;
+    if (left.success && leftPath) made.push(dirname(leftPath));
     for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
