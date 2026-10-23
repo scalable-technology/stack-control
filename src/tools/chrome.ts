@@ -27,9 +27,12 @@
  * - console        List captured console messages
  * - accessibility  Get accessibility tree
  * - scene          Inspect a live three.js scene graph (__THREE_DEVTOOLS__ hook)
- * - scroll         Scroll with a real wheel or touch gesture (compositor-driven)
- * - trace          Record a Chrome trace to a file (start, then stop)
- * - profile        Trace, scroll, stop and summarize in one call
+ * - scroll         Scroll with a real wheel or touch gesture (compositor-driven):
+ *                  distance, selector, speed, source, repeat, repeatDelayMs
+ * - trace          Record a Chrome trace to a file: action start (categories, compress),
+ *                  then action stop (outPath, overwrite, summary)
+ * - profile        Trace, scroll, stop and summarize in one call: durationMs, scroll,
+ *                  and trace's categories, compress, outPath, overwrite, summary
  * - metrics        Snapshot of Chrome's counters and the page's web vitals, no trace
  */
 
@@ -2367,7 +2370,13 @@ export const chromeTool: Tool = {
   a gesture started right after one has been seen to scroll further than asked
   (cause not established); compare requestedPx with scrolledPx. The measurement
   runs in the page's own JS world, so a page that lies can mislead it, as with
-  evaluate. A single call is limited to 60s of gesture time.
+  evaluate. A call is refused when its gesture is estimated (from distance,
+  speed and repeats) at over 60s; a stalled page can still take longer.
+  Fields: distance, selector, speed (px/s, default 800), source (mouse or
+  touch), repeat (extra gestures), repeatDelayMs (pause between them).
+  \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
+  \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
+  \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
 
 • **trace** - Record a Chrome trace (what the DevTools Performance panel records)
   to a file: no DevTools, no manual export. start, do the thing to measure
@@ -2388,7 +2397,8 @@ export const chromeTool: Tool = {
   One trace at a time per connection. Tracing adds overhead; the first ~200ms
   of a recording include profiler start-up. If Chrome refuses to end the
   trace, it is over; if Chrome does not answer, the trace may still be
-  running: stop again, or disconnect to end it.
+  running: stop again, or disconnect to end it. If Chrome does not answer a
+  start, the trace may be running: stop it, or disconnect.
   stop also returns a summary of the file it wrote: long tasks, busy %, time
   by category, frames, vitals (LCP, CLS) and the hottest functions.
   -> { path, bytes, ..., summary: { windowMs, busyPct, longTaskCount,
@@ -2420,16 +2430,16 @@ export const chromeTool: Tool = {
   checks (absolute, extension, parent is a writable directory, existing file
   rules). A destination that turns bad after that check fails the profile
   after it recorded. When a profile fails after it started (a failed scroll,
-  a switch of tab), it stops only its own trace, never sends its scroll to
-  another page, and the error says what became of the recording: the partial
+  a switch of tab, a start Chrome did not answer), it stops only its own
+  trace, and the error says what became of the recording: the partial
   trace kept in a fresh private temp directory (not at outPath), nothing kept
   (a failure while writing the stream removes the partial file), or the trace
   may still be running (stop again, or disconnect to end it). A refused
   overwrite rename is different: the complete trace stays beside the
-  destination under the temp name the error gives.
-  \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
-  \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
-  \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
+  destination under the temp name the error gives. Before the scroll it
+  checks that its trace is still the current one, so a tab switch during the
+  settle sends no scroll; a switch while the scroll itself starts is not
+  caught.
 
 • **metrics** - A cheap snapshot, no trace: Chrome's counters for the page and
   its web vitals so far, since load, from what the browser buffered.
