@@ -802,3 +802,210 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect('summarySkipped' in (r.data as object)).toBe(false);
   }, 60_000);
 });
+
+// 500 elements inserted by script, so Nodes counts them.
+const NODES_PAGE = `<!doctype html><body><script>
+  for (let i = 0; i < 500; i++) document.body.appendChild(document.createElement('div')).textContent = 'n' + i;
+</script></body>`;
+
+const BIG_TEXT_PAGE = `<!doctype html><body style="margin:0">
+<h1 style="font:64px sans-serif;margin:40px">A large heading paints the LCP</h1></body>`;
+
+// A click whose handler blocks the main thread for about 150ms: one slow interaction.
+const CLICK_PAGE = `<!doctype html><body style="margin:0">
+<button id="slow" style="width:300px;height:120px;font-size:24px">Slow click</button>
+<script>
+  document.getElementById('slow').addEventListener('click', () => {
+    const start = performance.now();
+    while (performance.now() - start < 150) {}
+    document.getElementById('slow').textContent = 'Clicked';
+  });
+</script></body>`;
+
+// A page that breaks the vitals probe: PerformanceObserver throws.
+const NO_OBSERVER_PAGE = `<!doctype html><body><p>No observers here</p><script>
+  window.PerformanceObserver = function () { throw new Error('page text that must not reach the result'); };
+</script></body>`;
+
+interface MetricsData {
+  metrics: Record<string, number | null>;
+  vitals: {
+    lcp: { ms: number; size: number; element: string } | null;
+    cls: number;
+    shiftCount: number;
+    inp: { ms: number; interactions: number } | null;
+  } | null;
+  vitalsError?: string;
+}
+
+describe('chrome metrics: input', () => {
+  it('says to connect first when there is no connection', async () => {
+    await call({ method: 'disconnect' });
+    const r = await call({ method: 'metrics' });
+    expect(r.success).toBe(false);
+    expect(r.error).toBe('Not connected. Use chrome({ method: "connect" }) first.');
+  });
+});
+
+describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome', () => {
+  let browser: TestBrowser;
+  const servers: Record<string, TestServer> = {};
+
+  const open = async (url: string) => {
+    const n = await call({ method: 'navigate', url });
+    expect(n.success, n.error).toBe(true);
+    for (let i = 0; i < 50; i++) {
+      if ((await evaluate('document.readyState === "complete"')) === true) return;
+      await sleep(100);
+    }
+    throw new Error(`${url} did not finish loading`);
+  };
+  const metrics = async (): Promise<MetricsData> => {
+    const r = await call({ method: 'metrics' });
+    expect(r.success, r.error).toBe(true);
+    return r.data as MetricsData;
+  };
+  /** CDP methods the tool sends while fn runs, read off the socket. */
+  const methodsSent = async (fn: () => Promise<unknown>): Promise<string[]> => {
+    const sent: string[] = [];
+    const real = WebSocket.prototype.send;
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      if (typeof data === 'string') sent.push(String((JSON.parse(data) as { method?: string }).method));
+      return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
+    try {
+      await fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return sent;
+  };
+
+  beforeAll(async () => {
+    browser = await launchTestBrowser();
+    for (const [name, html] of Object.entries({
+      nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, broken: NO_OBSERVER_PAGE,
+    })) {
+      servers[name] = await servePage(html);
+    }
+    const c = await call({ method: 'connect', port: browser.port });
+    expect(c.success, c.error).toBe(true);
+  }, 60_000);
+
+  afterAll(async () => {
+    await call({ method: 'disconnect' });
+    // Browser first: a server's close waits on the connections Chrome holds open.
+    await browser?.close();
+    for (const s of Object.values(servers)) await s.close();
+  }, 30_000);
+
+  it('counts the 500 inserted nodes and reports a numeric heap, in a small result', async () => {
+    await open(servers.nodes.url);
+    const r = await call({ method: 'metrics' });
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as MetricsData;
+    expect(d.metrics.nodes).toBeGreaterThanOrEqual(500);
+    expect(d.metrics.jsHeapUsedBytes).toBeGreaterThan(0);
+    expect(d.metrics.jsHeapTotalBytes).toBeGreaterThan(0);
+    expect(d.metrics.documents).toBeGreaterThanOrEqual(1);
+    expect(d.metrics.taskMs).toBeGreaterThan(0);
+    const size = JSON.stringify(r.data).length;
+    console.log(`metrics result: ${size} chars`);
+    expect(size).toBeLessThan(2000);
+  }, 60_000);
+
+  it('gives inp null and cls 0 on a quiet page with no interaction', async () => {
+    await open(servers.quiet.url);
+    const d = await metrics();
+    expect(d.vitals).not.toBeNull();
+    expect(d.vitals!.inp).toBe(null);
+    expect(d.vitals!.cls).toBe(0);
+    expect(d.vitals!.shiftCount).toBe(0);
+  }, 60_000);
+
+  it('sees the late banner shift, and agrees with a trace of the same run', async () => {
+    await open(servers.busy.url);
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    await sleep(500);
+    await evaluate('busyThenShift(), true');
+    await sleep(600);
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+    const traced = (stop.data as TraceData).summary!.vitals.cls;
+    const d = await metrics();
+    expect(d.vitals!.cls).toBeGreaterThan(0);
+    expect(d.vitals!.shiftCount).toBeGreaterThanOrEqual(1);
+    expect(Math.abs(d.vitals!.cls - traced)).toBeLessThan(0.01);
+  }, 60_000);
+
+  it('reports the LCP of a big-text page', async () => {
+    await open(servers.big.url);
+    await sleep(300);
+    const d = await metrics();
+    expect(d.vitals!.lcp).not.toBeNull();
+    expect(d.vitals!.lcp!.ms).toBeGreaterThan(0);
+    expect(d.vitals!.lcp!.size).toBeGreaterThan(0);
+    expect(d.vitals!.lcp!.element).toBe('h1');
+  }, 60_000);
+
+  it('reports INP for a real click on a slow handler', async () => {
+    await open(servers.click.url);
+    const clicked = await call({ method: 'click', selector: '#slow' });
+    expect(clicked.success, clicked.error).toBe(true);
+    await sleep(500);
+    expect(await evaluate('document.getElementById("slow").textContent')).toBe('Clicked');
+    const d = await metrics();
+    console.log(`INP after one slow click: ${JSON.stringify(d.vitals!.inp)}`);
+    expect(d.vitals!.inp).not.toBeNull();
+    expect(d.vitals!.inp!.ms).toBeGreaterThanOrEqual(100);
+    expect(d.vitals!.inp!.interactions).toBeGreaterThanOrEqual(1);
+  }, 60_000);
+
+  it('turns the Performance domain off again after reading', async () => {
+    await open(servers.quiet.url);
+    const sent = await methodsSent(() => metrics());
+    const at = (m: string) => sent.indexOf(m);
+    expect(at('Performance.enable')).toBeGreaterThanOrEqual(0);
+    expect(at('Performance.getMetrics')).toBeGreaterThan(at('Performance.enable'));
+    expect(at('Performance.disable')).toBeGreaterThan(at('Performance.getMetrics'));
+  }, 60_000);
+
+  it('fails with the reason when Chrome does not answer getMetrics, and still turns Performance off', async () => {
+    await open(servers.quiet.url);
+    const spy = loseAnswersFor('Performance.getMetrics');
+    const sent: string[] = [];
+    let r;
+    try {
+      r = await call({ method: 'metrics' });
+      sent.push(...spy.mock.calls.map(([data]) => String((JSON.parse(String(data)) as { method?: string }).method)));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/injected: lost the answer to Performance\.getMetrics/);
+    expect(sent).toContain('Performance.disable');
+  }, 60_000);
+
+  it('returns the metrics with vitals null and a plain reason when the page breaks the observer', async () => {
+    await open(servers.broken.url);
+    const r = await call({ method: 'metrics' });
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as MetricsData;
+    expect(d.metrics.nodes).toBeGreaterThan(0);
+    expect(d.vitals).toBe(null);
+    expect(typeof d.vitalsError).toBe('string');
+    expect(d.vitalsError!.length).toBeGreaterThan(0);
+    expect(d.vitalsError).not.toMatch(/page text/);
+  }, 60_000);
+});
+
+/** Make the send of one CDP method throw, as a broken socket does: the command never reaches Chrome. */
+function loseAnswersFor(method: string) {
+  const real = WebSocket.prototype.send;
+  return vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+    if (typeof data === 'string' && (JSON.parse(data) as { method?: string }).method === method) {
+      throw new Error(`injected: lost the answer to ${method}`);
+    }
+    return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+  });
+}

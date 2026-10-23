@@ -30,6 +30,7 @@
  * - scroll         Scroll with a real wheel or touch gesture (compositor-driven)
  * - trace          Record a Chrome trace to a file (start, then stop)
  * - profile        Trace, scroll, stop and summarize in one call
+ * - metrics        Snapshot of Chrome's counters and the page's web vitals, no trace
  */
 
 import { EventEmitter } from 'events';
@@ -50,6 +51,7 @@ import {
   validateOutPath,
 } from './chrome-trace-capture.js';
 import { summarizeTraceFile } from './chrome-trace-summary.js';
+import { VITALS_PROBE, pageVitals, pickMetrics } from './chrome-metrics.js';
 
 // =============================================================================
 // Types
@@ -801,6 +803,10 @@ const ProfileInput = z.object({
   summary: traceSummary.describe('return a summary of the trace, capped in count and length (default: true); false skips it'),
 });
 
+const MetricsInput = z.object({
+  method: z.literal('metrics'),
+});
+
 const ChromeInput = z.discriminatedUnion('method', [
   ConnectInput,
   DisconnectInput,
@@ -822,6 +828,7 @@ const ChromeInput = z.discriminatedUnion('method', [
   ScrollInput,
   TraceInput,
   ProfileInput,
+  MetricsInput,
 ]);
 
 // =============================================================================
@@ -2040,6 +2047,61 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
 }
 
 // =============================================================================
+// Metrics
+// =============================================================================
+
+/** A page that blocks its main thread holds the vitals probe; this bounds the wait for it. */
+const VITALS_TIMEOUT_MS = 10_000;
+
+async function handleMetrics(): Promise<ToolResult> {
+  if (!client?.isConnected()) {
+    return { success: false, error: 'Not connected. Use chrome({ method: "connect" }) first.' };
+  }
+  const c = client;
+
+  let metrics: ReturnType<typeof pickMetrics>;
+  try {
+    const enabled = await c.sendCommand('Performance.enable');
+    try {
+      if (enabled.error) throw new Error(enabled.error.message);
+      const r = await c.sendCommand('Performance.getMetrics');
+      if (r.error) throw new Error(r.error.message);
+      metrics = pickMetrics((r.result as { metrics?: unknown } | undefined)?.metrics);
+    } finally {
+      // Leave the domain as it was found: off. A failed disable must not hide the reading.
+      await c.sendCommand('Performance.disable').catch(() => {});
+    }
+  } catch (error) {
+    return { success: false, error: `Could not read Chrome's metrics: ${messageOf(error, 'unknown error')}` };
+  }
+
+  // The vitals are extra: a page that breaks the probe still gets its metrics. The reason is ours,
+  // never the page's exception text.
+  let vitalsError: string;
+  try {
+    const r = await c.sendCommand(
+      'Runtime.evaluate',
+      { expression: VITALS_PROBE, returnByValue: true, awaitPromise: true },
+      VITALS_TIMEOUT_MS
+    );
+    const result = r.result as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
+    if (r.error) {
+      vitalsError = 'Chrome refused to run the vitals probe in the page.';
+    } else if (result?.exceptionDetails !== undefined) {
+      vitalsError = 'The page threw while reading its performance entries (PerformanceObserver may be missing or replaced).';
+    } else {
+      const vitals = pageVitals(result?.result?.value);
+      if (vitals) return { success: true, data: { metrics, vitals } };
+      vitalsError = 'The page returned something other than performance entries.';
+    }
+  } catch (error) {
+    // A timeout or a broken connection: the message is the client's own, not the page's.
+    vitalsError = `The vitals probe got no answer: ${messageOf(error, 'unknown error')}`;
+  }
+  return { success: true, data: { metrics, vitals: null, vitalsError } };
+}
+
+// =============================================================================
 // Scroll
 // =============================================================================
 
@@ -2369,6 +2431,26 @@ export const chromeTool: Tool = {
   \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
   \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
 
+• **metrics** - A cheap snapshot, no trace: Chrome's counters for the page and
+  its web vitals so far, since load, from what the browser buffered.
+  \`chrome({ method: "metrics" })\`
+  -> { metrics: { nodes: 512, documents: 1, frames: 1, jsEventListeners: 3,
+       jsHeapUsedBytes: 1500000, jsHeapTotalBytes: 3000000, layoutCount: 4,
+       recalcStyleCount: 5, layoutMs: 12.35, recalcStyleMs: 2, scriptMs: 250,
+       v8CompileMs: 1.23, taskMs: 1500 },
+       vitals: { lcp: { ms: 412.35, size: 90000, element: "h1" }, cls: 0.12,
+       shiftCount: 2, inp: { ms: 152, interactions: 1 } } }
+  Durations are Chrome's running totals in ms. A counter Chrome did not report
+  is null, never 0. lcp is the last candidate (null when none); cls is the
+  worst session window of shifts without recent input (0 when none); inp is
+  null when there was no interaction, never 0. INP is an estimate: event
+  timing buffers only about 150 entries and only events of 40ms or more, so a
+  long session can lose interactions. The vitals are read in the page's own JS
+  world, so a page that lies can mislead them, as with evaluate; at most 500
+  entries of each kind are read and strings are cut at 200 characters. If the
+  page breaks the probe, vitals is null and vitalsError says why; the metrics
+  still come back.
+
 **Hidden-page handling:**
 evaluate, screenshot, and scene auto-detect document.hidden and bring the tab
 to front (macOS occlusion throttles rAF — animation-driven apps freeze under
@@ -2409,6 +2491,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
           'scroll',
           'trace',
           'profile',
+          'metrics',
         ],
         description: 'Chrome operation to perform',
       },
@@ -2630,6 +2713,8 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         return handleTrace(input);
       case 'profile':
         return handleProfile(input);
+      case 'metrics':
+        return handleMetrics();
       default:
         return {
           success: false,
