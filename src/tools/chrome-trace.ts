@@ -168,7 +168,7 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
 
 function candidateIndex(e: TraceEvent): number {
   const index = (e.args?.data as Record<string, unknown> | undefined)?.candidateIndex;
-  return typeof index === 'number' ? index : -1;
+  return typeof index === 'number' && Number.isFinite(index) ? index : -1;
 }
 
 function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
