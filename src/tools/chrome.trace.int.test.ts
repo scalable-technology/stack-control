@@ -11,6 +11,8 @@ import {
   chromeAvailable,
   launchTestBrowser,
   servePage,
+  toolTraceDir,
+  traceDirsIn,
   type TestBrowser,
   type TestServer,
 } from './chrome-test-browser.js';
@@ -28,7 +30,17 @@ vi.mock('./chrome-trace-summary.js', async (importOriginal) => {
   };
 });
 
-const call = (input: Record<string, unknown>) => chromeTool.handler(input, {});
+/** Every directory the tool made for a trace in this file, removed after each test (the tool keeps them). */
+const written = new Set<string>();
+const call = async (input: Record<string, unknown>) => {
+  const r = await chromeTool.handler(input, {});
+  for (const dir of traceDirsIn(r)) written.add(dir);
+  return r;
+};
+afterEach(() => {
+  for (const dir of written) rmSync(dir, { recursive: true, force: true });
+  written.clear();
+});
 
 const evaluate = async (expression: string): Promise<unknown> => {
   const r = await call({ method: 'evaluate', expression });
@@ -95,6 +107,26 @@ describe('chrome trace: input validation', () => {
     const r = await call({ method: 'profile', durationMs });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/^Not connected/);
+  });
+
+  it('cleans up only the directories the tool makes for a trace, never a test\'s outPath', () => {
+    const t = tmpdir();
+    expect(toolTraceDir(join(t, 'control-trace-abc123', 'trace.json.gz'))).toBe(join(t, 'control-trace-abc123'));
+    expect(toolTraceDir(join(t, 'control-trace-abc123', 'trace.json'))).toBe(join(t, 'control-trace-abc123'));
+    expect(toolTraceDir(join(t, 'control-trace-out-x', 'scroll.json.gz'))).toBeUndefined();
+    expect(toolTraceDir(join(t, 'control-trace-abc123', 'scroll.json.gz'))).toBeUndefined();
+    expect(toolTraceDir(join(t, 'control-profile-test-x', 'trace.json.gz'))).toBeUndefined();
+    expect(toolTraceDir(join(t, 'a', 'control-trace-abc123', 'trace.json.gz'))).toBeUndefined();
+    expect(toolTraceDir(join('/srv', 'control-trace-abc123', 'trace.json.gz'))).toBeUndefined();
+    expect(toolTraceDir(`${t}/control-trace-abc123/../control-trace-abc123/trace.json.gz`)).toBeUndefined();
+    expect(toolTraceDir('trace.json.gz')).toBeUndefined();
+    const kept = join(t, 'control-trace-kept01', 'trace.json.gz');
+    expect(traceDirsIn({ data: { path: kept } })).toEqual([join(t, 'control-trace-kept01')]);
+    expect(traceDirsIn({ error: `Scroll failed. The partial trace was kept at ${kept}.` })).toEqual([
+      join(t, 'control-trace-kept01'),
+    ]);
+    expect(traceDirsIn({ data: { path: 42 } })).toEqual([]);
+    expect(traceDirsIn({ error: 'Not connected.' })).toEqual([]);
   });
 
   it('says to connect first when there is no connection', async () => {
