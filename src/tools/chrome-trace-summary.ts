@@ -44,7 +44,7 @@ function round(n: number): number {
 const roundOrNull = (n: number | null) => (n === null ? null : round(n));
 
 /** At most MAX_STRING UTF-16 units, ending in an ellipsis when cut; never half a surrogate pair. Not a string: ''. */
-function truncate(s: unknown): string {
+export function truncate(s: unknown): string {
   if (typeof s !== 'string') return '';
   if (s.length <= MAX_STRING) return s;
   let end = MAX_STRING - 1;

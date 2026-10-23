@@ -316,6 +316,30 @@ function candidateIndex(e: TraceEvent): number {
   return typeof index === 'number' && Number.isFinite(index) ? index : -1;
 }
 
+/**
+ * CLS as web-vitals defines it: the worst session window. A shift joins the session only if under
+ * 1000ms after the previous one and under 5000ms after the first. `t` is in any unit; perMs says
+ * how many make a millisecond (1000 for trace microseconds, 1 for page milliseconds). The caller
+ * leaves out shifts with recent input. 0 when there are none.
+ */
+export function worstSessionWindow(shifts: readonly { t: number; score: number }[], perMs: number): number {
+  const ordered = [...shifts].sort((a, b) => a.t - b.t);
+  let cls = 0;
+  let sessionScore = 0;
+  let sessionStart = ordered[0]?.t ?? 0;
+  let previous = sessionStart;
+  for (const shift of ordered) {
+    if ((shift.t - previous) / perMs >= 1000 || (shift.t - sessionStart) / perMs >= 5000) {
+      cls = Math.max(cls, sessionScore);
+      sessionScore = 0;
+      sessionStart = shift.t;
+    }
+    sessionScore += shift.score;
+    previous = shift.t;
+  }
+  return Math.max(cls, sessionScore);
+}
+
 function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
   const shifts: { ts: number; score: number }[] = [];
   const navigations: TraceEvent[] = [];
@@ -340,22 +364,7 @@ function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
 
   shifts.sort((a, b) => a.ts - b.ts);
   const origin = Number.isFinite(windowStart) ? windowStart : (shifts[0]?.ts ?? 0);
-  let cls = 0;
-  let sessionScore = 0;
-  let sessionStart = shifts[0]?.ts ?? 0;
-  let previousTs = sessionStart;
-  for (const shift of shifts) {
-    // web-vitals: a shift joins the session only if under 1000ms after the previous
-    // one and under 5000ms after the first.
-    if ((shift.ts - previousTs) / 1000 >= 1000 || (shift.ts - sessionStart) / 1000 >= 5000) {
-      cls = Math.max(cls, sessionScore);
-      sessionScore = 0;
-      sessionStart = shift.ts;
-    }
-    sessionScore += shift.score;
-    previousTs = shift.ts;
-  }
-  cls = Math.max(cls, sessionScore);
+  const cls = worstSessionWindow(shifts.map((x) => ({ t: x.ts, score: x.score })), 1000);
 
   let lcp: Vitals['lcp'] = null;
   if (candidate && typeof candidate.args?.frame === 'string') {
