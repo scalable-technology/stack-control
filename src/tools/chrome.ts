@@ -39,6 +39,7 @@ import WebSocket from 'ws';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
+import { waitForCdpEvent } from './cdp-events.js';
 import { TraceRecorder } from './chrome-trace-capture.js';
 
 // =============================================================================
@@ -305,8 +306,13 @@ class ChromeCDPClient extends EventEmitter {
         );
       };
 
-      this.ws.onclose = () => {
+      const socket = this.ws;
+      socket.onclose = () => {
+        // A socket we already replaced or closed on purpose has been torn down; its late close
+        // event must not mark the newer connection as closed.
+        if (this.ws !== socket) return;
         this.connected = false;
+        this.emit('teardown');
         this.emit('close');
       };
 
@@ -469,30 +475,9 @@ class ChromeCDPClient extends EventEmitter {
     });
   }
 
-  /** Resolve with the params of the next event of this method. The listener is registered before this returns. */
-  waitForEvent(method: string, timeoutMs: number): Promise<Record<string, unknown>> {
-    return new Promise((resolve, reject) => {
-      const onEvent = (event: CDPResponse) => {
-        if (event.method !== method) return;
-        cleanup();
-        resolve(event.params ?? {});
-      };
-      const onClose = () => {
-        cleanup();
-        reject(new Error(`Connection closed while waiting for ${method}`));
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`Timed out after ${timeoutMs / 1000}s waiting for ${method}`));
-      }, timeoutMs);
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.off('cdp', onEvent);
-        this.off('close', onClose);
-      };
-      this.on('cdp', onEvent);
-      this.on('close', onClose);
-    });
+  /** See waitForCdpEvent: resolves with the next event of this method; rejects on timeout, teardown or abort. */
+  waitForEvent(method: string, timeoutMs: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return waitForCdpEvent(this, method, timeoutMs, signal);
   }
 
   async evaluate(expression: string): Promise<unknown> {
@@ -527,6 +512,8 @@ class ChromeCDPClient extends EventEmitter {
     }
     this.connected = false;
     this.pendingCommands.clear();
+    // Chrome ends a session's trace with the session; listeners drop what depended on it.
+    this.emit('teardown');
   }
 
   disconnect(): void {
@@ -546,6 +533,8 @@ function getClient(port?: number): ChromeCDPClient {
   if (!client || (port && client.getPort() !== port)) {
     if (client) client.disconnect();
     client = new ChromeCDPClient(port);
+    // A recording belongs to the session it started on; any teardown of that session ends it.
+    client.on('teardown', () => recorder.reset());
   }
   return client;
 }
@@ -829,7 +818,6 @@ async function ensureForeground(c: ChromeCDPClient): Promise<string | undefined>
 async function handleConnect(input: z.infer<typeof ConnectInput>): Promise<ToolResult> {
   try {
     const c = getClient(input.port);
-    recorder.reset(); // a new connection starts with no recording
     await c.connect(input.targetId);
     const target = c.getCurrentTarget();
     return {

@@ -167,6 +167,64 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     expect((await call({ method: 'trace', action: 'stop' })).success).toBe(true);
   }, 60_000);
 
+  it('keeps a running trace when a reconnect fails, because the old connection is still there', async () => {
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    const bad = await call({ method: 'connect', port: browser.port, targetId: 'no-such-target' });
+    expect(bad.success).toBe(false);
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+  }, 60_000);
+
+  it('forgets a running trace when another tab is selected', async () => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const second = (await created.json()) as { id: string };
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    const sel = await call({ method: 'select', targetId: second.id });
+    expect(sel.success, sel.error).toBe(true);
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success).toBe(false);
+    expect(stop.error).toMatch(/No trace is running/);
+    // Back to the original tab for the tests that follow.
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.url.startsWith(server.url));
+    expect(original).toBeDefined();
+    expect((await call({ method: 'select', targetId: original!.id })).success).toBe(true);
+  }, 60_000);
+
+  it('forgets a running trace when its tab closes under it', async () => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const doomed = (await created.json()) as { id: string };
+    expect((await call({ method: 'select', targetId: doomed.id })).success).toBe(true);
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    await fetch(`http://127.0.0.1:${browser.port}/json/close/${doomed.id}`);
+    await new Promise((r) => setTimeout(r, 800));
+
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.url.startsWith(server.url));
+    expect(original).toBeDefined();
+    expect((await call({ method: 'select', targetId: original!.id })).success).toBe(true);
+    // The old session's recording is gone; stopping must say so rather than wait on a dead trace.
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success).toBe(false);
+    expect(stop.error).toMatch(/No trace is running/);
+  }, 60_000);
+
+  it('does not wait out the 120s limit when the tab dies while a stop is in flight', async () => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const doomed = (await created.json()) as { id: string };
+    expect((await call({ method: 'select', targetId: doomed.id })).success).toBe(true);
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    const startedAt = Date.now();
+    const stopping = call({ method: 'trace', action: 'stop' });
+    await fetch(`http://127.0.0.1:${browser.port}/json/close/${doomed.id}`);
+    await stopping; // either outcome is fine; what matters is that it comes back quickly
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.url.startsWith(server.url));
+    expect((await call({ method: 'select', targetId: original!.id })).success).toBe(true);
+  }, 70_000);
+
   it('forgets a running trace when connecting again without disconnecting', async () => {
     expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
     const c = await call({ method: 'connect', port: browser.port });
