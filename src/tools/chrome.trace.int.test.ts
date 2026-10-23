@@ -2,8 +2,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
+import { boundSummary, type BoundedSummary } from './chrome-trace-summary.js';
 import { chromeTool } from './chrome.js';
 import {
   chromeAvailable,
@@ -12,6 +13,19 @@ import {
   type TestBrowser,
   type TestServer,
 } from './chrome-test-browser.js';
+
+// Test seam: a tiny summary cap, or a summary that throws, without making either a tool input. Unset, it passes through.
+const seam = vi.hoisted(() => ({ maxBytes: undefined as number | undefined, fail: false }));
+vi.mock('./chrome-trace-summary.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./chrome-trace-summary.js')>();
+  return {
+    ...real,
+    summarizeTraceFile: async (path: string, options: { compressed: boolean; maxBytes?: number }) => {
+      if (seam.fail) throw new Error('injected summary failure');
+      return real.summarizeTraceFile(path, { ...options, maxBytes: seam.maxBytes ?? options.maxBytes });
+    },
+  };
+});
 
 const call = (input: Record<string, unknown>) => chromeTool.handler(input, {});
 
@@ -35,6 +49,8 @@ interface TraceData {
   compressed: boolean;
   dataLoss: boolean;
   durationMs: number;
+  summary?: BoundedSummary;
+  summarySkipped?: string;
 }
 
 const readTrace = (path: string): TraceEvent[] => {
@@ -56,6 +72,7 @@ describe('chrome trace: input validation', () => {
     [{ method: 'trace', action: 'stop', outPath: '' }, 'outPath'],
     [{ method: 'trace', action: 'stop', outPath: '/tmp/a\0b.json.gz' }, 'outPath'],
     [{ method: 'trace', action: 'stop', overwrite: 'yes' }, 'overwrite'],
+    [{ method: 'trace', action: 'stop', summary: 'yes' }, 'summary'],
   ])('rejects %j and names the field %s', async (input, field) => {
     const r = await call(input);
     expect(r.success).toBe(false);
@@ -281,5 +298,143 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     // A fresh start works on the new connection.
     expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
     expect((await call({ method: 'trace', action: 'stop' })).success).toBe(true);
+  }, 60_000);
+});
+
+// After load, a 120ms synchronous task, then a banner inserted above visible content: a long task and a layout shift.
+const BUSY_PAGE = `<!doctype html><body style="margin:0;font:16px sans-serif">
+<p style="height:400px;margin:0;background:#ddd">Content that a late banner pushes down.</p>
+<script>
+  window.busyThenShift = () => setTimeout(() => {
+    const start = performance.now();
+    while (performance.now() - start < 120) {}
+    const banner = document.createElement('div');
+    banner.style.height = '200px';
+    banner.textContent = 'Late banner';
+    document.body.prepend(banner);
+  }, 50);
+</script></body>`;
+
+const QUIET_PAGE = `<!doctype html><body style="margin:0;font:16px sans-serif">
+<p style="height:400px;margin:0;background:#ddd">Static content.</p></body>`;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chrome', () => {
+  let browser: TestBrowser;
+  let busy: TestServer;
+  let quiet: TestServer;
+  /** Trace directories these tests create, removed after each test. */
+  const made: string[] = [];
+
+  const open = async (url: string) => {
+    const n = await call({ method: 'navigate', url });
+    expect(n.success, n.error).toBe(true);
+    for (let i = 0; i < 50; i++) {
+      if ((await evaluate('document.readyState === "complete"')) === true) return;
+      await sleep(100);
+    }
+    throw new Error(`${url} did not finish loading`);
+  };
+
+  /** Start, let profiler start-up pass, run the page's trigger (if any), wait it out, stop. */
+  const record = async (stop: Record<string, unknown>, trigger?: string): Promise<TraceData> => {
+    const s = await call({ method: 'trace', action: 'start' });
+    expect(s.success, s.error).toBe(true);
+    await sleep(500);
+    if (trigger) await evaluate(trigger);
+    await sleep(600);
+    const e = await call({ method: 'trace', action: 'stop', ...stop });
+    expect(e.success, e.error).toBe(true);
+    const d = e.data as TraceData;
+    if (stop.outPath === undefined) made.push(dirname(d.path));
+    return d;
+  };
+
+  beforeAll(async () => {
+    browser = await launchTestBrowser();
+    busy = await servePage(BUSY_PAGE);
+    quiet = await servePage(QUIET_PAGE);
+    const c = await call({ method: 'connect', port: browser.port });
+    expect(c.success, c.error).toBe(true);
+  }, 60_000);
+
+  afterEach(() => {
+    seam.maxBytes = undefined;
+    seam.fail = false;
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  afterAll(async () => {
+    await call({ method: 'disconnect' });
+    // Browser first: a server's close waits on the connections Chrome holds open.
+    await browser?.close();
+    await busy?.close();
+    await quiet?.close();
+  }, 30_000);
+
+  it('summarizes a long task and a layout shift on a busy page', async () => {
+    await open(busy.url);
+    const d = await record({}, 'busyThenShift(), true');
+    expect(d.summarySkipped).toBeUndefined();
+    expect(d.summary).toBeDefined();
+    const s = d.summary!;
+    expect(s.longTasks.some((t) => t.durationMs >= 100)).toBe(true);
+    expect(s.vitals.cls).toBeGreaterThan(0);
+    expect(s).toEqual(boundSummary(analyzeTrace(readTrace(d.path))));
+    expect(JSON.stringify(s).length).toBeLessThan(5000);
+  }, 60_000);
+
+  it('summarizes a quiet page as no long tasks and no shift', async () => {
+    await open(quiet.url);
+    const d = await record({});
+    expect(d.summary).toBeDefined();
+    const s = d.summary!;
+    expect(s.longTasks).toEqual([]);
+    expect(s.longTaskCount).toBe(0);
+    expect(s.vitals.cls).toBe(0);
+  }, 60_000);
+
+  it('returns neither summary nor summarySkipped with summary: false', async () => {
+    await open(quiet.url);
+    const d = await record({ summary: false });
+    expect(statSync(d.path).size).toBe(d.bytes);
+    expect('summary' in d).toBe(false);
+    expect('summarySkipped' in d).toBe(false);
+  }, 60_000);
+
+  it('summarizes the file at outPath', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'control-trace-out-'));
+    try {
+      await open(quiet.url);
+      const target = join(dir, 'quiet.json.gz');
+      const d = await record({ outPath: target });
+      expect(d.path).toBe(target);
+      expect(d.summary).toEqual(boundSummary(analyzeTrace(readTrace(target))));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('keeps the file and the stop result when the summary is skipped, and clears the recording', async () => {
+    await open(quiet.url);
+    seam.maxBytes = 1000;
+    const d = await record({});
+    expect(statSync(d.path).size).toBe(d.bytes);
+    expect(d.bytes).toBeGreaterThan(1000);
+    expect(d.summarySkipped).toMatch(/over the 1000 bytes summary limit/);
+    expect('summary' in d).toBe(false);
+    const again = await call({ method: 'trace', action: 'stop' });
+    expect(again.success).toBe(false);
+    expect(again.error).toMatch(/No trace is running/);
+  }, 60_000);
+
+  it('keeps the stop result when the summary itself throws', async () => {
+    await open(quiet.url);
+    seam.fail = true;
+    const d = await record({});
+    expect(statSync(d.path).size).toBe(d.bytes);
+    expect(d.summarySkipped).toBe('The summary failed');
+    expect('summary' in d).toBe(false);
   }, 60_000);
 });
