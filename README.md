@@ -142,7 +142,7 @@ native({ method: "backtrace", sessionId: "..." })
 Chrome browser inspection via CDP (Chrome DevTools Protocol).
 
 ```javascript
-chrome({ method: "status" })                            // List tabs, browser version
+chrome({ method: "status" })                            // List tabs, browser version, trace.running
 chrome({ method: "connect" })                           // Connect to first tab
 chrome({ method: "connect", targetId: "..." })          // Connect to specific tab
 chrome({ method: "evaluate", expression: "document.title" })
