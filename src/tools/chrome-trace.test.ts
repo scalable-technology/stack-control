@@ -393,8 +393,9 @@ describe('analyzeTrace: vitals', () => {
     name: 'LayoutShift', ph: 'I', ts: tsMs * 1000, ...MAIN,
     args: { frame: 'main', data: { score, had_recent_input: false, is_main_frame: true, ...data } },
   });
-  const navigation = (tsMs: number, frame = 'main'): TraceEvent => ({
-    name: 'navigationStart', ph: 'R', ts: tsMs * 1000, ...MAIN, args: { frame },
+  const navigation = (tsMs: number, frame = 'main', navigationId?: string): TraceEvent => ({
+    name: 'navigationStart', ph: 'R', ts: tsMs * 1000, ...MAIN,
+    args: navigationId === undefined ? { frame } : { frame, data: { navigationId } },
   });
   const candidate = (tsMs: number, data: Record<string, unknown> = {}, frame = 'main'): TraceEvent => ({
     name: 'largestContentfulPaint::Candidate', ph: 'R', ts: tsMs * 1000, ...MAIN,
@@ -444,8 +445,12 @@ describe('analyzeTrace: vitals', () => {
     expect(analyzeTrace([shift(0, 0.3), shift(1500, 0.2)]).vitals.cls).toBeCloseTo(0.3);
   });
 
-  it('keeps a gap of exactly one second in the same session', () => {
-    expect(analyzeTrace([shift(0, 0.2), shift(1000, 0.3)]).vitals.cls).toBeCloseTo(0.5);
+  it('starts a new session at a gap of exactly one second (web-vitals: gap under 1000ms stays)', () => {
+    expect(analyzeTrace([shift(0, 0.2), shift(1000, 0.3)]).vitals.cls).toBeCloseTo(0.3);
+  });
+
+  it('keeps a gap just under one second in the same session', () => {
+    expect(analyzeTrace([shift(0, 0.2), shift(999, 0.3)]).vitals.cls).toBeCloseTo(0.5);
   });
 
   it('caps a session at five seconds despite smaller gaps', () => {
@@ -453,9 +458,15 @@ describe('analyzeTrace: vitals', () => {
     expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.6);
   });
 
-  it('starts a new session at exactly five seconds', () => {
-    const events = [0, 1000, 2000, 3000, 4000, 5000].map((t) => shift(t, 0.1));
-    expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.5);
+  it('starts a new session at exactly five seconds from the first shift', () => {
+    // Every gap is under one second, so only the five-second rule can split this.
+    const events = [0, 800, 1600, 2400, 3200, 4000, 4800, 5000].map((t) => shift(t, 0.1));
+    expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.7);
+  });
+
+  it('keeps a shift 4999ms after the first in the same session', () => {
+    const events = [0, 800, 1600, 2400, 3200, 4000, 4800, 4999].map((t) => shift(t, 0.1));
+    expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.8);
   });
 
   it('lists only the ten largest shifts but counts all shifts', () => {
@@ -518,6 +529,35 @@ describe('analyzeTrace: vitals', () => {
       navigation(130), navigation(100), candidate(120), navigation(115, 'child'), navigation(110),
     ]).vitals;
     expect(v.lcp?.ms).toBe(10);
+  });
+
+  it('matches navigationStart by navigationId when the candidate has one', () => {
+    // Navigation A started at 0 and is still painting after navigation B began at 100.
+    const v = analyzeTrace([
+      navigation(0, 'main', 'A'), navigation(100, 'main', 'B'), candidate(120, { navigationId: 'A' }),
+    ]).vitals;
+    expect(v.lcp?.ms).toBe(120);
+  });
+
+  it('gives null when the candidate names a navigation that has no navigationStart', () => {
+    expect(analyzeTrace([
+      navigation(100, 'main', 'B'), candidate(120, { navigationId: 'A' }),
+    ]).vitals.lcp).toBeNull();
+    // A navigationStart without an id cannot be matched to a candidate that has one.
+    expect(analyzeTrace([navigation(100), candidate(120, { navigationId: 'A' })]).vitals.lcp).toBeNull();
+  });
+
+  it('does not match a navigationId from another frame', () => {
+    expect(analyzeTrace([
+      navigation(100, 'child', 'A'), candidate(120, { navigationId: 'A' }),
+    ]).vitals.lcp).toBeNull();
+  });
+
+  it('breaks a candidate timestamp tie with the higher candidateIndex', () => {
+    const first = candidate(120, { candidateIndex: 1, size: 10 });
+    const second = candidate(120, { candidateIndex: 2, size: 20 });
+    expect(analyzeTrace([navigation(100), second, first]).vitals.lcp?.size).toBe(20);
+    expect(analyzeTrace([navigation(100), first, second]).vitals.lcp?.size).toBe(20);
   });
 
   it('accepts a navigation at the exact candidate timestamp', () => {
