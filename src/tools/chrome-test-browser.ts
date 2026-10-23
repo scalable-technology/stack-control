@@ -40,14 +40,24 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
     ],
     { stdio: 'ignore' }
   );
+  let spawnError: Error | null = null;
+  proc.once('error', (e) => {
+    spawnError = e;
+  });
+  const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
   const close = async () => {
     proc.kill('SIGKILL');
-    await sleep(200);
+    // Wait for the process to be gone before deleting its profile; a spawn that failed never exits.
+    await Promise.race([exited, sleep(3000)]);
     rmSync(dir, { recursive: true, force: true });
   };
 
   const portFile = join(dir, 'DevToolsActivePort');
   for (let i = 0; i < 100; i++) {
+    if (spawnError) {
+      await close();
+      throw new Error(`Could not start Chrome at ${CHROME_PATH}: ${(spawnError as Error).message}`);
+    }
     if (existsSync(portFile)) {
       const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
       if (Number.isInteger(port) && port > 0) return { port, close };
