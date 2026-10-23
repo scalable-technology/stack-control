@@ -13,6 +13,7 @@
 export interface TraceEvent {
   name: string;
   cat?: string;
+  id?: string | number;
   ph: string;
   /** Microseconds. */
   ts: number;
@@ -85,9 +86,35 @@ export interface Vitals {
   shifts: LayoutShift[];
 }
 
+export interface HotFunction {
+  /** functionName, or '(anonymous)' when empty. */
+  name: string;
+  /** '' for native and special frames. */
+  url: string;
+  /** 1-based; null when the frame has no url or the number is missing or negative. */
+  line: number | null;
+  column: number | null;
+  /** Time the function itself was running, excluding its callees. */
+  selfMs: number;
+  /** selfMs as a share of busy time (sampledMs - idleMs), 0-100. */
+  selfPct: number;
+}
+
+export interface CpuProfile {
+  /** Time covered by the samples, from the first sample to the last. */
+  sampledMs: number;
+  idleMs: number;
+  /** '(program)': native work the profiler cannot attribute to a function. */
+  programMs: number;
+  /** Functions by self time, largest first, at most topFunctions. */
+  hot: HotFunction[];
+}
+
 export interface AnalyzeOptions {
   /** One vsync interval. Default 1000/60; pass 1000/120 for a 120Hz display. */
   frameBudgetMs?: number;
+  /** How many hot functions to return. Default 10. */
+  topFunctions?: number;
 }
 
 export interface TraceSummary {
@@ -98,6 +125,7 @@ export interface TraceSummary {
   categoryMs: CategoryMs;
   frames: FrameStats;
   vitals: Vitals;
+  profile: CpuProfile | null;
 }
 
 const DEFAULT_FRAME_BUDGET_MS = 1000 / 60;
@@ -164,6 +192,98 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
     chromeDropped,
     chromeDroppedDrawn,
   };
+}
+
+interface ProfileNode {
+  id: number;
+  callFrame: {
+    functionName: string;
+    url?: string;
+    lineNumber?: number;
+    columnNumber?: number;
+  };
+}
+
+interface ProfileChunkData {
+  cpuProfile?: { nodes?: ProfileNode[]; samples?: number[] };
+  timeDeltas?: number[];
+}
+
+function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], topFunctions: number): CpuProfile | null {
+  if (!Number.isInteger(topFunctions) || topFunctions < 1) {
+    throw new RangeError(`topFunctions must be a positive integer, got ${topFunctions}`);
+  }
+  if (!main) return null;
+  const key = (e: TraceEvent) => JSON.stringify([e.pid, e.id]);
+  const profiles = new Map<string, TraceEvent[]>();
+  for (const e of events) {
+    if (e.name === 'Profile' && e.ph === 'P' && e.pid === main.pid && e.tid === main.tid) {
+      profiles.set(key(e), []);
+    }
+  }
+  if (profiles.size === 0) return null;
+  for (const e of events) {
+    // ProfileChunk's tid belongs to the sampler, not the sampled thread.
+    if (e.name === 'ProfileChunk' && e.ph === 'P') profiles.get(key(e))?.push(e);
+  }
+
+  const buckets = new Map<string, Omit<HotFunction, 'selfMs' | 'selfPct'> & { selfUs: number }>();
+  let sampledUs = 0;
+  let idleUs = 0;
+  let programUs = 0;
+  for (const chunks of profiles.values()) {
+    chunks.sort((a, b) => a.ts - b.ts);
+    const nodes = new Map<number, ProfileNode>();
+    for (const chunk of chunks) {
+      const data = chunk.args?.data as ProfileChunkData | undefined;
+      for (const node of data?.cpuProfile?.nodes ?? []) nodes.set(node.id, node);
+    }
+    const samples: { time: number; node: ProfileNode }[] = [];
+    let time = 0;
+    for (const chunk of chunks) {
+      const data = chunk.args?.data as ProfileChunkData | undefined;
+      const ids = data?.cpuProfile?.samples ?? [];
+      for (let i = 0; i < ids.length; i++) {
+        const delta = data?.timeDeltas?.[i];
+        if (typeof delta !== 'number' || !Number.isFinite(delta)) continue;
+        time += delta;
+        const node = nodes.get(ids[i]);
+        if (node) samples.push({ time, node });
+      }
+    }
+    // Sampler jitter can produce negative deltas. Stable sorting repairs the
+    // timeline without adding time or changing which sample wins a timestamp tie.
+    samples.sort((a, b) => a.time - b.time);
+    for (let i = 0; i < samples.length; i++) {
+      const sample = samples[i];
+      const durationUs = (samples[i + 1]?.time ?? sample.time) - sample.time;
+      if (durationUs === 0) continue;
+      sampledUs += durationUs;
+      const frame = sample.node.callFrame;
+      if (frame.functionName === '(idle)') idleUs += durationUs;
+      if (frame.functionName === '(program)') programUs += durationUs;
+      if (frame.functionName === '(root)' || frame.functionName === '(idle)' || frame.functionName === '(program)') continue;
+      const url = frame.url ?? '';
+      const position = (value: number | undefined) =>
+        url && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + 1 : null;
+      const identity = JSON.stringify([frame.functionName, url, String(frame.lineNumber), String(frame.columnNumber)]);
+      let bucket = buckets.get(identity);
+      if (!bucket) {
+        buckets.set(identity, (bucket = {
+          name: frame.functionName || '(anonymous)', url,
+          line: position(frame.lineNumber), column: position(frame.columnNumber), selfUs: 0,
+        }));
+      }
+      bucket.selfUs += durationUs;
+    }
+  }
+  const busyUs = sampledUs - idleUs;
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  const hot = Array.from(buckets.values(), ({ selfUs, ...frame }) => ({
+    ...frame, selfMs: selfUs / 1000, selfPct: busyUs > 0 ? selfUs / busyUs * 100 : 0,
+  })).sort((a, b) => b.selfMs - a.selfMs || compare(a.name, b.name) || compare(a.url, b.url)
+    || (a.line === b.line ? 0 : a.line === null ? 1 : b.line === null ? -1 : a.line - b.line));
+  return { sampledMs: sampledUs / 1000, idleMs: idleUs / 1000, programMs: programUs / 1000, hot: hot.slice(0, topFunctions) };
 }
 
 function candidateIndex(e: TraceEvent): number {
@@ -393,5 +513,6 @@ export function analyzeTrace(events: TraceEvent[], options: AnalyzeOptions = {})
     categoryMs: selfTimeByCategory(mainSpans),
     frames: analyzeFrames(events, options.frameBudgetMs ?? DEFAULT_FRAME_BUDGET_MS),
     vitals: analyzeVitals(events, windowStart),
+    profile: analyzeProfile(events, main, options.topFunctions ?? 10),
   };
 }

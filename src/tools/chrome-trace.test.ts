@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
+import { analyzeTrace, type AnalyzeOptions, type TraceEvent } from './chrome-trace.js';
 
 const MAIN = { pid: 1, tid: 10 };
 
@@ -630,5 +630,207 @@ describe('analyzeTrace: vitals', () => {
     expect(v.shiftCount).toBe(1);
     expect(v.shifts).toEqual([{ atMs: 100, score: 0.1 }]);
     expect(v.lcp?.ms).toBeCloseTo(51.032, 3);
+  });
+});
+
+
+describe('analyzeTrace: cpu profile', () => {
+  const node = (id: number, functionName: string, url = '', lineNumber?: number, columnNumber?: number, parent = 1) => ({
+    id, parent, callFrame: { functionName, url, lineNumber, columnNumber },
+  });
+  const profile = (id = '0x2', at = MAIN): TraceEvent => ({
+    name: 'Profile', ph: 'P', ts: 0, ...at, id,
+  });
+  const chunk = (
+    nodes: ReturnType<typeof node>[], samples: number[], timeDeltas = samples.map(() => 1000),
+    ts = 0, id = '0x2', pid = MAIN.pid,
+  ): TraceEvent => ({
+    name: 'ProfileChunk', ph: 'P', ts, pid, tid: 99, id,
+    args: { data: { cpuProfile: { nodes, samples }, timeDeltas } },
+  });
+  const cpu = (events: TraceEvent[], options?: AnalyzeOptions) => {
+    const p = analyzeTrace(withMain(...events), options).profile;
+    expect(p).not.toBeNull();
+    return p!;
+  };
+  const simple = (nodes: ReturnType<typeof node>[], samples: number[], deltas?: number[]) =>
+    cpu([profile(), chunk(nodes, samples, deltas)]);
+  const basicNodes = [node(1, '(root)'), node(2, 'A'), node(3, 'B'), node(4, '(idle)')];
+
+  it('distinguishes an absent profile from a counted profile with no samples', () => {
+    expect(analyzeTrace([]).profile).toBeNull();
+    expect(analyzeTrace(withMain()).profile).toBeNull();
+    expect(analyzeTrace([profile(), chunk(basicNodes, [2, 3])]).profile).toBeNull();
+    expect(cpu([profile()])).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+    expect(cpu([profile(), chunk(basicNodes, [])])).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+  });
+
+  it('attributes 80ms to A and 19ms to B, with no duration for the final idle sample', () => {
+    const p = simple(basicNodes, [...Array(80).fill(2), ...Array(19).fill(3), 4]);
+    expect(p.sampledMs).toBe(99);
+    expect(p.idleMs).toBe(0);
+    expect(p.programMs).toBe(0);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['A', 80], ['B', 19]]);
+    expect(p.hot[0].selfPct).toBeCloseTo(80.808, 3);
+  });
+
+  it('leaves idle time out of the busy percentage denominator', () => {
+    const p = simple(basicNodes, [...Array(20).fill(2), ...Array(70).fill(4), ...Array(10).fill(3), 4]);
+    expect(p.sampledMs).toBe(100);
+    expect(p.idleMs).toBe(70);
+    expect(p.hot.map((f) => f.name)).toEqual(['A', 'B']);
+    expect(p.hot[0].selfPct).toBeCloseTo(66.667, 3);
+  });
+
+  it('counts program time as busy, keeps garbage collection, and excludes root', () => {
+    const p = simple([node(1, '(root)'), node(2, '(program)'), node(3, '(garbage collector)'), node(4, 'A')], [2, 2, 3, 4, 1, 1]);
+    expect(p.sampledMs).toBe(5);
+    expect(p.programMs).toBe(2);
+    expect(p.hot.map((f) => [f.name, f.selfMs, f.selfPct])).toEqual([
+      ['(garbage collector)', 1, 20], ['A', 1, 20],
+    ]);
+    expect(simple(basicNodes, [4, 4, 4])).toEqual({ sampledMs: 2, idleMs: 2, programMs: 0, hot: [] });
+  });
+
+  it('merges the same function across parents, but separates urls, lines and columns', () => {
+    const nodes = [node(1, '(root)'), node(2, 'same', 'a', 0, 0), node(3, 'same', 'a', 0, 0, 2),
+      node(4, 'same', 'b', 0, 0), node(5, 'same', 'a', 1, 0), node(6, 'same', 'a', 0, 1)];
+    const p = simple(nodes, [2, 3, 4, 5, 6, 1]);
+    expect(p.hot).toHaveLength(4);
+    expect(p.hot[0]).toMatchObject({ name: 'same', url: 'a', line: 1, column: 1, selfMs: 2 });
+    expect(p.hot).toEqual(expect.arrayContaining([
+      expect.objectContaining({ url: 'b', line: 1, column: 1, selfMs: 1 }),
+      expect.objectContaining({ url: 'a', line: 2, column: 1, selfMs: 1 }),
+      expect.objectContaining({ url: 'a', line: 1, column: 2, selfMs: 1 }),
+    ]));
+  });
+
+  it('orders equal self times by code-unit name, url and line with null last', () => {
+    const nodes = [node(1, '(root)'), node(2, 'z'), node(3, 'a', 'b', 0), node(4, 'a', 'a'),
+      node(5, 'a', 'a', 2), node(6, 'a', 'a', 0), node(7, 'Z')];
+    const samples = [2, 3, 4, 5, 6, 7, 1];
+    const hot = simple(nodes, samples).hot;
+    expect(hot.map((f) => [f.name, f.url, f.line])).toEqual([
+      ['Z', '', null], ['a', 'a', 1], ['a', 'a', 3], ['a', 'a', null], ['a', 'b', 1], ['z', '', null],
+    ]);
+    expect(simple([...nodes].reverse(), samples).hot).toEqual(hot);
+  });
+
+  it('limits the hot list to ten by default and respects topFunctions', () => {
+    const nodes = Array.from({ length: 12 }, (_, i) => node(i + 2, `f${i}`));
+    const events = [profile(), chunk([node(1, '(root)'), ...nodes], [...nodes.map((n) => n.id), 1])];
+    expect(cpu(events).hot).toHaveLength(10);
+    expect(cpu(events, { topFunctions: 3 }).hot).toHaveLength(3);
+    expect(cpu(events, { topFunctions: 20 }).hot).toHaveLength(12);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, -Infinity])('rejects topFunctions %s even without a profile', (topFunctions) => {
+    expect(() => analyzeTrace([], { topFunctions })).toThrow(RangeError);
+  });
+
+  it('sorts negative-delta samples by time instead of clamping the deltas', () => {
+    // Times: A=1000, B=4000, A=2000, idle=6000 us. Sorted gaps:
+    // A(1000)->A(2000)=1ms, A->B(4000)=2ms, B->idle(6000)=2ms.
+    const p = simple(basicNodes, [2, 3, 2, 4], [1000, 3000, -2000, 4000]);
+    expect(p.sampledMs).toBe((6000 - 1000) / 1000);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['A', 3], ['B', 2]]);
+    expect(p.idleMs).toBe(0);
+  });
+
+  it('preserves recorded order when sample times tie and omits zero-time entries', () => {
+    const p = simple(basicNodes, [2, 3, 4], [1000, 0, 1000]);
+    expect(p.sampledMs).toBe(1);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['B', 1]]);
+    expect(simple(basicNodes, [2]).hot).toEqual([]);
+  });
+
+  it('sorts chunks by timestamp and carries nodes and sample time across them', () => {
+    const p = cpu([profile(), chunk([], [3, 4], [3000, 4000], 30),
+      chunk(basicNodes, [], [], 10), chunk([], [2], [1000], 20)]);
+    expect(p.sampledMs).toBe(7);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['B', 4], ['A', 3]]);
+    expect(p.idleMs).toBe(0);
+  });
+
+  it('preserves input order for chunks whose timestamps tie', () => {
+    const p = cpu([profile(), chunk(basicNodes, [2], [1000], 10), chunk([], [3, 4], [2000, 3000], 10)]);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['B', 3], ['A', 2]]);
+  });
+
+  it('drops unknown nodes but lets the previous known sample run until the next known one', () => {
+    const p = simple(basicNodes, [2, 999, 3, 4], [1000, 2000, 3000, 4000]);
+    expect(p.sampledMs).toBe(9);
+    expect(p.programMs).toBe(0);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['A', 5], ['B', 4]]);
+    expect(simple(basicNodes, [999, 999]).sampledMs).toBe(0);
+  });
+
+  it('finds node definitions even when they appear in a later chunk', () => {
+    const p = cpu([profile(), chunk([], [2], [1000], 10), chunk(basicNodes, [3, 4], [2000, 3000], 20)]);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['B', 3], ['A', 2]]);
+  });
+
+  it('skips missing and non-finite deltas and ignores excess deltas', () => {
+    const p = cpu([profile(), chunk(basicNodes, [2, 3, 3, 3, 3, 3], [1000, NaN, Infinity, -Infinity], 10),
+      chunk([], [3, 4], [2000, 3000, 999999], 20)]);
+    expect(p.sampledMs).toBe(5);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['B', 3], ['A', 2]]);
+  });
+
+  it('ignores worker profiles, chunks from another pid, and chunks without a counted profile', () => {
+    const p = cpu([profile(), profile('worker', { pid: 1, tid: 11 }),
+      chunk(basicNodes, [2, 3], [1000, 2000]), chunk(basicNodes, [3, 3], [1000, 9000], 0, 'worker'),
+      chunk(basicNodes, [3, 3], [1000, 9000], 0, '0x2', 2), chunk(basicNodes, [3, 3], [1000, 9000], 0, 'orphan')]);
+    expect(p.sampledMs).toBe(2);
+    expect(p.hot.map((f) => [f.name, f.selfMs])).toEqual([['A', 2]]);
+    expect(analyzeTrace(withMain(profile('worker', { pid: 1, tid: 11 }))).profile).toBeNull();
+  });
+
+  it('adds independent profile timelines and merges their function buckets', () => {
+    const p = cpu([profile(), profile('second'), chunk(basicNodes, [2, 3], [1000, 2000]),
+      chunk([node(2, 'A'), node(3, '(idle)')], [2, 3], [900000, 3000], 0, 'second')]);
+    expect(p.sampledMs).toBe(5);
+    expect(p.hot).toEqual([{ name: 'A', url: '', line: null, column: null, selfMs: 5, selfPct: 100 }]);
+  });
+
+  it('converts positions to 1-based and handles anonymous, native and missing positions', () => {
+    const nodes = [node(1, '(root)'), node(2, 'A', 'page.js', 0, 4), node(3, '', '', 2, 3),
+      node(4, 'missing', 'page.js'), node(5, 'negative', 'page.js', -1, -1),
+      node(6, 'infinite', 'page.js', Infinity, NaN)];
+    const p = simple(nodes, [2, 3, 4, 5, 6, 1]);
+    expect(p.hot).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'A', line: 1, column: 5 }),
+      expect.objectContaining({ name: '(anonymous)', url: '', line: null, column: null }),
+      expect.objectContaining({ name: 'missing', line: null, column: null }),
+      expect.objectContaining({ name: 'negative', line: null, column: null }),
+      expect.objectContaining({ name: 'infinite', line: null, column: null }),
+    ]));
+    expect(p.hot).toHaveLength(5);
+  });
+
+  it('agrees with independently measured samples from a real Chrome trace', () => {
+    const events = (JSON.parse(readFileSync(
+      new URL('./__fixtures__/profile-real.json', import.meta.url), 'utf8'
+    )) as { traceEvents: TraceEvent[] }).traceEvents;
+    const p = analyzeTrace(events).profile;
+    expect(p).not.toBeNull();
+    expect(p!.sampledMs).toBeCloseTo(1283.987, 3);
+    expect(p!.idleMs).toBeCloseTo(1237.508, 3);
+    expect(p!.programMs).toBeCloseTo(44.267, 3);
+    expect(p!.hot).toHaveLength(2);
+    expect(p!.hot[0]).toMatchObject({ name: 'tick', url: 'http://localhost/page.html', line: 5, column: 17 });
+    expect(p!.hot[0].selfMs).toBeCloseTo(1.806, 3);
+    expect(p!.hot[1]).toMatchObject({ name: '(anonymous)', url: '', line: null, column: null });
+    expect(p!.hot[1].selfMs).toBeCloseTo(0.406, 3);
+  });
+
+  it('handles 700,000 filler events and 300,000 profile samples without argument spreads', () => {
+    const events = withMain(profile());
+    for (let i = 0; i < 700_000; i++) events.push(ev('RunTask', i, 0.5));
+    events.push(chunk(basicNodes, Array(300_000).fill(2)));
+    const p = analyzeTrace(events).profile;
+    expect(p).not.toBeNull();
+    expect(p!.sampledMs).toBe(299999);
+    expect(p!.hot).toEqual([{ name: 'A', url: '', line: null, column: null, selfMs: 299999, selfPct: 100 }]);
   });
 });
