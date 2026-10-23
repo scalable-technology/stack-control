@@ -1,11 +1,25 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeTrace, type TraceEvent, type TraceSummary } from './chrome-trace.js';
 import { boundSummary, summarizeTraceFile, type BoundedSummary } from './chrome-trace-summary.js';
+
+// Test seam: stat can report a smaller size than the file has, as when the file grows after the stat.
+const fsSeam = vi.hoisted(() => ({ statSize: undefined as number | undefined }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...real,
+    stat: async (path: string) => {
+      const st = await real.stat(path);
+      return fsSeam.statSize === undefined ? st : { ...st, size: fsSeam.statSize };
+    },
+  };
+});
 
 const MAIN = { pid: 1, tid: 10 };
 
@@ -27,6 +41,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'control-summary-test-'));
 });
 afterEach(() => {
+  fsSeam.statSize = undefined;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -92,6 +107,37 @@ describe('summarizeTraceFile', () => {
     const reason = skippedOf(await summarizeTraceFile(write(name, data), { compressed }));
     expect(reason).toMatch(why);
     expect(reason).not.toMatch(/SECRET|traceEvents":/);
+  });
+
+  it.each([
+    ['plain', 'grown.json', false, () => Buffer.alloc(2000, 0x20)],
+    // Random bytes do not compress, so without the size re-check this file would fail as "inflates past" instead.
+    ['gzipped', 'grown.json.gz', true, () => gzipSync(randomBytes(1500))],
+  ])('skips a %s file that grew past the cap after the stat', async (_label, name, compressed, data) => {
+    const path = write(name, data());
+    fsSeam.statSize = 10;
+    const reason = skippedOf(await summarizeTraceFile(path, { compressed, maxBytes: 1000 }));
+    expect(reason).toMatch(/The trace is \d+ bytes, over the 1000 bytes summary limit/);
+  });
+
+  it('keeps structure from a hand-written file out of the result', async () => {
+    const events = [
+      // Chrome writes pid as a number; a string here must not reach mainThread.
+      { name: 'thread_name', ph: 'M', ts: 0, pid: 'p'.repeat(1024 * 1024), tid: 10, args: { name: 'CrRendererMain' } },
+      { name: 'RunTask', ph: 'X', ts: 0, dur: 1000, pid: 'p'.repeat(1024 * 1024), tid: 10 },
+      { name: 'navigationStart', ph: 'R', ts: 0, pid: 1, tid: 10, args: { frame: 'main' } },
+      {
+        name: 'largestContentfulPaint::Candidate', ph: 'R', ts: 5000, pid: 1, tid: 10,
+        args: { frame: 'main', data: { isOutermostMainFrame: true, type: 'text', nodeName: 'P', size: 1e308 } },
+      },
+      { name: 'LayoutShift', ph: 'I', ts: 1000, pid: 1, tid: 10, args: { data: { score: -0.001, had_recent_input: false } } },
+    ];
+    const s = summaryOf(await summarizeTraceFile(write('h.json', JSON.stringify({ traceEvents: events })), { compressed: false }));
+    expect(s.mainThread).toBeNull();
+    expect(JSON.stringify(s).length).toBeLessThan(3000);
+    expect(s.vitals.lcp).toEqual({ ms: 5, type: 'text', nodeName: 'P', size: 1e308 });
+    expect(s.vitals.shifts).toHaveLength(1);
+    expect(Object.is(s.vitals.shifts[0].score, 0)).toBe(true);
   });
 
   it('skips a missing file with a plain reason instead of throwing', async () => {
@@ -178,6 +224,37 @@ describe('boundSummary', () => {
     expect(b.vitals).toMatchObject({ cls: 0.23, lcp: { ms: 51.03, size: 23828 }, shifts: [{ atMs: 10.56, score: 0.12 }] });
     expect(b.profile).toMatchObject({ sampledMs: 1283.99, idleMs: 0, programMs: 44.27 });
     expect(b.profile!.hot[0]).toMatchObject({ selfMs: 1.81, selfPct: 3.89, line: 5, column: 17 });
+  });
+
+  it('keeps mainThread only when pid and tid are finite numbers', () => {
+    const at = (mainThread: unknown) => boundSummary({ ...base(), mainThread } as unknown as TraceSummary).mainThread;
+    expect(at({ pid: 1, tid: 10 })).toEqual({ pid: 1, tid: 10 });
+    expect(at({ pid: 'p'.repeat(1000), tid: 10 })).toBeNull();
+    expect(at({ pid: 1, tid: NaN })).toBeNull();
+    expect(at({ pid: Infinity, tid: 1 })).toBeNull();
+  });
+
+  it('turns page strings that are not strings into empty strings', () => {
+    const b = boundSummary({
+      ...base(),
+      vitals: { ...base().vitals, lcp: { ms: 1, type: ['t'.repeat(10000)], nodeName: { x: 1 }, size: 1 } },
+      profile: { sampledMs: 1, idleMs: 0, programMs: 0, hot: [{ name: 42, url: null, line: null, column: null, selfMs: 1, selfPct: 100 }] },
+    } as unknown as TraceSummary);
+    expect(b.vitals.lcp).toMatchObject({ type: '', nodeName: '' });
+    expect(b.profile!.hot[0]).toMatchObject({ name: '', url: '' });
+  });
+
+  it('rounds without overflowing, writes -0 as 0, and leaves NaN and Infinity as they are', () => {
+    const b = boundSummary({
+      ...base(),
+      windowMs: 1e308,
+      busyPct: -0.001,
+      categoryMs: { ...base().categoryMs, scripting: NaN, layout: Infinity },
+    });
+    expect(b.windowMs).toBe(1e308);
+    expect(Object.is(b.busyPct, 0)).toBe(true);
+    expect(b.categoryMs.scripting).toBeNaN();
+    expect(b.categoryMs.layout).toBe(Infinity);
   });
 
   it('keeps a null LCP, main thread and profile as null', () => {

@@ -833,4 +833,41 @@ describe('analyzeTrace: cpu profile', () => {
     expect(p!.sampledMs).toBe(299999);
     expect(p!.hot).toEqual([{ name: 'A', url: '', line: null, column: null, selfMs: 299999, selfPct: 100 }]);
   });
+
+  describe('chunk data that is not the shape Chrome writes', () => {
+    const rawChunk = (data: Record<string, unknown>): TraceEvent => ({
+      name: 'ProfileChunk', ph: 'P', ts: 0, pid: MAIN.pid, tid: 99, id: '0x2', args: { data },
+    });
+
+    it('counts real arrays (the control for the cases below)', () => {
+      const p = cpu([profile(), rawChunk({ cpuProfile: { nodes: basicNodes, samples: [2, 2] }, timeDeltas: [1000, 1000] })]);
+      expect(p.sampledMs).toBe(1);
+      expect(p.hot.map((f) => f.name)).toEqual(['A']);
+    });
+
+    // Small finite lengths: without the guard a huge length would loop without end, and that cannot be timed out.
+    it('ignores samples that are an array-like object', () => {
+      const p = cpu([profile(), rawChunk({ cpuProfile: { nodes: basicNodes, samples: { length: 2, 0: 2, 1: 2 } }, timeDeltas: [1000, 1000] })]);
+      expect(p).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+    });
+
+    it('ignores timeDeltas that are an object', () => {
+      const p = cpu([profile(), rawChunk({ cpuProfile: { nodes: basicNodes, samples: [2, 2] }, timeDeltas: { length: 2, 0: 1000, 1: 1000 } })]);
+      expect(p).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+    });
+
+    it('ignores nodes that are not an array instead of throwing', () => {
+      const p = cpu([profile(), rawChunk({ cpuProfile: { nodes: { length: 1, 0: basicNodes[1] }, samples: [2, 2] }, timeDeltas: [1000, 1000] })]);
+      expect(p).toEqual({ sampledMs: 0, idleMs: 0, programMs: 0, hot: [] });
+    });
+
+    it('treats a functionName or url that is not a string as empty', () => {
+      const nodes = [
+        node(1, '(root)'),
+        { id: 2, parent: 1, callFrame: { functionName: ['x'.repeat(10000)], url: 42, lineNumber: 3, columnNumber: 4 } },
+      ];
+      const p = cpu([profile(), rawChunk({ cpuProfile: { nodes, samples: [2, 2] }, timeDeltas: [1000, 1000] })]);
+      expect(p.hot).toEqual([{ name: '(anonymous)', url: '', line: null, column: null, selfMs: 1, selfPct: 100 }]);
+    });
+  });
 });
