@@ -7,7 +7,19 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { closeSync, lstatSync, mkdtempSync, openSync, renameSync, rmSync, statSync, writeSync, type Stats } from 'node:fs';
+import {
+  accessSync,
+  closeSync,
+  constants,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeSync,
+  type Stats,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { CdpSender } from './cdp-object.js';
@@ -154,6 +166,12 @@ export function validateOutPath(options: { compress: boolean; outPath: string; o
     throw new Error(`The directory for outPath does not exist: ${parent}. Create it, or choose another path.`);
   }
   if (!parentStat.isDirectory()) throw new Error(`The parent of outPath is not a directory: ${parent}`);
+  try {
+    // Both the open beside the target and the rename need write and search on the directory.
+    accessSync(parent, constants.W_OK | constants.X_OK);
+  } catch {
+    throw new Error(`The directory for outPath is not writable: ${parent}. Choose another path.`);
+  }
 
   let existing: Stats | undefined;
   try {
@@ -183,7 +201,11 @@ export function openTraceSink(options: SinkOptions): TraceSink {
     try {
       fd = openSync(path, 'wx', 0o600);
     } catch (error) {
-      rmSync(fresh, { recursive: true, force: true });
+      try {
+        rmSync(fresh, { recursive: true, force: true });
+      } catch {
+        // The create error is the one that explains this; a failed cleanup must not replace it.
+      }
       throw error;
     }
     const close = closer(fd);
@@ -272,6 +294,16 @@ export function writeAll(write: (buf: Buffer, offset: number) => number, buf: Bu
   return buf.length;
 }
 
+/**
+ * Tracing.end got no answer (timeout or a broken transport), so Chrome may still be tracing.
+ * The recorder keeps the trace as running: stop can be tried again, and a disconnect ends it,
+ * because Chrome ends a trace with its session.
+ */
+export class TraceStillRunningError extends Error {}
+
+const mayStillRun = (error: unknown) =>
+  error instanceof TraceStillRunningError || (error instanceof Error && error.cause instanceof TraceStillRunningError);
+
 export async function stopTrace(
   cdp: TraceCdp,
   options: { compress: boolean; dir?: string; maxBytes?: number; deadlineMs?: number; sink?: TraceSink }
@@ -284,12 +316,22 @@ export async function stopTrace(
     const waiter = new AbortController();
     const complete = cdp.waitForEvent('Tracing.tracingComplete', COMPLETE_TIMEOUT_MS, waiter.signal);
     complete.catch(() => {});
+    let end: Awaited<ReturnType<TraceCdp['sendCommand']>>;
     try {
-      const end = await cdp.sendCommand('Tracing.end');
-      if (end.error) throw new Error(end.error.message);
+      end = await cdp.sendCommand('Tracing.end');
     } catch (error) {
       waiter.abort();
-      throw error;
+      throw new TraceStillRunningError(
+        `Stop did not complete; the trace may still be running. Try stop again, or disconnect to end it. (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+        { cause: error }
+      );
+    }
+    if (end.error) {
+      // Chrome answered: whatever it was doing, it is not recording this trace any more.
+      waiter.abort();
+      throw new Error(`Chrome refused to end the trace: ${end.error.message}`);
     }
     const done = await complete;
 
@@ -329,57 +371,137 @@ export async function stopTrace(
     const note = sink.abort();
     if (!note) throw error;
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${message} ${note}`, { cause: error });
+    throw mayStillRun(error)
+      ? new TraceStillRunningError(`${message} ${note}`, { cause: error })
+      : new Error(`${message} ${note}`, { cause: error });
   } finally {
     if (stream !== undefined) await cdp.sendCommand('IO.close', { handle: stream }).catch(() => {});
   }
 }
 
+interface ActiveTrace {
+  id: number;
+  /** Set when Chrome has answered Tracing.start; null while it is starting. */
+  startedAt: number | null;
+  compress: boolean;
+}
+
+export const TRACE_GONE =
+  'The trace this call started is gone; Chrome ended it with the tab or connection and nothing was kept.';
+
 /**
  * One connection's recording: at most one trace at a time, remembered with how
  * it was started so stop writes the same format. Cleared when the connection
- * changes, because Chrome ends a trace with its session.
+ * changes, because Chrome ends a trace with its session. Each start has an id,
+ * so a caller can stop the trace it started and never a newer one.
  */
 export class TraceRecorder {
-  private active: { startedAt: number; compress: boolean } | null = null;
+  private active: ActiveTrace | null = null;
+  private nextId = 1;
 
   get running(): boolean {
     return this.active !== null;
   }
 
-  async start(cdp: TraceCdp, options: StartOptions): Promise<void> {
+  /** True while the trace with this id is the one recording. */
+  isCurrent(id: number): boolean {
+    return this.active?.id === id;
+  }
+
+  async start(cdp: TraceCdp, options: StartOptions): Promise<number> {
     if (this.active) {
-      const seconds = Math.round((Date.now() - this.active.startedAt) / 1000);
+      const since = this.active.startedAt ?? Date.now();
+      const seconds = Math.round((Date.now() - since) / 1000);
       throw new Error(
         `A trace is already running (started ${seconds}s ago). Stop it with chrome({ method: "trace", action: "stop" }) first.`
       );
     }
-    await startTrace(cdp, options);
-    this.active = { startedAt: Date.now(), compress: options.compress };
+    // Reserved before the await, so a second start that overlaps this one is refused.
+    const trace: ActiveTrace = { id: this.nextId++, startedAt: null, compress: options.compress };
+    this.active = trace;
+    try {
+      await startTrace(cdp, options);
+    } catch (error) {
+      if (this.active === trace) this.active = null;
+      throw error;
+    }
+    trace.startedAt = Date.now();
+    return trace.id;
   }
 
+  /**
+   * With an id, stops only that trace: if it is gone (reset with its session, or replaced),
+   * it throws and touches nothing. Without one, stops whatever is running (trace stop).
+   */
   async stop(
     cdp: TraceCdp,
-    options: { dir?: string; outPath?: string; overwrite?: boolean } = {}
+    options: { dir?: string; outPath?: string; overwrite?: boolean; id?: number } = {}
   ): Promise<StoppedTrace & { durationMs: number }> {
+    const { id, ...sinkOptions } = options;
     const trace = this.active;
+    if (id !== undefined && trace?.id !== id) {
+      throw new Error(TRACE_GONE);
+    }
     if (!trace) {
       throw new Error('No trace is running. Start one with chrome({ method: "trace", action: "start" }).');
     }
+    if (trace.startedAt === null) throw new Error('The trace is still starting; try stop again in a moment.');
     // The recording ends when stop is called; flushing and downloading come after.
     const durationMs = Date.now() - trace.startedAt;
     // Outside the try: a bad path leaves the trace running, so the caller can fix it and stop again.
-    const sink = openTraceSink({ compress: trace.compress, ...options });
+    const sink = openTraceSink({ compress: trace.compress, ...sinkOptions });
+    let stillRunning = false;
     try {
       const out = await stopTrace(cdp, { compress: trace.compress, sink });
       return { ...out, durationMs };
+    } catch (error) {
+      stillRunning = mayStillRun(error);
+      throw error;
     } finally {
-      // Worked or not, Chrome has ended this trace.
-      this.active = null;
+      // Chrome has ended this trace unless Tracing.end got no answer. Only this trace is cleared:
+      // a newer one, started after a reset while this stop drained, is not ours.
+      if (!stillRunning && this.active === trace) this.active = null;
     }
+  }
+
+  /** Forget the trace with this id, if it is still the current one. */
+  release(id: number): void {
+    if (this.active?.id === id) this.active = null;
   }
 
   reset(): void {
     this.active = null;
+  }
+}
+
+/**
+ * Ends a recording whose caller failed after it started (profile). It acts only on the trace with
+ * this id: a reset means Chrome ended it with its session, and a trace running now is someone
+ * else's. What could be written goes to a fresh private directory, unsummarized. It never says a
+ * trace ended or that nothing was kept unless Chrome answered; the message names which case it was.
+ */
+export async function abandonTrace(recorder: TraceRecorder, cdp: TraceCdp, id: number, failure: string): Promise<string> {
+  if (!recorder.isCurrent(id)) return `${failure} ${TRACE_GONE}`;
+  try {
+    const out = await recorder.stop(cdp, { id });
+    return `${failure} The partial trace was kept at ${out.path}.`;
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    // Cleared by the stop: Chrome answered, and the stop's message says what became of the file.
+    if (!recorder.isCurrent(id)) return `${failure} Stopping the trace also failed: ${why}`;
+    // Still ours and maybe still tracing: the private file could not be made, or Tracing.end got no answer.
+    const end = await cdp.sendCommand('Tracing.end').catch(() => undefined);
+    if (end === undefined) {
+      return (
+        `${failure} Stopping the trace also failed (${why}), and Chrome did not answer a request to end it: ` +
+        'the trace may still be running. Try chrome({ method: "trace", action: "stop" }) again, or disconnect to end it.'
+      );
+    }
+    // Chrome answered, so it is not recording this trace any more; its stream is never read.
+    recorder.release(id);
+    return (
+      `${failure} Stopping the trace also failed (${why}). Chrome then ended the trace` +
+      `${end.error ? ` (it answered: ${end.error.message})` : ''}; nothing was kept.`
+    );
   }
 }

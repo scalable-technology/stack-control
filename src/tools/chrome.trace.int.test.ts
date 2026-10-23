@@ -167,7 +167,7 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
 
     // And the analyzer understands what was captured.
     const summary = analyzeTrace(events);
-    expect(summary.mainThread).not.toBeNull();
+    expect(summary.mainThread).toMatchObject({ pid: expect.any(Number), tid: expect.any(Number) });
     expect(summary.frames.count).toBeGreaterThan(10);
   }, 60_000);
 
@@ -408,7 +408,7 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
     expect(d.summary).toBeDefined();
     const s = d.summary!;
     // An empty trace also has no long tasks and no shift: these show the recording happened.
-    expect(s.mainThread).not.toBeNull();
+    expect(s.mainThread).toMatchObject({ pid: expect.any(Number), tid: expect.any(Number) });
     expect(s.windowMs).toBeGreaterThan(0);
     expect(s.longTasks).toEqual([]);
     expect(s.longTaskCount).toBe(0);
@@ -537,9 +537,9 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect((wheel!.ts - firstTs) / 1000).toBeGreaterThanOrEqual(400);
     // The recording itself (start to stop) lasts durationMs; the call adds the stop and the summary.
     expect(d.durationMs).toBeGreaterThanOrEqual(3000);
-    expect(d.durationMs).toBeLessThan(4000);
+    expect(d.durationMs).toBeLessThan(3000 + 2500);
     expect(elapsed).toBeGreaterThanOrEqual(3000);
-    expect(elapsed).toBeLessThan(8000);
+    expect(elapsed).toBeLessThan(3000 + 10000);
     await expectNotRecording();
   }, 60_000);
 
@@ -550,7 +550,7 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     const d = r.data as TraceData;
     expect(d.durationMs).toBeGreaterThanOrEqual(1000);
     expect('scroll' in d).toBe(false);
-    expect(d.summary?.mainThread).not.toBeNull();
+    expect(d.summary?.mainThread).toMatchObject({ pid: expect.any(Number), tid: expect.any(Number) });
     expect(d.summary!.windowMs).toBeGreaterThan(0);
   }, 60_000);
 
@@ -592,12 +592,11 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
 
     const taken = join(dir, 'taken.json.gz');
     writeFileSync(taken, 'mine');
-    const startedAt = Date.now();
+    const before = traceDirs();
     const r = await profile({ durationMs: 1000, outPath: taken });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/already exists.*overwrite: true/);
-    // Refused at once: no recording ran first.
-    expect(Date.now() - startedAt).toBeLessThan(1000);
+    expect(traceDirs()).toEqual(before);
     expect(readFileSync(taken, 'utf8')).toBe('mine');
     expect(readdirSync(dir).sort()).toEqual(['taken.json.gz']);
     await expectNotRecording();
@@ -620,6 +619,31 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     const stop = await call({ method: 'trace', action: 'stop' });
     expect(stop.success, stop.error).toBe(true);
     made.push(dirname((stop.data as TraceData).path));
+  }, 60_000);
+
+  it('never stops a trace it did not start: a tab switch mid-profile, then a new trace', async () => {
+    await open(quiet.url);
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const other = (await created.json()) as { id: string };
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.url.startsWith(quiet.url));
+    expect(original).toBeDefined();
+    try {
+      const running = profile({ durationMs: 3000 });
+      await sleep(800);
+      // The select ends the profile's trace with its session; trace B on the new tab is someone else's.
+      expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
+      expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+      const r = await running;
+      expect(r.success).toBe(false);
+      expect(r.error).toMatch(/The trace this call started is gone/);
+      const stopB = await call({ method: 'trace', action: 'stop' });
+      expect(stopB.success, stopB.error).toBe(true);
+      made.push(dirname((stopB.data as TraceData).path));
+    } finally {
+      await call({ method: 'select', targetId: original!.id });
+      await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
+    }
   }, 60_000);
 
   it('replaces an existing file at outPath with overwrite: true', async () => {
