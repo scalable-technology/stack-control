@@ -70,7 +70,12 @@ export interface LayoutShift {
 }
 
 export interface Vitals {
-  /** Largest contentful paint; null when there is no candidate or no navigationStart before it. */
+  /**
+   * Last largest-contentful-paint candidate of the outermost main frame, in ms
+   * after its navigationStart; null when there is no candidate or no matching
+   * navigationStart. Not iframe-inclusive; no back/forward-cache or prerender
+   * handling; largestContentfulPaint::Invalidate events are ignored.
+   */
   lcp: { ms: number; type: string; nodeName: string; size: number } | null;
   /** Worst session window across all frames; whether to filter frames remains open. */
   cls: number;
@@ -161,6 +166,11 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
   };
 }
 
+function candidateIndex(e: TraceEvent): number {
+  const index = (e.args?.data as Record<string, unknown> | undefined)?.candidateIndex;
+  return typeof index === 'number' ? index : -1;
+}
+
 function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
   const shifts: { ts: number; score: number }[] = [];
   const navigations: TraceEvent[] = [];
@@ -177,7 +187,9 @@ function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
       const data = e.args?.data as Record<string, unknown> | undefined;
       const isMain = data?.isOutermostMainFrame === undefined
         ? data?.isMainFrame === true : data.isOutermostMainFrame === true;
-      if (isMain && (!candidate || e.ts > candidate.ts)) candidate = e;
+      if (isMain && (!candidate || e.ts > candidate.ts || (e.ts === candidate.ts && candidateIndex(e) > candidateIndex(candidate)))) {
+        candidate = e;
+      }
     }
   }
 
@@ -188,7 +200,9 @@ function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
   let sessionStart = shifts[0]?.ts ?? 0;
   let previousTs = sessionStart;
   for (const shift of shifts) {
-    if ((shift.ts - previousTs) / 1000 > 1000 || (shift.ts - sessionStart) / 1000 >= 5000) {
+    // web-vitals: a shift joins the session only if under 1000ms after the previous
+    // one and under 5000ms after the first.
+    if ((shift.ts - previousTs) / 1000 >= 1000 || (shift.ts - sessionStart) / 1000 >= 5000) {
       cls = Math.max(cls, sessionScore);
       sessionScore = 0;
       sessionStart = shift.ts;
@@ -200,11 +214,14 @@ function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
 
   let lcp: Vitals['lcp'] = null;
   if (candidate && typeof candidate.args?.frame === 'string') {
+    // A candidate that names its navigation only matches that navigation's mark;
+    // an older trace without ids falls back to the latest mark on the frame.
+    const navigationId = (candidate.args.data as Record<string, unknown> | undefined)?.navigationId;
     let navigation: TraceEvent | null = null;
     for (const e of navigations) {
-      if (e.args?.frame === candidate.args.frame && e.ts <= candidate.ts && (!navigation || e.ts > navigation.ts)) {
-        navigation = e;
-      }
+      if (e.args?.frame !== candidate.args.frame || e.ts > candidate.ts) continue;
+      if (typeof navigationId === 'string' && (e.args?.data as Record<string, unknown> | undefined)?.navigationId !== navigationId) continue;
+      if (!navigation || e.ts > navigation.ts) navigation = e;
     }
     if (navigation) {
       const data = candidate.args.data as Record<string, unknown>;
