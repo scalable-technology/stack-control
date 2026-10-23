@@ -79,6 +79,9 @@ function nearestRank(sorted: number[], p: number): number {
  * consecutive draws, which is what the DevTools frame lane shows.
  */
 function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
+  if (!Number.isFinite(budgetMs) || budgetMs <= 0) {
+    throw new RangeError(`frameBudgetMs must be a positive finite number, got ${budgetMs}`);
+  }
   const byCompositor = new Map<string, number[]>();
   for (const e of events) {
     if (e.name !== 'DrawFrame') continue;

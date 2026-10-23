@@ -210,6 +210,18 @@ describe('analyzeTrace: frames', () => {
     expect(f.p95Ms).toBe(100);
   });
 
+  it('does not round a percentile up past its rank', () => {
+    // 100 gaps: 95 x 10ms, 5 x 100ms. Rank 95 is the last 10ms gap. Together
+    // with the test above this pins the rank from both sides.
+    const f = analyzeTrace(drawsWithGaps([...Array(95).fill(10), ...Array(5).fill(100)])).frames;
+    expect(f.p95Ms).toBe(10);
+    expect(f.p99Ms).toBe(100);
+  });
+
+  it.each([0, -1, NaN, Infinity])('rejects a frame budget of %s', (frameBudgetMs) => {
+    expect(() => analyzeTrace(drawsWithGaps([16, 16]), { frameBudgetMs })).toThrow(RangeError);
+  });
+
   it('gives null percentiles and 0 fps for under two draws', () => {
     expect(analyzeTrace([]).frames).toMatchObject({ count: 0, fps: 0, p50Ms: null, slow: 0 });
     expect(analyzeTrace([draw(1000)]).frames).toMatchObject({ count: 1, fps: 0, p50Ms: null });
