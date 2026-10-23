@@ -344,6 +344,20 @@ describe('analyzeTrace: frames Chrome logged as dropped', () => {
     expect(f.chromeDroppedDrawn).toBe(0);
   });
 
+  it('counts only instant DrawFrame events, not async begin/end pairs', () => {
+    // Older Chromium emitted DrawFrame as async 'b'/'e'; counting both would double the frames.
+    const async = (ph: string, tsMs: number): TraceEvent => ({ ...drawAt(tsMs, 1), ph });
+    const f = analyzeTrace([
+      drawAt(1000, 1),
+      drawAt(1016.7, 2),
+      async('b', 1020),
+      async('e', 1021),
+      { ...dropAt(1016.7, 2), ph: 'b' },
+    ]).frames;
+    expect(f.count).toBe(2);
+    expect(f.chromeDropped).toBe(0);
+  });
+
   it('reports drops even when there are fewer than two draws', () => {
     const f = analyzeTrace([drawAt(1000, 1), dropAt(1005, 5)]).frames;
     expect(f.count).toBe(1);
@@ -352,8 +366,9 @@ describe('analyzeTrace: frames Chrome logged as dropped', () => {
 
   describe('against a real DevTools Performance trace', () => {
     // Frame events only, cut from an 11s scroll recording of a WebGPU page.
-    // The compositor held ~59fps, yet Chrome logged 87 dropped frames, 77 of
-    // them drawn anyway: gap-based numbers alone would call this page smooth.
+    // DrawFrame events ran at ~59fps, yet Chrome logged 87 DroppedFrame events,
+    // 77 sharing a frameSeqId with a DrawFrame: gap-based numbers alone would
+    // call this page smooth.
     const events = (
       JSON.parse(
         readFileSync(new URL('./__fixtures__/frames-devtools.json', import.meta.url), 'utf8')

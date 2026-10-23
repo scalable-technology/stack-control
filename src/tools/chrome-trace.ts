@@ -53,9 +53,11 @@ export interface FrameStats {
   /** DroppedFrame events Chrome logged on this compositor. */
   chromeDropped: number;
   /**
-   * Of those, the ones whose frameSeqId also has a DrawFrame: Chrome counted
-   * the frame as dropped, yet the compositor presented one. Gap-based numbers
-   * cannot see these (a page can hold 59fps and still miss content).
+   * Of those, the ones whose frameSeqId also has a DrawFrame event. Why Chrome
+   * logs both is not established (DrawFrame is submission, not presentation);
+   * a likely cause is main-thread content missing a frame the compositor still
+   * drew. Gap-based numbers cannot see these: a page can hold 59fps of draws
+   * and still drop content.
    */
   chromeDroppedDrawn: number;
 }
@@ -98,6 +100,8 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
   const byCompositor = new Map<string, Compositor>();
   for (const e of events) {
     if (e.name !== 'DrawFrame' && e.name !== 'DroppedFrame') continue;
+    // Instants only: older Chromium emitted DrawFrame as async begin/end pairs.
+    if (e.ph !== 'I' && e.ph !== 'i') continue;
     const key = `${e.pid}:${String(e.args?.layerTreeId)}`;
     let c = byCompositor.get(key);
     if (!c) byCompositor.set(key, (c = { draws: [], drawnSeqs: new Set(), dropSeqs: [] }));
