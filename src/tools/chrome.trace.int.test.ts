@@ -636,10 +636,35 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
       expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
       const r = await running;
       expect(r.success).toBe(false);
-      expect(r.error).toMatch(/The trace this call started is gone/);
+      expect(r.error).toMatch(/The trace this call started is no longer the active recording/);
       const stopB = await call({ method: 'trace', action: 'stop' });
       expect(stopB.success, stopB.error).toBe(true);
       made.push(dirname((stopB.data as TraceData).path));
+    } finally {
+      await call({ method: 'select', targetId: original!.id });
+      await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
+    }
+  }, 60_000);
+
+  it('sends no scroll once its trace is gone: a tab switch during the settle', async () => {
+    await open(quiet.url);
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?${tall.url}`, { method: 'PUT' });
+    const other = (await created.json()) as { id: string };
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
+    const original = targets.find((x) => x.url.startsWith(quiet.url));
+    expect(original).toBeDefined();
+    try {
+      const running = profile({ durationMs: 3000, scroll: { distance: 1200, speed: 800 } });
+      // Inside the 500ms settle: the scroll has not been sent yet.
+      await sleep(250);
+      expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
+      const r = await running;
+      expect(r.success).toBe(false);
+      expect(r.error).toMatch(/no longer the active recording/);
+      for (let i = 0; i < 50 && (await evaluate('document.readyState')) !== 'complete'; i++) await sleep(100);
+      expect(await evaluate('document.body.scrollHeight > 5000')).toBe(true); // the tall page, so a scroll would move it
+      await sleep(500);
+      expect(await evaluate('window.scrollY')).toBe(0);
     } finally {
       await call({ method: 'select', targetId: original!.id });
       await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
