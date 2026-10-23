@@ -3,6 +3,10 @@
  *
  * Pure functions over Chrome trace events (the `traceEvents` array that
  * DevTools exports and Perfetto opens). No Chrome, no I/O: unit-testable.
+ *
+ * Reads complete ('X') events only; begin/end and async events are ignored.
+ * The main thread is the CrRendererMain thread named by a thread_name
+ * metadata event. A trace without one gives mainThread null and zeros.
  */
 
 export interface TraceEvent {
@@ -127,9 +131,23 @@ function unionLength(spans: Span[]): number {
   return total;
 }
 
+/** Spans that are not contained in an earlier (longer-first) span. */
+function outermost(spans: Span[]): Span[] {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const out: Span[] = [];
+  let curEnd = -Infinity;
+  for (const s of sorted) {
+    if (s.end <= curEnd) continue;
+    out.push(s);
+    curEnd = s.end;
+  }
+  return out;
+}
+
 /**
  * Self time per category. A nested event's time belongs to the event, not to
- * its parent, so the categories sum to the time spent in tasks.
+ * its parent, so the categories sum to the time of all main-thread events.
+ * That is at least the time in RunTask: an event outside any task counts too.
  */
 function selfTimeByCategory(spans: Span[]): CategoryMs {
   const out: CategoryMs = { scripting: 0, layout: 0, paint: 0, gc: 0, other: 0 };
@@ -157,15 +175,20 @@ export function analyzeTrace(events: TraceEvent[]): TraceSummary {
     : [];
   const tasks = mainSpans.filter((s) => s.name === 'RunTask');
 
-  const windowStart = Math.min(...timed.map((e) => e.ts));
-  const windowEnd = Math.max(...timed.map((e) => e.ts + (e.dur ?? 0)));
+  // A loop, not Math.min(...xs): real traces exceed the spread argument limit.
+  let windowStart = Infinity;
+  let windowEnd = -Infinity;
+  for (const e of timed) {
+    if (e.ts < windowStart) windowStart = e.ts;
+    if (e.ts + (e.dur ?? 0) > windowEnd) windowEnd = e.ts + (e.dur ?? 0);
+  }
   const windowUs = timed.length ? windowEnd - windowStart : 0;
 
   return {
     windowMs: windowUs / 1000,
     mainThread: main,
     busyPct: windowUs > 0 ? (unionLength(tasks) / windowUs) * 100 : 0,
-    longTasks: tasks
+    longTasks: outermost(tasks)
       .filter((t) => (t.end - t.start) / 1000 > LONG_TASK_MS)
       .map((t) => ({
         startMs: (t.start - windowStart) / 1000,
