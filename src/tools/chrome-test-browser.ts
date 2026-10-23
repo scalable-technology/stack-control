@@ -46,9 +46,13 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
   });
   const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
   const close = async () => {
-    proc.kill('SIGKILL');
-    // Wait for the process to be gone before deleting its profile; a spawn that failed never exits.
-    await Promise.race([exited, sleep(3000)]);
+    // A spawn that failed has no pid and never exits; a live process must be gone before its
+    // profile is deleted, and if it will not die the profile is left in place rather than raced.
+    if (proc.pid !== undefined) {
+      proc.kill('SIGKILL');
+      const gone = await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]);
+      if (!gone) throw new Error(`Chrome (pid ${proc.pid}) did not exit; left ${dir} in place`);
+    }
     rmSync(dir, { recursive: true, force: true });
   };
 

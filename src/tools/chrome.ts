@@ -37,6 +37,7 @@ import { tmpdir } from 'os';
 import WebSocket from 'ws';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
+import { withRemoteObject } from './cdp-object.js';
 
 // =============================================================================
 // Types
@@ -1878,82 +1879,78 @@ async function handleScroll(input: z.infer<typeof ScrollInput>): Promise<ToolRes
     }
 
     // Hold the scrollers by handle so before and after measure the same elements.
-    const found = await c.sendCommand('Runtime.evaluate', {
-      expression: scrollerChainFinder(x, y),
-      returnByValue: false,
-    });
-    const objectId = (found.result as { result?: { objectId?: string } } | undefined)?.result?.objectId;
-    if (!objectId) return { success: false, error: 'Could not find a scroller at the gesture point' };
+    // `return await`: a bare `return` would let a rejection skip this function's catch.
+    return await withRemoteObject(c, scrollerChainFinder(x, y), async (objectId): Promise<ToolResult> => {
+      const readChain = async (): Promise<ScrollerState[]> => {
+        const r = await c.sendCommand('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: SCROLLER_CHAIN_STATE,
+          returnByValue: true,
+        });
+        const v = (r.result as { result?: { value?: unknown } } | undefined)?.result?.value;
+        if (!Array.isArray(v) || v.length === 0 || v.length > 64) {
+          throw new Error('The page returned an unusable scroller list; refusing to use it');
+        }
+        return v.map((e: { top?: unknown; name?: unknown }) => ({
+          top: finiteNumber(e?.top, 'scroll position'),
+          name: String(e?.name ?? 'unknown').slice(0, 80),
+        }));
+      };
 
-    const readChain = async (): Promise<ScrollerState[]> => {
-      const r = await c.sendCommand('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: SCROLLER_CHAIN_STATE,
-        returnByValue: true,
-      });
-      const v = (r.result as { result?: { value?: unknown } } | undefined)?.result?.value;
-      if (!Array.isArray(v) || v.length === 0 || v.length > 64) {
-        throw new Error('The page returned an unusable scroller list; refusing to use it');
+      const before = await readChain();
+      const startedAt = Date.now();
+
+      // CDP's yDistance is positive for scrolling UP; our distance is positive for down.
+      const response = await c.sendCommand(
+        'Input.synthesizeScrollGesture',
+        {
+          x,
+          y,
+          yDistance: -input.distance,
+          speed: input.speed,
+          gestureSourceType: input.source,
+          repeatCount: input.repeat,
+          repeatDelayMs: input.repeatDelayMs,
+        },
+        Math.ceil(expectedMs) + 15000
+      );
+      if (response.error) {
+        return { success: false, error: `Scroll gesture failed: ${response.error.message}` };
       }
-      return v.map((e: { top?: unknown; name?: unknown }) => ({
-        top: finiteNumber(e?.top, 'scroll position'),
-        name: String(e?.name ?? 'unknown').slice(0, 80),
-      }));
-    };
+      const gestureMs = Date.now() - startedAt;
 
-    const before = await readChain();
-    const startedAt = Date.now();
+      // Smooth scrolling can outlast the gesture call: wait until every position stops moving.
+      let after = await readChain();
+      let stable = 0;
+      for (let i = 0; i < 25 && stable < 3; i++) {
+        await new Promise((r) => setTimeout(r, 60));
+        const next = await readChain();
+        stable = next.every((e, k) => e.top === after[k]?.top) ? stable + 1 : 0;
+        after = next;
+      }
 
-    // CDP's yDistance is positive for scrolling UP; our distance is positive for down.
-    const response = await c.sendCommand(
-      'Input.synthesizeScrollGesture',
-      {
-        x,
-        y,
-        yDistance: -input.distance,
-        speed: input.speed,
-        gestureSourceType: input.source,
-        repeatCount: input.repeat,
-        repeatDelayMs: input.repeatDelayMs,
-      },
-      Math.ceil(expectedMs) + 15000
-    );
-    if (response.error) {
-      return { success: false, error: `Scroll gesture failed: ${response.error.message}` };
-    }
-    const gestureMs = Date.now() - startedAt;
+      // The scroller that moved is the one that took the gesture; if none moved, the innermost.
+      const movedAt = after.findIndex((e, k) => e.top !== before[k]?.top);
+      const k = movedAt === -1 ? 0 : movedAt;
+      const rootAt = after.length - 1;
+      const scroller = after[k];
 
-    // Smooth scrolling can outlast the gesture call: wait until every position stops moving.
-    let after = await readChain();
-    let stable = 0;
-    for (let i = 0; i < 25 && stable < 3; i++) {
-      await new Promise((r) => setTimeout(r, 60));
-      const next = await readChain();
-      stable = next.every((e, k) => e.top === after[k]?.top) ? stable + 1 : 0;
-      after = next;
-    }
-
-    // The scroller that moved is the one that took the gesture; if none moved, the innermost.
-    const movedAt = after.findIndex((e, k) => e.top !== before[k]?.top);
-    const k = movedAt === -1 ? 0 : movedAt;
-    const rootAt = after.length - 1;
-    const scroller = after[k];
-
-    return {
-      success: true,
-      data: {
-        source: input.source,
-        scroller: scroller.name,
-        requestedPx: input.distance * gestures,
-        scrolledPx: scroller.top - before[k].top,
-        scrollTopBefore: before[k].top,
-        scrollTopAfter: scroller.top,
-        ...(k !== rootAt ? { documentScrolledPx: after[rootAt].top - before[rootAt].top } : {}),
-        settled: stable >= 3,
-        gestureMs,
-        ...(foreground ? { foreground } : {}),
-      },
-    };
+      return {
+        success: true,
+        data: {
+          source: input.source,
+          scroller: scroller.name,
+          requestedPx: input.distance * gestures,
+          scrolledPx: scroller.top - before[k].top,
+          scrollTopBefore: before[k].top,
+          scrollTopAfter: scroller.top,
+          ...(k !== rootAt ? { documentScrolledPx: after[rootAt].top - before[rootAt].top } : {}),
+          settled: stable >= 3,
+          gestureMs,
+          ...(foreground ? { foreground } : {}),
+        },
+      };
+    });
   } catch (error) {
     return {
       success: false,
