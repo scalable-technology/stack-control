@@ -560,6 +560,12 @@ describe('analyzeTrace: vitals', () => {
     expect(analyzeTrace([navigation(100), first, second]).vitals.lcp?.size).toBe(20);
   });
 
+  it('ignores a non-finite candidateIndex when breaking a tie', () => {
+    const bad = candidate(120, { candidateIndex: NaN, size: 10 });
+    const good = candidate(120, { candidateIndex: 1, size: 20 });
+    expect(analyzeTrace([navigation(100), bad, good]).vitals.lcp?.size).toBe(20);
+  });
+
   it('accepts a navigation at the exact candidate timestamp', () => {
     expect(analyzeTrace([candidate(120), navigation(120)]).vitals.lcp?.ms).toBe(0);
   });
