@@ -757,6 +757,18 @@ const TraceInput = z.object({
     .optional()
     .default(true)
     .describe('start only: gzip the file (.json.gz, which DevTools opens); false writes plain .json'),
+  outPath: z
+    .string()
+    .min(1)
+    .max(4096)
+    .refine((p) => !p.includes('\0'), 'must not contain a NUL byte')
+    .optional()
+    .describe('stop only: absolute path to write the trace to; must end in .json.gz (or .json with compress: false)'),
+  overwrite: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('stop only: replace a regular file already at outPath (default: false)'),
 });
 
 const ChromeInput = z.discriminatedUnion('method', [
@@ -1849,7 +1861,7 @@ async function handleTrace(input: z.infer<typeof TraceInput>): Promise<ToolResul
       };
     }
 
-    const out = await recorder.stop(c);
+    const out = await recorder.stop(c, { outPath: input.outPath, overwrite: input.overwrite });
     return {
       success: true,
       data: {
@@ -2134,11 +2146,15 @@ export const chromeTool: Tool = {
   to a file: no DevTools, no manual export. start, do the thing to measure
   (scroll, click, navigate), then stop. The file is a streamed .json.gz that
   DevTools and Perfetto open; it is never returned inline (traces run to
-  hundreds of MB). Written owner-only (mode 0600) under the temp directory:
-  traces hold URLs and source text, so keep them local.
+  hundreds of MB). Written owner-only (mode 0600) under the temp directory
+  unless outPath is given: traces hold URLs and source text, so keep them local.
   \`chrome({ method: "trace", action: "start" })\`
   \`chrome({ method: "trace", action: "stop" })\`  -> { path, bytes, durationMs, dataLoss }
   \`chrome({ method: "trace", action: "start", compress: false })\`
+  \`chrome({ method: "trace", action: "stop", outPath: "/abs/dir/scroll.json.gz" })\`
+  outPath must be absolute and end in .json.gz (.json if started with
+  compress: false). It refuses to replace an existing file unless
+  overwrite: true; the file is written mode 0600.
   One trace at a time per connection. Tracing adds overhead; the first ~200ms
   of a recording include profiler start-up.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
@@ -2304,6 +2320,15 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       compress: {
         type: 'boolean',
         description: 'trace start: gzip the file as .json.gz (default: true); false writes plain .json',
+      },
+      outPath: {
+        type: 'string',
+        description:
+          'trace stop: absolute path for the trace file instead of a fresh temp directory; must end in .json.gz (.json with compress: false)',
+      },
+      overwrite: {
+        type: 'boolean',
+        description: 'trace stop: replace a regular file already at outPath (default: false)',
       },
       distance: {
         type: 'number',

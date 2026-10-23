@@ -1,16 +1,36 @@
-import { readdirSync, readFileSync, rmSync, statSync, mkdtempSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_TRACE_CATEGORIES,
   TraceRecorder,
+  openTraceSink,
   startTrace,
   stopTrace,
   writeAll,
   type TraceCdp,
 } from './chrome-trace-capture.js';
+
+// Pass-through spies, so a test can count closes or step into the gap between a check and an open.
+vi.mock('node:fs', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs')>();
+  return { ...real, closeSync: vi.fn(real.closeSync), lstatSync: vi.fn(real.lstatSync) };
+});
 
 const dirs: string[] = [];
 const tempDir = () => {
@@ -228,13 +248,15 @@ describe('stopTrace', () => {
     expect(calls(sent, 'IO.close')).toHaveLength(1);
   });
 
-  it('closes the stream when the file cannot be created', async () => {
+  it('does not end the trace when the file cannot be created', async () => {
     const parent = tempDir();
     const blocker = join(parent, 'not-a-directory');
     writeFileSync(blocker, 'x');
     const { cdp, sent } = fake();
     await expect(stopTrace(cdp, { compress: false, dir: join(blocker, 'sub') })).rejects.toThrow();
-    expect(calls(sent, 'IO.close')).toEqual([{ method: 'IO.close', params: { handle: 'stream-1' } }]);
+    // The file is created first, so Chrome is never asked to end and no stream is held.
+    expect(calls(sent, 'Tracing.end')).toEqual([]);
+    expect(calls(sent, 'IO.close')).toEqual([]);
   });
 
   it('stops at a size ceiling: deletes what it wrote, closes the stream and says so', async () => {
@@ -350,5 +372,266 @@ describe('TraceRecorder', () => {
     rec.reset();
     expect(rec.running).toBe(false);
     await expect(rec.stop(fake().cdp, { dir: tempDir() })).rejects.toThrow(/No trace is running/);
+  });
+});
+
+describe('TraceRecorder: stop to a chosen path', () => {
+  const NEW = '{"traceEvents":[{"name":"new"}]}';
+  const newTrace = (options: FakeOptions = {}) => fake({ chunks: [{ data: b64(NEW), eof: true, base64Encoded: true }], ...options });
+  const recording = async (compress: boolean, options: FakeOptions = {}) => {
+    const f = newTrace(options);
+    const rec = new TraceRecorder();
+    await rec.start(f.cdp, { compress });
+    return { rec, ...f };
+  };
+  /** A refused path must not touch Chrome: the recording keeps running for a second try. */
+  const expectStillRecording = (rec: TraceRecorder, sent: { method: string }[]) => {
+    expect(calls(sent, 'Tracing.end')).toEqual([]);
+    expect(rec.running).toBe(true);
+  };
+
+  it.each([
+    [true, 'out.json', '.json.gz'],
+    [true, 'out.txt', '.json.gz'],
+    [false, 'out.json.gz', '.json'],
+    [false, 'out.JSON', '.json'],
+  ])('compress %s: refuses %s, names %s, and a second stop with a good path works', async (compress, name, ext) => {
+    const dir = tempDir();
+    const { rec, cdp, sent } = await recording(compress);
+    await expect(rec.stop(cdp, { outPath: join(dir, name) })).rejects.toThrow(`must end in ${ext}`);
+    expectStillRecording(rec, sent);
+    expect(readdirSync(dir)).toEqual([]);
+
+    const good = join(dir, `good${ext}`);
+    const out = await rec.stop(cdp, { outPath: good });
+    expect(out.path).toBe(good);
+    expect(readFileSync(good, 'utf8')).toBe(NEW);
+    expect(rec.running).toBe(false);
+  });
+
+  it.each(['relative-trace-out.json', '~/trace-out.json', './trace-out.json'])('refuses the relative path %s', async (p) => {
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: p })).rejects.toThrow(/absolute path/);
+    expectStillRecording(rec, sent);
+    expect(existsSync(resolve(p))).toBe(false);
+  });
+
+  it('collapses .. before checking, and returns the resolved path', async () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, 'sub'));
+    const { rec, cdp } = await recording(false);
+    const out = await rec.stop(cdp, { outPath: `${dir}/sub/../out.json` });
+    expect(out.path).toBe(join(dir, 'out.json'));
+    expect(readFileSync(join(dir, 'out.json'), 'utf8')).toBe(NEW);
+    expect(readdirSync(join(dir, 'sub'))).toEqual([]);
+
+    // The parent is the resolved one, so a missing segment that .. cancels does not matter.
+    const again = await recording(false);
+    const second = await again.rec.stop(again.cdp, { outPath: `${dir}/nope/../out2.json` });
+    expect(second.path).toBe(join(dir, 'out2.json'));
+    expect(readFileSync(join(dir, 'out2.json'), 'utf8')).toBe(NEW);
+  });
+
+  it('refuses a missing parent directory, and a parent that is a file', async () => {
+    const dir = tempDir();
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: join(dir, 'missing', 'out.json') })).rejects.toThrow(/does not exist/);
+    expectStillRecording(rec, sent);
+    writeFileSync(join(dir, 'file'), 'x');
+    await expect(rec.stop(cdp, { outPath: join(dir, 'file', 'out.json') })).rejects.toThrow(/not a directory/);
+    expectStillRecording(rec, sent);
+    expect(readdirSync(dir)).toEqual(['file']);
+  });
+
+  it('refuses an existing file without overwrite and leaves it as it was', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    writeFileSync(target, 'old');
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: target })).rejects.toThrow(/already exists.*overwrite: true/);
+    expectStillRecording(rec, sent);
+    expect(readFileSync(target, 'utf8')).toBe('old');
+  });
+
+  it('overwrite: true replaces the file, leaves no temp file, and says it overwrote', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    writeFileSync(target, 'old', { mode: 0o644 });
+    const { rec, cdp } = await recording(false);
+    const out = await rec.stop(cdp, { outPath: target, overwrite: true });
+    expect(readFileSync(target, 'utf8')).toBe(NEW);
+    expect(readdirSync(dir)).toEqual(['out.json']);
+    expect(out.overwritten).toBe(true);
+    expect(statSync(target).mode & 0o777).toBe(0o600);
+  });
+
+  it('overwrite: true onto a new path does not claim it overwrote', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const { rec, cdp } = await recording(false);
+    const out = await rec.stop(cdp, { outPath: target, overwrite: true });
+    expect(readFileSync(target, 'utf8')).toBe(NEW);
+    expect('overwritten' in out).toBe(false);
+    expect(readdirSync(dir)).toEqual(['out.json']);
+  });
+
+  it('refuses a symlink at the path even with overwrite, and leaves the link and its target alone', async () => {
+    const dir = tempDir();
+    const elsewhere = join(tempDir(), 'theirs.json');
+    writeFileSync(elsewhere, 'theirs');
+    const target = join(dir, 'out.json');
+    symlinkSync(elsewhere, target);
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: target, overwrite: true })).rejects.toThrow(/not a regular file/);
+    expectStillRecording(rec, sent);
+    expect(lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(target)).toBe(elsewhere);
+    expect(readFileSync(elsewhere, 'utf8')).toBe('theirs');
+    expect(readdirSync(dir)).toEqual(['out.json']);
+  });
+
+  it('refuses a dangling symlink without overwrite', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const nowhere = join(dir, 'nowhere.json');
+    symlinkSync(nowhere, target);
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: target })).rejects.toThrow(/already exists/);
+    expectStillRecording(rec, sent);
+    expect(lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(existsSync(nowhere)).toBe(false);
+  });
+
+  it('refuses a directory at the path even with overwrite', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    mkdirSync(target);
+    const { rec, cdp, sent } = await recording(false);
+    await expect(rec.stop(cdp, { outPath: target, overwrite: true })).rejects.toThrow(/not a regular file/);
+    expectStillRecording(rec, sent);
+    expect(statSync(target).isDirectory()).toBe(true);
+    expect(readdirSync(dir)).toEqual(['out.json']);
+  });
+
+  it('writes the file owner-only (0600) with either strategy', async () => {
+    const dir = tempDir();
+    for (const overwrite of [false, true]) {
+      const target = join(dir, `out-${overwrite}.json.gz`);
+      if (overwrite) writeFileSync(target, 'old', { mode: 0o644 });
+      const { rec, cdp } = await recording(true);
+      await rec.stop(cdp, { outPath: target, overwrite });
+      expect(statSync(target).mode & 0o777).toBe(0o600);
+      expect(readFileSync(target, 'utf8')).toBe(NEW);
+    }
+  });
+
+  it('removes the file it created when the stream fails after Chrome ended the trace', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    // The first chunk lands on disk before the second read fails.
+    const chunked = fake({
+      chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
+      onRead: (n) => {
+        if (n === 1) {
+          expect(readFileSync(target, 'utf8')).toBe('{"traceEvents":[');
+          throw new Error('stream gone');
+        }
+      },
+    });
+    await expect(rec.stop(chunked.cdp, { outPath: target })).rejects.toThrow('stream gone');
+    expect(existsSync(target)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(rec.running).toBe(false); // Chrome has ended it
+    expect(calls(chunked.sent, 'Tracing.end')).toHaveLength(1);
+  });
+
+  it('keeps the old file intact when the stream fails during an overwrite', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    writeFileSync(target, 'old');
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    const chunked = fake({
+      chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
+      onRead: (n) => {
+        if (n === 1) {
+          expect(readdirSync(dir).some((f) => f.endsWith('.tmp'))).toBe(true); // writing beside, not over
+          throw new Error('stream gone');
+        }
+      },
+    });
+    await expect(rec.stop(chunked.cdp, { outPath: target, overwrite: true })).rejects.toThrow('stream gone');
+    expect(readFileSync(target, 'utf8')).toBe('old');
+    expect(readdirSync(dir)).toEqual(['out.json']);
+  });
+});
+
+describe('openTraceSink', () => {
+  const closes = (fd: number) => vi.mocked(fs.closeSync).mock.calls.filter(([n]) => n === fd).length;
+
+  it('refuses a path that is already taken by the time it opens it', () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const first = openTraceSink({ compress: false, outPath: target });
+    expect(() => openTraceSink({ compress: false, outPath: target })).toThrow(/already exists/);
+    fs.writeSync(first.fd, 'mine');
+    first.commit();
+    expect(readFileSync(target, 'utf8')).toBe('mine');
+  });
+
+  it('does not truncate a file that appears between the check and the open', () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    // The check sees nothing; someone else creates the file before the open.
+    vi.mocked(fs.lstatSync).mockImplementationOnce(((p: fs.PathLike) => {
+      writeFileSync(target, 'theirs');
+      throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(p)}'`), { code: 'ENOENT' });
+    }) as typeof fs.lstatSync);
+    expect(() => openTraceSink({ compress: false, outPath: target })).toThrow(/EEXIST|already exists/);
+    expect(readFileSync(target, 'utf8')).toBe('theirs');
+  });
+
+  it('closes each file exactly once on success, on abort and when commit fails', () => {
+    // fd numbers are reused once closed, so the count is reset before each sink.
+    const dir = tempDir();
+    vi.mocked(fs.closeSync).mockClear();
+    const plain = openTraceSink({ compress: false, dir });
+    plain.commit();
+    plain.abort();
+    expect(closes(plain.fd)).toBe(1);
+
+    vi.mocked(fs.closeSync).mockClear();
+    const chosen = openTraceSink({ compress: false, outPath: join(dir, 'a.json') });
+    chosen.abort();
+    chosen.abort();
+    expect(closes(chosen.fd)).toBe(1);
+    expect(existsSync(join(dir, 'a.json'))).toBe(false);
+
+    writeFileSync(join(dir, 'b.json'), 'old');
+    vi.mocked(fs.closeSync).mockClear();
+    const replace =openTraceSink({ compress: false, outPath: join(dir, 'b.json'), overwrite: true });
+    // The target turns into a non-empty directory, so the final rename fails.
+    rmSync(join(dir, 'b.json'));
+    mkdirSync(join(dir, 'b.json'));
+    writeFileSync(join(dir, 'b.json', 'x'), 'x');
+    expect(() => replace.commit()).toThrow();
+    replace.abort();
+    expect(closes(replace.fd)).toBe(1);
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('closes once when a stopTrace fails mid-write', async () => {
+    const dir = tempDir();
+    vi.mocked(fs.closeSync).mockClear();
+    const sink = openTraceSink({ compress: false, outPath: join(dir, 'out.json') });
+    const { cdp } = fake({
+      chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
+      onRead: (n) => { if (n === 1) throw new Error('stream gone'); },
+    });
+    await expect(stopTrace(cdp, { compress: false, sink })).rejects.toThrow('stream gone');
+    expect(closes(sink.fd)).toBe(1);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
