@@ -122,31 +122,18 @@ function release(close: () => void, remove: () => void, path: string): string | 
  * at the temp file the error names. If the final close fails (EIO), the file is removed and the
  * close error is thrown, because what reached the disk cannot be trusted.
  */
-export function openTraceSink(options: SinkOptions): TraceSink {
+/**
+ * The checks on a caller's outPath, with nothing created: profile runs them before it records,
+ * so a bad path costs no recording. A pass is not a promise; openTraceSink opens with O_EXCL
+ * (or writes beside and renames), so a file that appears afterwards is still caught.
+ */
+export function validateOutPath(options: { compress: boolean; outPath: string; overwrite?: boolean }): {
+  target: string;
+  parent: string;
+  /** A regular file is there now (allowed only with overwrite: true). */
+  exists: boolean;
+} {
   const ext = options.compress ? '.json.gz' : '.json';
-
-  if (options.outPath === undefined) {
-    // A new owner-only directory per trace (mkdtemp makes it 0700 with an unpredictable name):
-    // traces hold URLs and source text, and nothing pre-existing is reused or trusted.
-    const fresh = mkdtempSync(join(options.dir ?? tmpdir(), 'control-trace-'));
-    const path = join(fresh, `trace${ext}`);
-    let fd: number;
-    try {
-      fd = openSync(path, 'wx', 0o600);
-    } catch (error) {
-      rmSync(fresh, { recursive: true, force: true });
-      throw error;
-    }
-    const close = closer(fd);
-    return {
-      path,
-      fd,
-      replaces: false,
-      commit: close,
-      abort: () => release(close, () => rmSync(fresh, { recursive: true, force: true }), fresh),
-    };
-  }
-
   if (!isAbsolute(options.outPath)) {
     throw new Error(
       `outPath must be an absolute path, got "${options.outPath}" (~ is not expanded and the server's working directory is not yours)`
@@ -181,6 +168,35 @@ export function openTraceSink(options: SinkOptions): TraceSink {
   if (existing && options.overwrite !== true) {
     throw new Error(`outPath already exists: ${target}. Pass overwrite: true to replace it, or choose another path.`);
   }
+  return { target, parent, exists: existing !== undefined };
+}
+
+export function openTraceSink(options: SinkOptions): TraceSink {
+  const ext = options.compress ? '.json.gz' : '.json';
+
+  if (options.outPath === undefined) {
+    // A new owner-only directory per trace (mkdtemp makes it 0700 with an unpredictable name):
+    // traces hold URLs and source text, and nothing pre-existing is reused or trusted.
+    const fresh = mkdtempSync(join(options.dir ?? tmpdir(), 'control-trace-'));
+    const path = join(fresh, `trace${ext}`);
+    let fd: number;
+    try {
+      fd = openSync(path, 'wx', 0o600);
+    } catch (error) {
+      rmSync(fresh, { recursive: true, force: true });
+      throw error;
+    }
+    const close = closer(fd);
+    return {
+      path,
+      fd,
+      replaces: false,
+      commit: close,
+      abort: () => release(close, () => rmSync(fresh, { recursive: true, force: true }), fresh),
+    };
+  }
+
+  const { target, parent, exists } = validateOutPath({ ...options, outPath: options.outPath });
 
   if (options.overwrite !== true) {
     // O_EXCL: fails if anything, even a symlink, appeared since the check.
@@ -205,7 +221,7 @@ export function openTraceSink(options: SinkOptions): TraceSink {
   return {
     path: target,
     fd,
-    replaces: existing !== undefined,
+    replaces: exists,
     commit: () => {
       close();
       try {
