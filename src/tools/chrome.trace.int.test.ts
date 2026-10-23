@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import WebSocket from 'ws';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
 import { boundSummary, type BoundedSummary } from './chrome-trace-summary.js';
-import { chromeTool } from './chrome.js';
+import { ChromeCDPClient, chromeTool } from './chrome.js';
 import {
   chromeAvailable,
   launchTestBrowser,
@@ -803,9 +803,27 @@ const CLICK_PAGE = `<!doctype html><body style="margin:0">
   });
 </script></body>`;
 
-// A page that breaks the vitals probe: PerformanceObserver throws.
-const NO_OBSERVER_PAGE = `<!doctype html><body><p>No observers here</p><script>
-  window.PerformanceObserver = function () { throw new Error('page text that must not reach the result'); };
+// A page that attacks the probe: an observer that hands back a 16MB string as every entry value,
+// and a slice that throws. Underneath, a real heading (LCP) and a real late banner (a shift).
+const HOSTILE_PAGE = `<!doctype html><body style="margin:0;font:16px sans-serif">
+<h1 style="font:64px sans-serif;margin:0">A large heading</h1>
+<p style="height:300px;margin:0;background:#ddd">Content a late banner pushes down.</p>
+<script>
+  const huge = 'x'.repeat(16 << 20);
+  const fake = [{ startTime: huge, value: huge, duration: huge, size: huge, interactionId: huge, element: huge }];
+  window.PerformanceObserver = class {
+    constructor(callback) { this.callback = callback; }
+    observe() { setTimeout(() => this.callback({ getEntries: () => fake })); }
+    takeRecords() { return fake; }
+    disconnect() {}
+  };
+  String.prototype.slice = function () { throw new Error('slice is broken here'); };
+  setTimeout(() => {
+    const banner = document.createElement('div');
+    banner.style.height = '200px';
+    banner.textContent = 'Late banner';
+    document.body.prepend(banner);
+  }, 300);
 </script></body>`;
 
 interface MetricsData {
@@ -865,7 +883,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
   beforeAll(async () => {
     browser = await launchTestBrowser();
     for (const [name, html] of Object.entries({
-      nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, broken: NO_OBSERVER_PAGE,
+      nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, hostile: HOSTILE_PAGE,
     })) {
       servers[name] = await servePage(html);
     }
@@ -967,16 +985,77 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect(sent).toContain('Performance.disable');
   }, 60_000);
 
-  it('returns the metrics with vitals null and a plain reason when the page breaks the observer', async () => {
-    await open(servers.broken.url);
+  it("reads the browser's real entries on a page that replaces PerformanceObserver and breaks slice", async () => {
+    await open(servers.hostile.url);
+    await sleep(800);
+    expect(await evaluate('document.body.firstElementChild.textContent')).toBe('Late banner');
     const r = await call({ method: 'metrics' });
+    expect(r.success, r.error).toBe(true);
+    const size = JSON.stringify(r.data).length;
+    console.log(`metrics on the hostile page: ${size} chars, vitals ${JSON.stringify((r.data as MetricsData).vitals)}`);
+    expect(size).toBeLessThan(2000);
+    const d = r.data as MetricsData;
+    expect(d.vitals).not.toBeNull();
+    expect(d.vitals!.cls).toBeGreaterThan(0.05);
+    expect(d.vitals!.shiftCount).toBeGreaterThanOrEqual(1);
+    expect(d.vitals!.lcp?.element).toBe('h1');
+    expect(d.vitals!.lcp!.ms).toBeGreaterThan(0);
+    expect(d.vitals!.inp).toBe(null);
+  }, 60_000);
+
+  it('gives vitals null, and never runs the probe in the page world, when the isolated world cannot be made', async () => {
+    await open(servers.quiet.url);
+    const spy = loseAnswersFor('Page.createIsolatedWorld');
+    let r;
+    let evaluates: Record<string, unknown>[] = [];
+    try {
+      r = await call({ method: 'metrics' });
+      evaluates = spy.mock.calls
+        .map(([data]) => JSON.parse(String(data)) as { method?: string; params?: Record<string, unknown> })
+        .filter((m) => m.method === 'Runtime.evaluate')
+        .map((m) => m.params ?? {});
+    } finally {
+      spy.mockRestore();
+    }
     expect(r.success, r.error).toBe(true);
     const d = r.data as MetricsData;
     expect(d.metrics.nodes).toBeGreaterThan(0);
     expect(d.vitals).toBe(null);
-    expect(typeof d.vitalsError).toBe('string');
-    expect(d.vitalsError!.length).toBeGreaterThan(0);
-    expect(d.vitalsError).not.toMatch(/page text/);
+    expect(d.vitalsError).toMatch(/separate JS world/);
+    expect(evaluates).toEqual([]);
+  }, 60_000);
+
+  it('runs two overlapping calls one after the other', async () => {
+    await open(servers.quiet.url);
+    let results: Awaited<ReturnType<typeof call>>[] = [];
+    const sent = await methodsSent(async () => {
+      results = await Promise.all([call({ method: 'metrics' }), call({ method: 'metrics' })]);
+    });
+    expect(results.map((x) => x.success)).toEqual([true, true]);
+    expect(sent.filter((m) => m.startsWith('Performance.'))).toEqual([
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+    ]);
+  }, 60_000);
+
+  it('moves the selection epoch on a tab switch and on a disconnect, not on a failed switch', async () => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const other = (await created.json()) as { id: string };
+    const c = new ChromeCDPClient(browser.port);
+    try {
+      await c.connect();
+      const first = c.selectionEpoch;
+      await expect(c.connect('no-such-target')).rejects.toThrow(/not found/);
+      expect(c.selectionEpoch).toBe(first);
+      await c.connect(other.id);
+      const switched = c.selectionEpoch;
+      expect(switched).toBeGreaterThan(first);
+      c.disconnect();
+      expect(c.selectionEpoch).toBeGreaterThan(switched);
+    } finally {
+      c.disconnect();
+      await fetch(`http://127.0.0.1:${browser.port}/json/close/${other.id}`);
+    }
   }, 60_000);
 });
 

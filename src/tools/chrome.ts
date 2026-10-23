@@ -54,7 +54,7 @@ import {
   validateOutPath,
 } from './chrome-trace-capture.js';
 import { summarizeTraceFile } from './chrome-trace-summary.js';
-import { VITALS_PROBE, pageVitals, pickMetrics } from './chrome-metrics.js';
+import { createMetricsReader } from './chrome-metrics.js';
 
 // =============================================================================
 // Types
@@ -188,7 +188,17 @@ const THREE_HOOK_SCRIPT = `(() => {
   window.__STACK_CONTROL_THREE__ = store;
 })();`;
 
-class ChromeCDPClient extends EventEmitter {
+export class ChromeCDPClient extends EventEmitter {
+  private epoch = 0;
+
+  /**
+   * Moves whenever the selected tab or the connection changes: a call that reads it before and
+   * after knows whether everything it read came from one tab.
+   */
+  get selectionEpoch(): number {
+    return this.epoch;
+  }
+
   private ws: WebSocket | null = null;
   private pendingCommands = new Map<
     number,
@@ -326,6 +336,7 @@ class ChromeCDPClient extends EventEmitter {
         // event must not mark the newer connection as closed.
         if (this.ws !== socket) return;
         this.connected = false;
+        this.epoch++;
         this.emit('teardown');
         this.emit('close');
       };
@@ -526,6 +537,7 @@ class ChromeCDPClient extends EventEmitter {
     }
     this.connected = false;
     this.pendingCommands.clear();
+    this.epoch++;
     // Chrome ends a session's trace with the session; listeners drop what depended on it.
     this.emit('teardown');
   }
@@ -2053,55 +2065,17 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
 // Metrics
 // =============================================================================
 
-/** A page that blocks its main thread holds the vitals probe; this bounds the wait for it. */
-const VITALS_TIMEOUT_MS = 10_000;
+/** One metrics call at a time; see createMetricsReader. */
+const readMetrics = createMetricsReader();
 
 async function handleMetrics(): Promise<ToolResult> {
   if (!client?.isConnected()) {
     return { success: false, error: 'Not connected. Use chrome({ method: "connect" }) first.' };
   }
   const c = client;
-
-  let metrics: ReturnType<typeof pickMetrics>;
-  try {
-    const enabled = await c.sendCommand('Performance.enable');
-    try {
-      if (enabled.error) throw new Error(enabled.error.message);
-      const r = await c.sendCommand('Performance.getMetrics');
-      if (r.error) throw new Error(r.error.message);
-      metrics = pickMetrics((r.result as { metrics?: unknown } | undefined)?.metrics);
-    } finally {
-      // Leave the domain as it was found: off. A failed disable must not hide the reading.
-      await c.sendCommand('Performance.disable').catch(() => {});
-    }
-  } catch (error) {
-    return { success: false, error: `Could not read Chrome's metrics: ${messageOf(error, 'unknown error')}` };
-  }
-
-  // The vitals are extra: a page that breaks the probe still gets its metrics. The reason is ours,
-  // never the page's exception text.
-  let vitalsError: string;
-  try {
-    const r = await c.sendCommand(
-      'Runtime.evaluate',
-      { expression: VITALS_PROBE, returnByValue: true, awaitPromise: true },
-      VITALS_TIMEOUT_MS
-    );
-    const result = r.result as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
-    if (r.error) {
-      vitalsError = 'Chrome refused to run the vitals probe in the page.';
-    } else if (result?.exceptionDetails !== undefined) {
-      vitalsError = 'The page threw while reading its performance entries (PerformanceObserver may be missing or replaced).';
-    } else {
-      const vitals = pageVitals(result?.result?.value);
-      if (vitals) return { success: true, data: { metrics, vitals } };
-      vitalsError = 'The page returned something other than performance entries.';
-    }
-  } catch (error) {
-    // A timeout or a broken connection: the message is the client's own, not the page's.
-    vitalsError = `The vitals probe got no answer: ${messageOf(error, 'unknown error')}`;
-  }
-  return { success: true, data: { metrics, vitals: null, vitalsError } };
+  // The tab selected when the call was made: a switch while it waits or reads fails it.
+  const epoch = c.selectionEpoch;
+  return readMetrics(c, () => client === c && c.selectionEpoch === epoch);
 }
 
 // =============================================================================
@@ -2455,11 +2429,13 @@ export const chromeTool: Tool = {
   worst session window of shifts without recent input (0 when none); inp is
   null when there was no interaction, never 0. INP is an estimate: event
   timing buffers only about 150 entries and only events of 40ms or more, so a
-  long session can lose interactions. The vitals are read in the page's own JS
-  world, so a page that lies can mislead them, as with evaluate; at most 500
-  entries of each kind are read and strings are cut at 200 characters. If the
-  page breaks the probe, vitals is null and vitalsError says why; the metrics
-  still come back.
+  long session can lose interactions. The vitals are read in a separate JS
+  world Chrome makes for the tool, so the page's scripts cannot replace what
+  the probe uses; the entries are the browser's. At most 500 entries of each
+  kind are read, numbers outside a sane range are ignored, and strings are cut
+  at 200 characters. If that world cannot be made (for example while the page
+  navigates), vitals is null and vitalsError says why; the metrics still come
+  back. Calls run one at a time; a tab switch during a call fails it.
 
 **Hidden-page handling:**
 evaluate, screenshot, and scene auto-detect document.hidden and bring the tab
