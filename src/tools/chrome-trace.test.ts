@@ -386,3 +386,203 @@ describe('analyzeTrace: frames Chrome logged as dropped', () => {
     });
   });
 });
+
+
+describe('analyzeTrace: vitals', () => {
+  const shift = (tsMs: number, score: unknown, data: Record<string, unknown> = {}): TraceEvent => ({
+    name: 'LayoutShift', ph: 'I', ts: tsMs * 1000, ...MAIN,
+    args: { frame: 'main', data: { score, had_recent_input: false, is_main_frame: true, ...data } },
+  });
+  const navigation = (tsMs: number, frame = 'main'): TraceEvent => ({
+    name: 'navigationStart', ph: 'R', ts: tsMs * 1000, ...MAIN, args: { frame },
+  });
+  const candidate = (tsMs: number, data: Record<string, unknown> = {}, frame = 'main'): TraceEvent => ({
+    name: 'largestContentfulPaint::Candidate', ph: 'R', ts: tsMs * 1000, ...MAIN,
+    args: { frame, data: { isOutermostMainFrame: true, type: 'text', nodeName: 'P', size: 200, ...data } },
+  });
+
+  it('returns empty vitals without shifts or LCP candidates', () => {
+    expect(analyzeTrace([]).vitals).toEqual({ lcp: null, cls: 0, shiftCount: 0, shifts: [] });
+    expect(analyzeTrace(withMain(ev('RunTask', 100, 60))).vitals).toEqual({
+      lcp: null, cls: 0, shiftCount: 0, shifts: [],
+    });
+  });
+
+  it('sums nearby shifts and lists the largest score first', () => {
+    const v = analyzeTrace([shift(200, 0.05), shift(100, 0.1)]).vitals;
+    expect(v.cls).toBeCloseTo(0.15);
+    expect(v.shiftCount).toBe(2);
+    expect(v.shifts).toEqual([{ atMs: 0, score: 0.1 }, { atMs: 100, score: 0.05 }]);
+  });
+
+  it('excludes shifts caused by recent input, including from session gaps', () => {
+    const v = analyzeTrace([
+      shift(0, 0.1), shift(900, 0.9, { had_recent_input: true }), shift(1800, 0.2),
+    ]).vitals;
+    expect(v.cls).toBeCloseTo(0.2);
+    expect(v.shiftCount).toBe(2);
+    expect(v.shifts).toEqual([{ atMs: 1800, score: 0.2 }, { atMs: 0, score: 0.1 }]);
+  });
+
+  it.each([NaN, Infinity, -Infinity, '0.5', undefined, null])('ignores non-finite or non-numeric score %s', (score) => {
+    const v = analyzeTrace([shift(0, score), shift(100, 0.1)]).vitals;
+    expect(v.cls).toBeCloseTo(0.1);
+    expect(v.shiftCount).toBe(1);
+    expect(v.shifts).toEqual([{ atMs: 0, score: 0.1 }]);
+  });
+
+  it('includes layout shifts from subframes', () => {
+    const subframe = shift(100, 0.2, { is_main_frame: false });
+    subframe.args!.frame = 'child';
+    const v = analyzeTrace([shift(0, 0.1), subframe]).vitals;
+    expect(v.cls).toBeCloseTo(0.3);
+    expect(v.shiftCount).toBe(2);
+  });
+
+  it('takes the largest session rather than summing sessions separated by over one second', () => {
+    expect(analyzeTrace([shift(1500, 0.3), shift(0, 0.2)]).vitals.cls).toBeCloseTo(0.3);
+    expect(analyzeTrace([shift(0, 0.3), shift(1500, 0.2)]).vitals.cls).toBeCloseTo(0.3);
+  });
+
+  it('keeps a gap of exactly one second in the same session', () => {
+    expect(analyzeTrace([shift(0, 0.2), shift(1000, 0.3)]).vitals.cls).toBeCloseTo(0.5);
+  });
+
+  it('caps a session at five seconds despite smaller gaps', () => {
+    const events = [0, 900, 1800, 2700, 3600, 4500, 5400].map((t) => shift(t, 0.1));
+    expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.6);
+  });
+
+  it('starts a new session at exactly five seconds', () => {
+    const events = [0, 1000, 2000, 3000, 4000, 5000].map((t) => shift(t, 0.1));
+    expect(analyzeTrace(events).vitals.cls).toBeCloseTo(0.5);
+  });
+
+  it('lists only the ten largest shifts but counts all shifts', () => {
+    const events = Array.from({ length: 12 }, (_, i) => shift(i * 10, (i + 1) / 100));
+    const v = analyzeTrace(events).vitals;
+    expect(v.shiftCount).toBe(12);
+    expect(v.cls).toBeCloseTo(0.78);
+    expect(v.shifts).toEqual(Array.from({ length: 10 }, (_, i) => ({
+      atMs: (11 - i) * 10, score: (12 - i) / 100,
+    })));
+  });
+
+  it('shares the long-task time origin, including timed events outside the main thread', () => {
+    const s = analyzeTrace(withMain(
+      ev('Paint', 50, 10, { pid: 2, tid: 20 }), ev('RunTask', 100, 60), shift(150, 0.1),
+    ));
+    expect(s.longTasks).toEqual([{ startMs: 50, durationMs: 60 }]);
+    expect(s.vitals.shifts).toEqual([{ atMs: 100, score: 0.1 }]);
+  });
+
+  it('uses the earliest counted shift as origin without timed events', () => {
+    expect(analyzeTrace([navigation(100), shift(1000, 0.1)]).vitals.shifts).toEqual([
+      { atMs: 0, score: 0.1 },
+    ]);
+  });
+
+  it('measures LCP from navigationStart and passes through candidate details', () => {
+    const v = analyzeTrace([navigation(1000), candidate(1051.032, { size: 23828 })]).vitals;
+    expect(v.lcp?.ms).toBeCloseTo(51.032, 3);
+    expect(v.lcp).toMatchObject({ type: 'text', nodeName: 'P', size: 23828 });
+  });
+
+  it('uses the last candidate by timestamp rather than input order or size', () => {
+    const v = analyzeTrace([
+      candidate(120, { type: 'image', nodeName: 'IMG', size: 100 }),
+      navigation(100), candidate(110, { size: 1000 }),
+    ]).vitals;
+    expect(v.lcp).toEqual({ ms: 20, type: 'image', nodeName: 'IMG', size: 100 });
+  });
+
+  it('ignores candidates explicitly outside the outermost main frame', () => {
+    const v = analyzeTrace([
+      navigation(100), candidate(110), candidate(120, { isOutermostMainFrame: false, isMainFrame: true }),
+    ]).vitals;
+    expect(v.lcp?.ms).toBe(10);
+  });
+
+  it('falls back to isMainFrame only when isOutermostMainFrame is absent', () => {
+    const fallback = candidate(120, { isMainFrame: true });
+    delete (fallback.args!.data as Record<string, unknown>).isOutermostMainFrame;
+    const v = analyzeTrace([navigation(100), candidate(110), fallback]).vitals;
+    expect(v.lcp?.ms).toBe(20);
+    const noMain = candidate(130, { isMainFrame: false });
+    delete (noMain.args!.data as Record<string, unknown>).isOutermostMainFrame;
+    expect(analyzeTrace([navigation(100), noMain]).vitals.lcp).toBeNull();
+  });
+
+  it('uses the latest preceding navigation on the same frame', () => {
+    const v = analyzeTrace([
+      navigation(130), navigation(100), candidate(120), navigation(115, 'child'), navigation(110),
+    ]).vitals;
+    expect(v.lcp?.ms).toBe(10);
+  });
+
+  it('accepts a navigation at the exact candidate timestamp', () => {
+    expect(analyzeTrace([candidate(120), navigation(120)]).vitals.lcp?.ms).toBe(0);
+  });
+
+  it.each([
+    { navigations: [] },
+    { navigations: [navigation(130)] },
+    { navigations: [navigation(100, 'child')] },
+    { navigations: [{ ...navigation(100), ph: 'I' }] },
+  ])('returns null without a usable navigationStart ($navigations)', ({ navigations }) => {
+    expect(analyzeTrace([...navigations, candidate(120)]).vitals.lcp).toBeNull();
+  });
+
+  it('does not reuse an earlier candidate when the last candidate has no navigation', () => {
+    expect(analyzeTrace([
+      navigation(100), candidate(110), candidate(120, {}, 'child'),
+    ]).vitals.lcp).toBeNull();
+  });
+
+  it('defaults missing candidate details without discarding the candidate', () => {
+    const v = analyzeTrace([
+      navigation(100), candidate(120, { size: '200', type: undefined, nodeName: undefined }),
+    ]).vitals;
+    expect(v.lcp).toEqual({ ms: 20, size: 0, type: '', nodeName: '' });
+  });
+
+  it('accepts both instant shift phases and ignores async shift events', () => {
+    const v = analyzeTrace([
+      shift(0, 0.1), { ...shift(100, 0.2), ph: 'i' }, { ...shift(200, 0.9), ph: 'b' },
+    ]).vitals;
+    expect(v.cls).toBeCloseTo(0.3);
+    expect(v.shiftCount).toBe(2);
+  });
+
+  it.each(['R', 'I', 'i'])('accepts LCP candidate phase %s', (ph) => {
+    expect(analyzeTrace([navigation(100), { ...candidate(120), ph }]).vitals.lcp?.ms).toBe(20);
+  });
+
+  it('ignores async LCP candidates', () => {
+    const v = analyzeTrace([navigation(100), candidate(110), { ...candidate(120), ph: 'b' }]).vitals;
+    expect(v.lcp?.ms).toBe(10);
+  });
+
+  it('agrees with a real Chrome trace on CLS and LCP', () => {
+    const events = (JSON.parse(readFileSync(
+      new URL('./__fixtures__/vitals-real.json', import.meta.url), 'utf8'
+    )) as { traceEvents: TraceEvent[] }).traceEvents;
+    const v = analyzeTrace(events).vitals;
+    expect(v.cls).toBeCloseTo(0.23422996, 8);
+    expect(v.shiftCount).toBe(2);
+    expect(v.lcp).not.toBeNull();
+    expect(v.lcp!.ms).toBeCloseTo(51.032, 3);
+    expect(v.lcp).toMatchObject({ type: 'text', nodeName: 'P', size: 23828 });
+  });
+
+  it('handles vitals in a trace with 700,000 other events', () => {
+    const events: TraceEvent[] = [];
+    for (let i = 0; i < 700_000; i++) events.push(ev('RunTask', i, 0.5));
+    events.push(shift(100, 0.1), navigation(0), candidate(51.032));
+    const v = analyzeTrace(events).vitals;
+    expect(v.cls).toBeCloseTo(0.1);
+    expect(v.shiftCount).toBe(1);
+    expect(v.shifts).toEqual([{ atMs: 100, score: 0.1 }]);
+    expect(v.lcp?.ms).toBeCloseTo(51.032, 3);
+  });
+});
