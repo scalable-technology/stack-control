@@ -80,6 +80,37 @@ describe('analyzeTrace: long tasks', () => {
   });
 });
 
+describe('analyzeTrace: real-trace shapes', () => {
+  it('handles a trace with hundreds of thousands of events', () => {
+    // Real DevTools exports reach 200k-1M events. Spreading that many into
+    // Math.min/Math.max throws RangeError: plain node fails past ~100k, and
+    // under vitest past ~300k-600k (measured), so this size fails either way.
+    const events: TraceEvent[] = [threadName(MAIN.pid, MAIN.tid, 'CrRendererMain')];
+    for (let i = 0; i < 700_000; i++) events.push(ev('RunTask', i, 0.5));
+    events.push(ev('RunTask', 800_000, 120));
+    const s = analyzeTrace(events);
+    expect(s.longTasks).toEqual([{ startMs: 800_000, durationMs: 120 }]);
+  });
+
+  it('reports a RunTask nested inside another RunTask once', () => {
+    // Nested message loops put a task inside a task: one long task, not two.
+    const s = analyzeTrace(withMain(ev('RunTask', 0, 200), ev('RunTask', 50, 100)));
+    expect(s.longTasks).toEqual([{ startMs: 0, durationMs: 200 }]);
+  });
+
+  it('gives a null main thread and no long tasks when no CrRendererMain is named', () => {
+    const s = analyzeTrace([ev('RunTask', 0, 200)]);
+    expect(s.mainThread).toBeNull();
+    expect(s.longTasks).toEqual([]);
+  });
+
+  it('counts an event outside any task in its category, so categories can exceed busy time', () => {
+    const s = analyzeTrace(withMain(ev('RunTask', 0, 10), ev('Layout', 20, 5)));
+    expect(s.categoryMs.layout).toBeCloseTo(5, 5);
+    expect(s.busyPct).toBeCloseTo((10 / 25) * 100, 5);
+  });
+});
+
 describe('analyzeTrace: busy percentage', () => {
   it('is the share of the trace window the main thread spent in tasks', () => {
     // Window runs from 0 to 1000ms; two 100ms tasks -> 20%.
