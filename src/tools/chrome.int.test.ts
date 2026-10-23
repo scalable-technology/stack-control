@@ -246,6 +246,11 @@ describe.skipIf(!chromeAvailable)('chrome scroll: real input in headless Chrome'
   }, 30_000);
 });
 
+// A page that lies about scroll positions rather than the gesture point.
+const HOSTILE_POSITIONS_PAGE = `<!doctype html><body style="margin:0"><script>
+  Object.defineProperty(Element.prototype, 'scrollTop', { get() { return 'not a number'; }, set() {} });
+</script><div style="height:5000px"></div></body>`;
+
 describe.skipIf(!chromeAvailable)('chrome scroll: a page that lies', () => {
   let browser: TestBrowser;
   let server: TestServer;
@@ -266,6 +271,22 @@ describe.skipIf(!chromeAvailable)('chrome scroll: a page that lies', () => {
     await call({ method: 'disconnect' });
     await server?.close();
     await browser?.close();
+  }, 30_000);
+
+  it('returns an error, not an exception, when the page lies about scroll positions', async () => {
+    const liar = await servePage(HOSTILE_POSITIONS_PAGE);
+    try {
+      await call({ method: 'navigate', url: liar.url });
+      await new Promise((r) => setTimeout(r, 800));
+      const r = await call({ method: 'scroll', distance: 300 });
+      expect(r.success).toBe(false);
+      expect(r.error).toMatch(/non-numeric scroll position/i);
+    } finally {
+      // Put the shared tab back on this describe's page for the tests that follow.
+      await call({ method: 'navigate', url: server.url });
+      await new Promise((r) => setTimeout(r, 800));
+      await liar.close();
+    }
   }, 30_000);
 
   it('rejects a non-numeric gesture point instead of running it as code', async () => {
