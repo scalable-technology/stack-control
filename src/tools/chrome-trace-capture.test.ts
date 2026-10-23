@@ -29,7 +29,12 @@ import {
 // Pass-through spies, so a test can count closes or step into the gap between a check and an open.
 vi.mock('node:fs', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:fs')>();
-  return { ...real, closeSync: vi.fn(real.closeSync), lstatSync: vi.fn(real.lstatSync) };
+  return {
+    ...real,
+    closeSync: vi.fn(real.closeSync),
+    lstatSync: vi.fn(real.lstatSync),
+    renameSync: vi.fn(real.renameSync),
+  };
 });
 
 const dirs: string[] = [];
@@ -557,7 +562,11 @@ describe('TraceRecorder: stop to a chosen path', () => {
       chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
       onRead: (n) => {
         if (n === 1) {
-          expect(readdirSync(dir).some((f) => f.endsWith('.tmp'))).toBe(true); // writing beside, not over
+          // The first chunk is in the temp file beside the target, not over it.
+          const temps = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+          expect(temps).toHaveLength(1);
+          expect(readFileSync(join(dir, temps[0]), 'utf8')).toBe('{"traceEvents":[');
+          expect(readFileSync(target, 'utf8')).toBe('old');
           throw new Error('stream gone');
         }
       },
@@ -565,6 +574,55 @@ describe('TraceRecorder: stop to a chosen path', () => {
     await expect(rec.stop(chunked.cdp, { outPath: target, overwrite: true })).rejects.toThrow('stream gone');
     expect(readFileSync(target, 'utf8')).toBe('old');
     expect(readdirSync(dir)).toEqual(['out.json']);
+  });
+
+  it('keeps the complete trace in its temp file when the OS refuses the final replace', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    writeFileSync(target, 'old');
+    const { rec, cdp } = await recording(false);
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error(`EPERM: operation not permitted, rename -> '${target}'`), { code: 'EPERM' });
+    });
+    const error = await rec.stop(cdp, { outPath: target, overwrite: true }).then(
+      () => { throw new Error('stop should have failed'); },
+      (e: Error) => e
+    );
+    const temps = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+    expect(temps).toHaveLength(1);
+    const temp = join(dir, temps[0]);
+    expect(readFileSync(temp, 'utf8')).toBe(NEW);
+    expect(statSync(temp).mode & 0o777).toBe(0o600);
+    expect(error.message).toContain('EPERM');
+    expect(error.message).toContain('complete');
+    expect(error.message).toContain(temp);
+    expect(readFileSync(target, 'utf8')).toBe('old');
+    expect(rec.running).toBe(false); // Chrome ended the trace
+  });
+
+  it('still removes its file and reports the first error when closing fails during abort', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    const chunked = fake({
+      chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
+      onRead: (n) => {
+        if (n === 1) {
+          expect(readFileSync(target, 'utf8')).toBe('{"traceEvents":[');
+          // The abort's close fails after releasing the fd, as an EIO from close can.
+          vi.mocked(fs.closeSync).mockImplementationOnce((fd) => {
+            actual.closeSync(fd);
+            throw Object.assign(new Error('EIO: i/o error, close'), { code: 'EIO' });
+          });
+          throw new Error('stream gone');
+        }
+      },
+    });
+    await expect(rec.stop(chunked.cdp, { outPath: target })).rejects.toThrow('stream gone');
+    expect(existsSync(target)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
 
@@ -616,10 +674,11 @@ describe('openTraceSink', () => {
     rmSync(join(dir, 'b.json'));
     mkdirSync(join(dir, 'b.json'));
     writeFileSync(join(dir, 'b.json', 'x'), 'x');
-    expect(() => replace.commit()).toThrow();
+    expect(() => replace.commit()).toThrow(/refused.*kept at/);
     replace.abort();
     expect(closes(replace.fd)).toBe(1);
-    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    // A refused replace keeps the finished temp file, even through a later abort.
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toHaveLength(1);
   });
 
   it('closes once when a stopTrace fails mid-write', async () => {

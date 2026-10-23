@@ -2154,7 +2154,9 @@ export const chromeTool: Tool = {
   \`chrome({ method: "trace", action: "stop", outPath: "/abs/dir/scroll.json.gz" })\`
   outPath must be absolute and end in .json.gz (.json if started with
   compress: false). It refuses to replace an existing file unless
-  overwrite: true; the file is written mode 0600.
+  overwrite: true; the file is written mode 0600. A bad path is refused
+  before the recording ends, so it keeps running. If the OS refuses the
+  final replace, the complete trace is kept at the temp file the error names.
   One trace at a time per connection. Tracing adds overhead; the first ~200ms
   of a recording include profiler start-up.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
