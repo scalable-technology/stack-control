@@ -2000,7 +2000,12 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
       scroll = await handleScroll({ method: 'scroll', ...input.scroll });
       if (!scroll.success) failure = scroll.error ?? 'The scroll failed';
     }
-    if (failure === undefined) await sleep(Math.max(0, input.durationMs - (Date.now() - startedAt)));
+    if (failure === undefined) {
+      // A timer can fire a millisecond early against Date.now(), so wait on the clock, not on one sleep.
+      for (let left = input.durationMs - (Date.now() - startedAt); left > 0; left = input.durationMs - (Date.now() - startedAt)) {
+        await sleep(left);
+      }
+    }
   } catch (error) {
     failure = messageOf(error, 'The profile failed');
   }
