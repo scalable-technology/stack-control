@@ -50,6 +50,14 @@ export interface FrameStats {
   slow: number;
   /** Vsync slots missed: sum of round(gap / budget) - 1 over the gaps. */
   dropped: number;
+  /** DroppedFrame events Chrome logged on this compositor. */
+  chromeDropped: number;
+  /**
+   * Of those, the ones whose frameSeqId also has a DrawFrame: Chrome counted
+   * the frame as dropped, yet the compositor presented one. Gap-based numbers
+   * cannot see these (a page can hold 59fps and still miss content).
+   */
+  chromeDroppedDrawn: number;
 }
 
 export interface AnalyzeOptions {
@@ -82,21 +90,37 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
   if (!Number.isFinite(budgetMs) || budgetMs <= 0) {
     throw new RangeError(`frameBudgetMs must be a positive finite number, got ${budgetMs}`);
   }
-  const byCompositor = new Map<string, number[]>();
-  for (const e of events) {
-    if (e.name !== 'DrawFrame') continue;
-    const key = `${e.pid}:${String(e.args?.layerTreeId)}`;
-    const list = byCompositor.get(key);
-    if (list) list.push(e.ts);
-    else byCompositor.set(key, [e.ts]);
+  interface Compositor {
+    draws: number[];
+    drawnSeqs: Set<number | undefined>;
+    dropSeqs: (number | undefined)[];
   }
-  let draws: number[] = [];
-  for (const list of byCompositor.values()) if (list.length > draws.length) draws = list;
-  draws.sort((a, b) => a - b);
+  const byCompositor = new Map<string, Compositor>();
+  for (const e of events) {
+    if (e.name !== 'DrawFrame' && e.name !== 'DroppedFrame') continue;
+    const key = `${e.pid}:${String(e.args?.layerTreeId)}`;
+    let c = byCompositor.get(key);
+    if (!c) byCompositor.set(key, (c = { draws: [], drawnSeqs: new Set(), dropSeqs: [] }));
+    const seq = typeof e.args?.frameSeqId === 'number' ? e.args.frameSeqId : undefined;
+    if (e.name === 'DrawFrame') {
+      c.draws.push(e.ts);
+      c.drawnSeqs.add(seq);
+    } else {
+      c.dropSeqs.push(seq);
+    }
+  }
+  let best: Compositor = { draws: [], drawnSeqs: new Set(), dropSeqs: [] };
+  for (const c of byCompositor.values()) if (c.draws.length > best.draws.length) best = c;
+  const draws = best.draws.sort((a, b) => a - b);
+  const chromeDropped = best.dropSeqs.length;
+  const chromeDroppedDrawn = best.dropSeqs.filter((s) => s !== undefined && best.drawnSeqs.has(s)).length;
 
   const gaps = draws.slice(1).map((t, i) => (t - draws[i]) / 1000);
   if (gaps.length === 0) {
-    return { count: draws.length, fps: 0, p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null, slow: 0, dropped: 0 };
+    return {
+      count: draws.length, fps: 0, p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null,
+      slow: 0, dropped: 0, chromeDropped, chromeDroppedDrawn,
+    };
   }
   const sorted = [...gaps].sort((a, b) => a - b);
   const spanS = (draws[draws.length - 1] - draws[0]) / 1_000_000;
@@ -109,6 +133,8 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
     maxMs: sorted[sorted.length - 1],
     slow: gaps.filter((g) => g > 1.5 * budgetMs).length,
     dropped: gaps.reduce((n, g) => n + Math.max(0, Math.round(g / budgetMs) - 1), 0),
+    chromeDropped,
+    chromeDroppedDrawn,
   };
 }
 
