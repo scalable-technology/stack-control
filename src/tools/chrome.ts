@@ -695,6 +695,7 @@ const ScrollInput = z.object({
     .describe('Aim the gesture at the center of this element (default: viewport center)'),
   speed: z
     .number()
+    .int()
     .positive()
     .max(20000)
     .optional()
@@ -1784,61 +1785,131 @@ async function handleWait(input: z.infer<typeof WaitInput>): Promise<ToolResult>
 // Scroll
 // =============================================================================
 
+/** The longest gesture one call may run, so a call can never hold the browser for long. */
+const MAX_SCROLL_MS = 60_000;
+
+/** A number from the page is data, not code: accept only a finite number. */
+function finiteNumber(value: unknown, what: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`The page returned a non-numeric ${what}; refusing to use it`);
+  }
+  return value;
+}
+
 /**
- * JS that finds the scroller under a point: the nearest scrollable ancestor of
- * the element there, else the document. Used before and after the gesture so
- * the result says what scrolled, not what was asked of the window.
+ * JS that returns the scrollers a wheel at a point can move, innermost first,
+ * ending with the document's scrolling element: every scrollable ancestor of
+ * the element under the point. Returned as one array handle (not by value), so
+ * the same elements are measured before and after even when scrolling moves
+ * another box under the point. x and y are validated finite numbers by the
+ * caller, never page strings.
  */
-function scrollerProbe(x: number, y: number): string {
+function scrollerChainFinder(x: number, y: number): string {
   return `(() => {
     const root = document.scrollingElement || document.documentElement;
+    const chain = [];
     let el = document.elementFromPoint(${x}, ${y});
     while (el && el !== document.documentElement && el !== document.body) {
-      if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight) break;
+      if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight) chain.push(el);
       el = el.parentElement;
     }
-    const s = el && el !== document.documentElement && el !== document.body ? el : root;
-    return { top: s.scrollTop, name: s === root ? 'document' : s.tagName.toLowerCase() + (s.id ? '#' + s.id : '') };
+    chain.push(root);
+    return chain;
   })()`;
 }
 
+const SCROLLER_CHAIN_STATE = `function () {
+  const root = document.scrollingElement || document.documentElement;
+  return this.map((el) => ({
+    top: el.scrollTop,
+    name: el === root ? 'document' : el.tagName.toLowerCase() + (el.id ? '#' + el.id : ''),
+  }));
+}`;
+
+interface ScrollerState {
+  top: number;
+  name: string;
+}
+
 async function handleScroll(input: z.infer<typeof ScrollInput>): Promise<ToolResult> {
+  const gestures = 1 + input.repeat;
+  const expectedMs =
+    (Math.abs(input.distance) / input.speed) * 1000 * gestures + input.repeat * input.repeatDelayMs;
+  if (expectedMs > MAX_SCROLL_MS) {
+    return {
+      success: false,
+      error:
+        `Gesture too long: about ${Math.round(expectedMs / 1000)}s (limit ${MAX_SCROLL_MS / 1000}s). ` +
+        'Raise speed, lower distance or repeat, or split it into several calls.',
+    };
+  }
+
   if (!client?.isConnected()) {
     return {
       success: false,
       error: 'Not connected. Use chrome({ method: "connect" }) first.',
     };
   }
+  const c = client;
 
   try {
     // Hidden pages throttle input and rAF; scroll only a visible tab.
-    const foreground = await ensureForeground(client);
+    const foreground = await ensureForeground(c);
 
-    let point: { x: number; y: number } | null;
+    let raw: unknown;
     if (input.selector) {
-      point = (await client.evaluate(
-        `(() => { const el = document.querySelector(${JSON.stringify(input.selector)}); if (!el) return null;
+      raw = await c.evaluate(
+        `(() => { const el = document.querySelector(${JSON.stringify(input.selector)}); if (!el) return 'none';
           const r = el.getBoundingClientRect();
           return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`
-      )) as { x: number; y: number } | null;
-      if (!point) return { success: false, error: `No element matches selector "${input.selector}"` };
+      );
+      if (raw === 'none') return { success: false, error: `No element matches selector "${input.selector}"` };
     } else {
-      point = (await client.evaluate(
-        '({ x: Math.round(innerWidth / 2), y: Math.round(innerHeight / 2) })'
-      )) as { x: number; y: number };
+      raw = await c.evaluate('({ x: Math.round(innerWidth / 2), y: Math.round(innerHeight / 2) })');
+    }
+    const p = raw as { x?: unknown; y?: unknown } | null;
+    let x: number;
+    let y: number;
+    try {
+      x = finiteNumber(p?.x, 'gesture point');
+      y = finiteNumber(p?.y, 'gesture point');
+    } catch {
+      return { success: false, error: 'Could not determine a numeric gesture point; the page returned something else' };
     }
 
-    const before = (await client.evaluate(scrollerProbe(point.x, point.y))) as { top: number; name: string };
+    // Hold the scrollers by handle so before and after measure the same elements.
+    const found = await c.sendCommand('Runtime.evaluate', {
+      expression: scrollerChainFinder(x, y),
+      returnByValue: false,
+    });
+    const objectId = (found.result as { result?: { objectId?: string } } | undefined)?.result?.objectId;
+    if (!objectId) return { success: false, error: 'Could not find a scroller at the gesture point' };
+
+    const readChain = async (): Promise<ScrollerState[]> => {
+      const r = await c.sendCommand('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: SCROLLER_CHAIN_STATE,
+        returnByValue: true,
+      });
+      const v = (r.result as { result?: { value?: unknown } } | undefined)?.result?.value;
+      if (!Array.isArray(v) || v.length === 0 || v.length > 64) {
+        throw new Error('The page returned an unusable scroller list; refusing to use it');
+      }
+      return v.map((e: { top?: unknown; name?: unknown }) => ({
+        top: finiteNumber(e?.top, 'scroll position'),
+        name: String(e?.name ?? 'unknown').slice(0, 80),
+      }));
+    };
+
+    const before = await readChain();
     const startedAt = Date.now();
-    const gestures = 1 + input.repeat;
-    const expectedMs = (Math.abs(input.distance) / input.speed) * 1000 * gestures + input.repeat * input.repeatDelayMs;
 
     // CDP's yDistance is positive for scrolling UP; our distance is positive for down.
-    const response = await client.sendCommand(
+    const response = await c.sendCommand(
       'Input.synthesizeScrollGesture',
       {
-        x: point.x,
-        y: point.y,
+        x,
+        y,
         yDistance: -input.distance,
         speed: input.speed,
         gestureSourceType: input.source,
@@ -1852,19 +1923,33 @@ async function handleScroll(input: z.infer<typeof ScrollInput>): Promise<ToolRes
     }
     const gestureMs = Date.now() - startedAt;
 
-    // Let a smooth-scroll animation finish before reading the position.
-    await new Promise((r) => setTimeout(r, 150));
-    const after = (await client.evaluate(scrollerProbe(point.x, point.y))) as { top: number; name: string };
+    // Smooth scrolling can outlast the gesture call: wait until every position stops moving.
+    let after = await readChain();
+    let stable = 0;
+    for (let i = 0; i < 25 && stable < 3; i++) {
+      await new Promise((r) => setTimeout(r, 60));
+      const next = await readChain();
+      stable = next.every((e, k) => e.top === after[k]?.top) ? stable + 1 : 0;
+      after = next;
+    }
+
+    // The scroller that moved is the one that took the gesture; if none moved, the innermost.
+    const movedAt = after.findIndex((e, k) => e.top !== before[k]?.top);
+    const k = movedAt === -1 ? 0 : movedAt;
+    const rootAt = after.length - 1;
+    const scroller = after[k];
 
     return {
       success: true,
       data: {
         source: input.source,
-        scroller: after.name,
+        scroller: scroller.name,
         requestedPx: input.distance * gestures,
-        scrolledPx: after.top - before.top,
-        scrollTopBefore: before.top,
-        scrollTopAfter: after.top,
+        scrolledPx: scroller.top - before[k].top,
+        scrollTopBefore: before[k].top,
+        scrollTopAfter: scroller.top,
+        ...(k !== rootAt ? { documentScrolledPx: after[rootAt].top - before[rootAt].top } : {}),
+        settled: stable >= 3,
         gestureMs,
         ...(foreground ? { foreground } : {}),
       },
@@ -1955,9 +2040,13 @@ export const chromeTool: Tool = {
 
 • **scroll** - Scroll with a REAL wheel (or touch) gesture, not window.scrollTo.
   Compositor-driven scrolling is what jank depends on. Positive distance scrolls
-  down. Reports what actually scrolled (the page may end first). If exact
-  distances matter, wait about a second between big fast gestures: momentum from
-  the last one can add distance to the next (compare requestedPx with scrolledPx).
+  down. Reports what actually scrolled (the page may end first), for the
+  scroller under the gesture point, plus documentScrolledPx when that is a nested
+  box. If exact distances matter, wait about a second between big fast gestures:
+  a gesture started right after one has been seen to scroll further than asked
+  (cause not established); compare requestedPx with scrolledPx. The measurement
+  runs in the page's own JS world, so a page that lies can mislead it, as with
+  evaluate. A single call is limited to 60s of gesture time.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
   \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
   \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
