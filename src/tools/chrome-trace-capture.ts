@@ -70,8 +70,9 @@ export interface SinkOptions {
 }
 
 /**
- * Where a trace is written. commit makes it final. abort removes what the sink created, best
- * effort and without throwing, except a complete trace whose final replace the OS refused.
+ * Where a trace is written. commit makes it final. abort removes what the sink created, except
+ * a complete trace whose final replace the OS refused. It never throws; when the removal fails
+ * it returns a one-line note naming what was left behind.
  */
 export interface TraceSink {
   path: string;
@@ -79,7 +80,7 @@ export interface TraceSink {
   /** True when commit will replace a file that was there when the sink was opened. */
   replaces: boolean;
   commit(): void;
-  abort(): void;
+  abort(): string | undefined;
 }
 
 const kindOf = (s: Stats) =>
@@ -97,9 +98,10 @@ function closer(fd: number): () => void {
 
 /**
  * abort runs while another error is on its way out: a close error must not skip the removal,
- * and neither may replace the error that caused the abort.
+ * and neither may replace the error that caused the abort. A failed removal comes back as a
+ * note, so the caller can say what was left on disk.
  */
-function release(close: () => void, remove: () => void): void {
+function release(close: () => void, remove: () => void, path: string): string | undefined {
   try {
     close();
   } catch {
@@ -107,16 +109,18 @@ function release(close: () => void, remove: () => void): void {
   }
   try {
     remove();
-  } catch {
-    // Best effort: the caller is already reporting the error that matters.
+    return undefined;
+  } catch (error) {
+    return `Could not remove the partial file ${path}: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
 /**
  * Check the path and create the file before Chrome is asked to end the trace, so a bad path
- * never costs the recording: it keeps running. After the end, the one way a finished trace
- * misses its path is the OS refusing the final replace (overwrite: true); the complete trace
- * is then kept at the temp file the error names.
+ * never costs the recording: it keeps running. After the end, a finished trace misses its path
+ * in two ways. If the OS refuses the final replace (overwrite: true), the complete trace is kept
+ * at the temp file the error names. If the final close fails (EIO), the file is removed and the
+ * close error is thrown, because what reached the disk cannot be trusted.
  */
 export function openTraceSink(options: SinkOptions): TraceSink {
   const ext = options.compress ? '.json.gz' : '.json';
@@ -139,7 +143,7 @@ export function openTraceSink(options: SinkOptions): TraceSink {
       fd,
       replaces: false,
       commit: close,
-      abort: () => release(close, () => rmSync(fresh, { recursive: true, force: true })),
+      abort: () => release(close, () => rmSync(fresh, { recursive: true, force: true }), fresh),
     };
   }
 
@@ -188,7 +192,7 @@ export function openTraceSink(options: SinkOptions): TraceSink {
       replaces: false,
       commit: close,
       // Created by us a moment ago, so ours to remove.
-      abort: () => release(close, () => rmSync(target, { force: true })),
+      abort: () => release(close, () => rmSync(target, { force: true }), target),
     };
   }
 
@@ -216,9 +220,14 @@ export function openTraceSink(options: SinkOptions): TraceSink {
         );
       }
     },
-    abort: () => release(close, () => {
-      if (!kept) rmSync(temp, { force: true });
-    }),
+    abort: () =>
+      release(
+        close,
+        () => {
+          if (!kept) rmSync(temp, { force: true });
+        },
+        temp
+      ),
   };
 }
 
@@ -301,8 +310,10 @@ export async function stopTrace(
       ...(sink.replaces ? { overwritten: true as const } : {}),
     };
   } catch (error) {
-    sink.abort();
-    throw error;
+    const note = sink.abort();
+    if (!note) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} ${note}`, { cause: error });
   } finally {
     if (stream !== undefined) await cdp.sendCommand('IO.close', { handle: stream }).catch(() => {});
   }

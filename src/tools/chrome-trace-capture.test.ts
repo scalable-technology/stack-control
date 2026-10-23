@@ -34,6 +34,7 @@ vi.mock('node:fs', async (importOriginal) => {
     closeSync: vi.fn(real.closeSync),
     lstatSync: vi.fn(real.lstatSync),
     renameSync: vi.fn(real.renameSync),
+    rmSync: vi.fn(real.rmSync),
   };
 });
 
@@ -623,6 +624,53 @@ describe('TraceRecorder: stop to a chosen path', () => {
     await expect(rec.stop(chunked.cdp, { outPath: target })).rejects.toThrow('stream gone');
     expect(existsSync(target)).toBe(false);
     expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('names the partial file it could not remove, alongside the first error', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    const original = new Error('stream gone');
+    const chunked = fake({
+      chunks: [{ data: b64('{"traceEvents":['), eof: false, base64Encoded: true }],
+      onRead: (n) => {
+        if (n === 1) {
+          vi.mocked(fs.rmSync).mockImplementationOnce(() => {
+            throw Object.assign(new Error(`EACCES: permission denied, rm '${target}'`), { code: 'EACCES' });
+          });
+          throw original;
+        }
+      },
+    });
+    const error = await rec.stop(chunked.cdp, { outPath: target }).then(
+      () => { throw new Error('stop should have failed'); },
+      (e: Error) => e
+    );
+    expect(error.message).toContain('stream gone');
+    expect(error.message).toContain(`Could not remove the partial file ${target}: EACCES`);
+    expect(error.cause).toBe(original);
+    // The note is true: the partial file really is still there.
+    expect(readFileSync(target, 'utf8')).toBe('{"traceEvents":[');
+  });
+
+  it('removes the file and throws the close error when the final close fails', async () => {
+    const dir = tempDir();
+    const target = join(dir, 'out.json');
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const rec = new TraceRecorder();
+    await rec.start(fake().cdp, { compress: false });
+    const f = newTrace({
+      onRead: () => {
+        // Every chunk is in; the close in commit fails after releasing the fd.
+        vi.mocked(fs.closeSync).mockImplementationOnce((fd) => {
+          actual.closeSync(fd);
+          throw Object.assign(new Error('EIO: i/o error, close'), { code: 'EIO' });
+        });
+      },
+    });
+    await expect(rec.stop(f.cdp, { outPath: target })).rejects.toThrow(/^EIO: i\/o error, close$/);
+    expect(existsSync(target)).toBe(false);
   });
 });
 

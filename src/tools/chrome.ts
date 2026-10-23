@@ -2156,7 +2156,8 @@ export const chromeTool: Tool = {
   compress: false). It refuses to replace an existing file unless
   overwrite: true; the file is written mode 0600. A bad path is refused
   before the recording ends, so it keeps running. If the OS refuses the
-  final replace, the complete trace is kept at the temp file the error names.
+  final replace, the complete trace is kept at the temp file the error names;
+  if the final close fails, the file is removed, since it may be incomplete.
   One trace at a time per connection. Tracing adds overhead; the first ~200ms
   of a recording include profiler start-up.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
