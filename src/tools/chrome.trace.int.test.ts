@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -73,10 +73,27 @@ describe('chrome trace: input validation', () => {
     [{ method: 'trace', action: 'stop', outPath: '/tmp/a\0b.json.gz' }, 'outPath'],
     [{ method: 'trace', action: 'stop', overwrite: 'yes' }, 'overwrite'],
     [{ method: 'trace', action: 'stop', summary: 'yes' }, 'summary'],
+    [{ method: 'profile', durationMs: 31000 }, 'durationMs'],
+    [{ method: 'profile', durationMs: 30001 }, 'durationMs'],
+    [{ method: 'profile', durationMs: 999 }, 'durationMs'],
+    [{ method: 'profile', durationMs: 1500.5 }, 'durationMs'],
+    [{ method: 'profile', scroll: { distance: 100, speed: 0 } }, 'speed'],
+    [{ method: 'profile', scroll: { speed: 800 } }, 'distance'],
+    [{ method: 'profile', categories: ['bad category'] }, 'categories'],
+    [{ method: 'profile', outPath: '' }, 'outPath'],
+    [{ method: 'profile', overwrite: 'yes' }, 'overwrite'],
+    [{ method: 'profile', summary: 'yes' }, 'summary'],
   ])('rejects %j and names the field %s', async (input, field) => {
     const r = await call(input);
     expect(r.success).toBe(false);
     expect(r.error).toMatch(new RegExp(`"${field}"`));
+  });
+
+  it.each([1000, 30000])('accepts durationMs %d (it gets as far as the connection check)', async (durationMs) => {
+    await call({ method: 'disconnect' });
+    const r = await call({ method: 'profile', durationMs });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/^Not connected/);
   });
 
   it('says to connect first when there is no connection', async () => {
@@ -439,5 +456,191 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
     expect(statSync(d.path).size).toBe(d.bytes);
     expect(d.summarySkipped).toBe('The summary failed');
     expect('summary' in d).toBe(false);
+  }, 60_000);
+});
+
+describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome', () => {
+  let browser: TestBrowser;
+  let tall: TestServer;
+  let quiet: TestServer;
+  /** Directories these tests create, removed after each test. */
+  const made: string[] = [];
+
+  const open = async (url: string) => {
+    const n = await call({ method: 'navigate', url });
+    expect(n.success, n.error).toBe(true);
+    for (let i = 0; i < 50; i++) {
+      if ((await evaluate('document.readyState === "complete"')) === true) return;
+      await sleep(100);
+    }
+    throw new Error(`${url} did not finish loading`);
+  };
+  const traceDirs = () => readdirSync(tmpdir()).filter((n) => n.startsWith('control-trace-')).sort();
+  const expectNotRecording = async () => {
+    const r = await call({ method: 'trace', action: 'stop' });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/No trace is running/);
+  };
+  const scratch = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'control-profile-test-'));
+    made.push(dir);
+    return dir;
+  };
+  const profile = async (input: Record<string, unknown>) => {
+    const r = await call({ method: 'profile', ...input });
+    const path = (r.data as { path?: string } | undefined)?.path;
+    if (r.success && path && input.outPath === undefined) made.push(dirname(path));
+    return r;
+  };
+
+  beforeAll(async () => {
+    browser = await launchTestBrowser();
+    tall = await servePage(PAGE);
+    quiet = await servePage(QUIET_PAGE);
+    const c = await call({ method: 'connect', port: browser.port });
+    expect(c.success, c.error).toBe(true);
+  }, 60_000);
+
+  afterEach(() => {
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  afterAll(async () => {
+    await call({ method: 'disconnect' });
+    await browser?.close();
+    await tall?.close();
+    await quiet?.close();
+  }, 30_000);
+
+  it('records a wheel scroll on the tall page and returns the summary and the scroll', async () => {
+    await open(tall.url);
+    expect(await evaluate('window.scrollY')).toBe(0);
+    const startedAt = Date.now();
+    const r = await profile({ durationMs: 3000, scroll: { distance: 1200, speed: 800 } });
+    const elapsed = Date.now() - startedAt;
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as TraceData & { scroll: { requestedPx: number; scrolledPx: number } };
+    expect(d.summary).toBeDefined();
+    expect(d.summary!.frames.count).toBeGreaterThan(0);
+    expect(d.scroll.requestedPx).toBe(1200);
+    expect(Math.abs(d.scroll.scrolledPx - 1200)).toBeLessThanOrEqual(5);
+    expect(Math.abs((await evaluate('window.scrollY')) as number - 1200)).toBeLessThanOrEqual(5);
+    const events = readTrace(d.path);
+    expect(events.length).toBeGreaterThan(100);
+    // The gesture waits for the profiler to settle: the first wheel comes at least ~500ms into the trace.
+    let firstTs = Infinity;
+    for (const ev of events) if (ev.ph === 'X' && ev.ts < firstTs) firstTs = ev.ts;
+    const wheel = events.find(
+      (ev) => ev.name === 'EventDispatch' && (ev.args?.data as { type?: string } | undefined)?.type === 'wheel'
+    );
+    expect(wheel).toBeDefined();
+    expect((wheel!.ts - firstTs) / 1000).toBeGreaterThanOrEqual(400);
+    // The recording itself (start to stop) lasts durationMs; the call adds the stop and the summary.
+    expect(d.durationMs).toBeGreaterThanOrEqual(3000);
+    expect(d.durationMs).toBeLessThan(4000);
+    expect(elapsed).toBeGreaterThanOrEqual(3000);
+    expect(elapsed).toBeLessThan(8000);
+    await expectNotRecording();
+  }, 60_000);
+
+  it('records a quiet page without a scroll', async () => {
+    await open(quiet.url);
+    const r = await profile({ durationMs: 1000 });
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as TraceData;
+    expect(d.durationMs).toBeGreaterThanOrEqual(1000);
+    expect('scroll' in d).toBe(false);
+    expect(d.summary?.mainThread).not.toBeNull();
+    expect(d.summary!.windowMs).toBeGreaterThan(0);
+  }, 60_000);
+
+  it.each([31000, 999])('rejects durationMs %d without starting a trace', async (durationMs) => {
+    const before = traceDirs();
+    const r = await profile({ durationMs });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/"durationMs"/);
+    await expectNotRecording();
+    expect(traceDirs()).toEqual(before);
+  }, 60_000);
+
+  it('rejects a scroll that does not fit in durationMs before it starts', async () => {
+    const before = traceDirs();
+    const r = await profile({ durationMs: 2000, scroll: { distance: 100000, speed: 800 } });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/125000ms/);
+    expect(r.error).toMatch(/durationMs 2000/);
+    await expectNotRecording();
+    expect(traceDirs()).toEqual(before);
+  }, 60_000);
+
+  it('refuses while a trace is running and leaves that trace running', async () => {
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    const r = await profile({ durationMs: 1000 });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/A trace is already running.*stop it first/i);
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+    made.push(dirname((stop.data as TraceData).path));
+  }, 60_000);
+
+  it('refuses a bad outPath before it records anything', async () => {
+    const dir = scratch();
+    const wrong = await profile({ durationMs: 1000, outPath: join(dir, 'p.json') });
+    expect(wrong.success).toBe(false);
+    expect(wrong.error).toMatch(/must end in \.json\.gz/);
+    await expectNotRecording();
+
+    const taken = join(dir, 'taken.json.gz');
+    writeFileSync(taken, 'mine');
+    const startedAt = Date.now();
+    const r = await profile({ durationMs: 1000, outPath: taken });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/already exists.*overwrite: true/);
+    // Refused at once: no recording ran first.
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+    expect(readFileSync(taken, 'utf8')).toBe('mine');
+    expect(readdirSync(dir).sort()).toEqual(['taken.json.gz']);
+    await expectNotRecording();
+  }, 60_000);
+
+  it('stops the trace and keeps it privately when the scroll fails mid-run', async () => {
+    await open(tall.url);
+    const dir = scratch();
+    const r = await profile({ durationMs: 2000, scroll: { distance: 300, selector: '#nope' }, outPath: join(dir, 'p.json.gz') });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/No element matches selector "#nope"/);
+    const kept = /The partial trace was kept at (\S+)\.$/.exec(r.error ?? '')?.[1];
+    expect(kept, r.error).toBeDefined();
+    made.push(dirname(kept!));
+    // Not at the caller's outPath: a run that failed is not the trace they asked for.
+    expect(readdirSync(dir)).toEqual([]);
+    expect(readTrace(kept!).length).toBeGreaterThan(10);
+    await expectNotRecording();
+    expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+    const stop = await call({ method: 'trace', action: 'stop' });
+    expect(stop.success, stop.error).toBe(true);
+    made.push(dirname((stop.data as TraceData).path));
+  }, 60_000);
+
+  it('replaces an existing file at outPath with overwrite: true', async () => {
+    await open(quiet.url);
+    const dir = scratch();
+    const target = join(dir, 'p.json.gz');
+    writeFileSync(target, 'old');
+    const r = await profile({ durationMs: 1000, outPath: target, overwrite: true });
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as TraceData & { overwritten?: boolean };
+    expect(d.path).toBe(target);
+    expect(d.overwritten).toBe(true);
+    expect(readTrace(target).length).toBeGreaterThan(10);
+    expect(d.summary).toEqual(boundSummary(analyzeTrace(readTrace(target))));
+  }, 60_000);
+
+  it('returns no summary keys with summary: false', async () => {
+    await open(quiet.url);
+    const r = await profile({ durationMs: 1000, summary: false });
+    expect(r.success, r.error).toBe(true);
+    expect('summary' in (r.data as object)).toBe(false);
+    expect('summarySkipped' in (r.data as object)).toBe(false);
   }, 60_000);
 });

@@ -22,6 +22,7 @@ import {
   openTraceSink,
   startTrace,
   stopTrace,
+  validateOutPath,
   writeAll,
   type TraceCdp,
 } from './chrome-trace-capture.js';
@@ -740,5 +741,44 @@ describe('openTraceSink', () => {
     await expect(stopTrace(cdp, { compress: false, sink })).rejects.toThrow('stream gone');
     expect(closes(sink.fd)).toBe(1);
     expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+describe('validateOutPath', () => {
+  it('resolves a free path and creates nothing', () => {
+    const dir = tempDir();
+    expect(validateOutPath({ compress: true, outPath: `${dir}/sub/../a.json.gz` })).toEqual({
+      target: join(dir, 'a.json.gz'), parent: dir, exists: false,
+    });
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it.each([
+    ['a relative path', (_dir: string) => ({ compress: true, outPath: 'a.json.gz' }), /absolute path/],
+    ['the wrong extension', (dir: string) => ({ compress: true, outPath: join(dir, 'a.json') }), /must end in \.json\.gz/],
+    ['a missing parent', (dir: string) => ({ compress: false, outPath: join(dir, 'missing', 'a.json') }), /does not exist/],
+    ['a parent that is a file', (dir: string) => ({ compress: false, outPath: join(dir, 'file', 'a.json') }), /not a directory/],
+    ['a taken path without overwrite', (dir: string) => ({ compress: false, outPath: join(dir, 'taken.json') }), /already exists.*overwrite: true/],
+    ['a directory', (dir: string) => ({ compress: false, outPath: join(dir, 'd.json'), overwrite: true }), /is a directory/],
+    ['a symlink', (dir: string) => ({ compress: false, outPath: join(dir, 'link.json'), overwrite: true }), /is a symlink/],
+  ])('refuses %s and changes nothing', (_label, options, why) => {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'file'), 'f');
+    writeFileSync(join(dir, 'taken.json'), 'mine');
+    mkdirSync(join(dir, 'd.json'));
+    symlinkSync(join(dir, 'taken.json'), join(dir, 'link.json'));
+    const before = readdirSync(dir).sort();
+    expect(() => validateOutPath(options(dir))).toThrow(why);
+    expect(readdirSync(dir).sort()).toEqual(before);
+    expect(readFileSync(join(dir, 'taken.json'), 'utf8')).toBe('mine');
+  });
+
+  it('accepts a regular file with overwrite and leaves it, and the directory, as they were', () => {
+    const dir = tempDir();
+    const target = join(dir, 'b.json');
+    writeFileSync(target, 'old');
+    expect(validateOutPath({ compress: false, outPath: target, overwrite: true })).toEqual({ target, parent: dir, exists: true });
+    expect(readFileSync(target, 'utf8')).toBe('old');
+    expect(readdirSync(dir)).toEqual(['b.json']);
   });
 });
