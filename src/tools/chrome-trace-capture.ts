@@ -386,8 +386,10 @@ interface ActiveTrace {
   compress: boolean;
 }
 
+/** An id mismatch shows only that this call's recording is not the active one, not why. */
 export const TRACE_GONE =
-  'The trace this call started is gone; Chrome ended it with the tab or connection and nothing was kept.';
+  'The trace this call started is no longer the active recording: Chrome ends a trace with its tab or connection, ' +
+  'and another call may have stopped it. This call kept nothing.';
 
 /**
  * One connection's recording: at most one trace at a time, remembered with how
@@ -480,7 +482,14 @@ export class TraceRecorder {
  * else's. What could be written goes to a fresh private directory, unsummarized. It never says a
  * trace ended or that nothing was kept unless Chrome answered; the message names which case it was.
  */
-export async function abandonTrace(recorder: TraceRecorder, cdp: TraceCdp, id: number, failure: string): Promise<string> {
+export async function abandonTrace(
+  recorder: TraceRecorder,
+  cdp: TraceCdp,
+  id: number,
+  failure: string,
+  /** How long to wait for the stream of the best-effort end, so it can be closed. */
+  completeTimeoutMs = 5000
+): Promise<string> {
   if (!recorder.isCurrent(id)) return `${failure} ${TRACE_GONE}`;
   try {
     const out = await recorder.stop(cdp, { id });
@@ -490,14 +499,27 @@ export async function abandonTrace(recorder: TraceRecorder, cdp: TraceCdp, id: n
     // Cleared by the stop: Chrome answered, and the stop's message says what became of the file.
     if (!recorder.isCurrent(id)) return `${failure} Stopping the trace also failed: ${why}`;
     // Still ours and maybe still tracing: the private file could not be made, or Tracing.end got no answer.
+    // Registered before the end, so the stream Chrome hands back can be closed; it is never read.
+    const waiter = new AbortController();
+    const complete = cdp.waitForEvent('Tracing.tracingComplete', completeTimeoutMs, waiter.signal);
+    complete.catch(() => {});
     const end = await cdp.sendCommand('Tracing.end').catch(() => undefined);
+    if (end === undefined || end.error) {
+      waiter.abort();
+    } else {
+      // A completion that does not come within the bound has no stream we could close.
+      const done = await complete.catch(() => undefined);
+      if (typeof done?.stream === 'string' && done.stream !== '') {
+        await cdp.sendCommand('IO.close', { handle: done.stream }).catch(() => {});
+      }
+    }
     if (end === undefined) {
       return (
         `${failure} Stopping the trace also failed (${why}), and Chrome did not answer a request to end it: ` +
         'the trace may still be running. Try chrome({ method: "trace", action: "stop" }) again, or disconnect to end it.'
       );
     }
-    // Chrome answered, so it is not recording this trace any more; its stream is never read.
+    // Chrome answered, so it is not recording this trace any more.
     recorder.release(id);
     return (
       `${failure} Stopping the trace also failed (${why}). Chrome then ended the trace` +

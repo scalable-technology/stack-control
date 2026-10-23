@@ -66,6 +66,8 @@ interface FakeOptions {
   endError?: string;
   /** The first n Tracing.end calls get no answer: they reject, as a CDP timeout does. */
   endRejects?: number;
+  /** tracingComplete never arrives: the wait rejects at its timeout, or when its signal aborts. */
+  completeNever?: boolean;
   /** Runs when IO.read call number n (0-based) arrives, before its chunk is returned. */
   onRead?: (n: number) => void;
 }
@@ -100,6 +102,15 @@ function fake(options: FakeOptions = {}) {
       waiting = true;
       signal = s;
       expect(method).toBe('Tracing.tracingComplete');
+      if (options.completeNever) {
+        return new Promise<Record<string, unknown>>((_resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${method}`)), _timeoutMs);
+          s?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(new Error('aborted'));
+          });
+        });
+      }
       return options.complete ?? { stream: 'stream-1', dataLossOccurred: false };
     }),
   };
@@ -402,7 +413,10 @@ describe('TraceRecorder', () => {
     const old = await rec.start(f.cdp, { compress: false });
     rec.reset();
     const next = await rec.start(f.cdp, { compress: false });
-    await expect(rec.stop(f.cdp, { dir, id: old })).rejects.toThrow(/The trace this call started is gone/);
+    await expect(rec.stop(f.cdp, { dir, id: old })).rejects.toThrow(
+      'The trace this call started is no longer the active recording: Chrome ends a trace with its tab or connection, ' +
+        'and another call may have stopped it. This call kept nothing.'
+    );
     expect(calls(f.sent, 'Tracing.end')).toEqual([]);
     expect(readdirSync(dir)).toEqual([]);
     expect(rec.isCurrent(next)).toBe(true);
@@ -889,6 +903,28 @@ describe('validateOutPath', () => {
 
 describe('abandonTrace', () => {
   const tracesIn = () => readdirSync(tmpdir()).filter((n) => n.startsWith('control-trace-'));
+
+  it('closes the stream Chrome produces for its best-effort end, without reading it', async () => {
+    const f = fake({ endRejects: 1, complete: { stream: 's9', dataLossOccurred: false } });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    expect(message).toMatch(/Chrome then ended the trace; nothing was kept\.$/);
+    expect(calls(f.sent, 'IO.close').map((c) => c.params)).toEqual([{ handle: 's9' }]);
+    expect(calls(f.sent, 'IO.read')).toEqual([]);
+  });
+
+  it('gives up on a completion that never comes within its bound, and says nothing new', async () => {
+    const f = fake({ endRejects: 1, completeNever: true });
+    const rec = new TraceRecorder();
+    const id = await rec.start(f.cdp, { compress: false });
+    const startedAt = Date.now();
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.', 50);
+    expect(Date.now() - startedAt).toBeLessThan(2000);
+    expect(message).toMatch(/Chrome then ended the trace; nothing was kept\.$/);
+    expect(calls(f.sent, 'IO.close')).toEqual([]);
+    expect(rec.running).toBe(false);
+  });
 
   it('touches nothing when the trace it started is gone', async () => {
     const f = fake();

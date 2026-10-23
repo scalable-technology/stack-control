@@ -1991,7 +1991,10 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
   let failure: string | undefined;
   try {
     await sleep(SETTLE_MS);
-    if (input.scroll) {
+    // A tab switch or a new connection during the settle took this trace away: send no input to
+    // whatever page is selected now.
+    if (client !== c || !recorder.isCurrent(id)) failure = 'The profile ended before its scroll.';
+    if (input.scroll && failure === undefined) {
       scroll = await handleScroll({ method: 'scroll', ...input.scroll });
       if (!scroll.success) failure = scroll.error ?? 'The scroll failed';
     }
@@ -2331,8 +2334,9 @@ export const chromeTool: Tool = {
   starts a trace, waits 500ms for the profiler to settle, runs the scroll if
   given (the scroll method's fields), and records for about durationMs
   (1000-30000, default 5000), then stops like trace stop. durationMs is a
-  target, not a deadline: a stalled page can run longer (a scroll is limited
-  to 60s).
+  target, not a deadline: a stalled page can run longer. The 60s scroll limit
+  applies to the gesture's estimated time, not to the call; each CDP step has
+  its own timeout.
   \`chrome({ method: "profile", durationMs: 5000, scroll: { distance: 2400, speed: 800 } })\`
   -> { path, bytes, durationMs, dataLoss, summary, scroll: { requestedPx, scrolledPx, ... } }
   categories, compress, outPath, overwrite and summary work as on trace. These
@@ -2340,12 +2344,14 @@ export const chromeTool: Tool = {
   estimated time does not fit in durationMs, and an outPath that fails its
   checks (absolute, extension, parent is a writable directory, existing file
   rules). A destination that turns bad after that check fails the profile
-  after it recorded. When a profile fails after it started, it stops only its
-  own trace and keeps what could be written in a private temp directory (not
-  at outPath); the error says where, or that nothing was kept (a failure while
-  writing the stream removes the partial file), or that the trace may still be
-  running (stop again, or disconnect to end it). A switch of tab ends the
-  profile's trace with its session.
+  after it recorded. When a profile fails after it started (a failed scroll,
+  a switch of tab), it stops only its own trace, never sends its scroll to
+  another page, and the error says what became of the recording: the partial
+  trace kept in a fresh private temp directory (not at outPath), nothing kept
+  (a failure while writing the stream removes the partial file), or the trace
+  may still be running (stop again, or disconnect to end it). A refused
+  overwrite rename is different: the complete trace stays beside the
+  destination under the temp name the error gives.
   \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
   \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
   \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
