@@ -27,6 +27,7 @@
  * - console        List captured console messages
  * - accessibility  Get accessibility tree
  * - scene          Inspect a live three.js scene graph (__THREE_DEVTOOLS__ hook)
+ * - scroll         Scroll with a real wheel or touch gesture (compositor-driven)
  */
 
 import { EventEmitter } from 'events';
@@ -681,6 +682,47 @@ const WaitInput = z.object({
     .describe('Wait for no network activity for 500ms'),
 });
 
+const ScrollInput = z.object({
+  method: z.literal('scroll'),
+  distance: z
+    .number()
+    .min(-100000)
+    .max(100000)
+    .describe('Pixels to scroll vertically: positive scrolls down, negative scrolls up'),
+  selector: z
+    .string()
+    .optional()
+    .describe('Aim the gesture at the center of this element (default: viewport center)'),
+  speed: z
+    .number()
+    .positive()
+    .max(20000)
+    .optional()
+    .default(800)
+    .describe('Gesture speed in px/s (default: 800)'),
+  source: z
+    .enum(['mouse', 'touch'])
+    .optional()
+    .default('mouse')
+    .describe('mouse = wheel input, touch = finger drag (default: mouse)'),
+  repeat: z
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .optional()
+    .default(0)
+    .describe('Extra times to repeat the gesture after the first (default: 0)'),
+  repeatDelayMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(10000)
+    .optional()
+    .default(250)
+    .describe('Pause between repeats in ms (default: 250)'),
+});
+
 const ChromeInput = z.discriminatedUnion('method', [
   ConnectInput,
   DisconnectInput,
@@ -699,6 +741,7 @@ const ChromeInput = z.discriminatedUnion('method', [
   TypeInput,
   PressInput,
   WaitInput,
+  ScrollInput,
 ]);
 
 // =============================================================================
@@ -1737,6 +1780,103 @@ async function handleWait(input: z.infer<typeof WaitInput>): Promise<ToolResult>
 // Tool Export
 // =============================================================================
 
+// =============================================================================
+// Scroll
+// =============================================================================
+
+/**
+ * JS that finds the scroller under a point: the nearest scrollable ancestor of
+ * the element there, else the document. Used before and after the gesture so
+ * the result says what scrolled, not what was asked of the window.
+ */
+function scrollerProbe(x: number, y: number): string {
+  return `(() => {
+    const root = document.scrollingElement || document.documentElement;
+    let el = document.elementFromPoint(${x}, ${y});
+    while (el && el !== document.documentElement && el !== document.body) {
+      if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight) break;
+      el = el.parentElement;
+    }
+    const s = el && el !== document.documentElement && el !== document.body ? el : root;
+    return { top: s.scrollTop, name: s === root ? 'document' : s.tagName.toLowerCase() + (s.id ? '#' + s.id : '') };
+  })()`;
+}
+
+async function handleScroll(input: z.infer<typeof ScrollInput>): Promise<ToolResult> {
+  if (!client?.isConnected()) {
+    return {
+      success: false,
+      error: 'Not connected. Use chrome({ method: "connect" }) first.',
+    };
+  }
+
+  try {
+    // Hidden pages throttle input and rAF; scroll only a visible tab.
+    const foreground = await ensureForeground(client);
+
+    let point: { x: number; y: number } | null;
+    if (input.selector) {
+      point = (await client.evaluate(
+        `(() => { const el = document.querySelector(${JSON.stringify(input.selector)}); if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`
+      )) as { x: number; y: number } | null;
+      if (!point) return { success: false, error: `No element matches selector "${input.selector}"` };
+    } else {
+      point = (await client.evaluate(
+        '({ x: Math.round(innerWidth / 2), y: Math.round(innerHeight / 2) })'
+      )) as { x: number; y: number };
+    }
+
+    const before = (await client.evaluate(scrollerProbe(point.x, point.y))) as { top: number; name: string };
+    const startedAt = Date.now();
+    const gestures = 1 + input.repeat;
+    const expectedMs = (Math.abs(input.distance) / input.speed) * 1000 * gestures + input.repeat * input.repeatDelayMs;
+
+    // CDP's yDistance is positive for scrolling UP; our distance is positive for down.
+    const response = await client.sendCommand(
+      'Input.synthesizeScrollGesture',
+      {
+        x: point.x,
+        y: point.y,
+        yDistance: -input.distance,
+        speed: input.speed,
+        gestureSourceType: input.source,
+        repeatCount: input.repeat,
+        repeatDelayMs: input.repeatDelayMs,
+      },
+      Math.ceil(expectedMs) + 15000
+    );
+    if (response.error) {
+      return { success: false, error: `Scroll gesture failed: ${response.error.message}` };
+    }
+    const gestureMs = Date.now() - startedAt;
+
+    // Let a smooth-scroll animation finish before reading the position.
+    await new Promise((r) => setTimeout(r, 150));
+    const after = (await client.evaluate(scrollerProbe(point.x, point.y))) as { top: number; name: string };
+
+    return {
+      success: true,
+      data: {
+        source: input.source,
+        scroller: after.name,
+        requestedPx: input.distance * gestures,
+        scrolledPx: after.top - before.top,
+        scrollTopBefore: before.top,
+        scrollTopAfter: after.top,
+        gestureMs,
+        ...(foreground ? { foreground } : {}),
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Scroll failed',
+    };
+  }
+}
+
 export const chromeTool: Tool = {
   name: 'chrome',
   description: `Chrome browser inspection via CDP (Chrome DevTools Protocol).
@@ -1813,6 +1953,15 @@ export const chromeTool: Tool = {
   \`chrome({ method: "wait", selector: ".loaded" })\`
   \`chrome({ method: "wait", networkIdle: true, timeout: 10000 })\`
 
+• **scroll** - Scroll with a REAL wheel (or touch) gesture, not window.scrollTo.
+  Compositor-driven scrolling is what jank depends on. Positive distance scrolls
+  down. Reports what actually scrolled (the page may end first). If exact
+  distances matter, wait about a second between big fast gestures: momentum from
+  the last one can add distance to the next (compare requestedPx with scrolledPx).
+  \`chrome({ method: "scroll", distance: 2400, speed: 480 })\`
+  \`chrome({ method: "scroll", distance: -400, selector: "#panel" })\`
+  \`chrome({ method: "scroll", distance: 300, repeat: 3, source: "touch" })\`
+
 **Hidden-page handling:**
 evaluate, screenshot, and scene auto-detect document.hidden and bring the tab
 to front (macOS occlusion throttles rAF — animation-driven apps freeze under
@@ -1850,6 +1999,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
           'type',
           'press',
           'wait',
+          'scroll',
         ],
         description: 'Chrome operation to perform',
       },
@@ -1957,6 +2107,27 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         type: 'boolean',
         description: 'Wait for no network activity for 500ms',
       },
+      distance: {
+        type: 'number',
+        description: 'scroll: pixels to scroll vertically (positive = down, negative = up)',
+      },
+      speed: {
+        type: 'number',
+        description: 'scroll: gesture speed in px/s (default: 800)',
+      },
+      source: {
+        type: 'string',
+        enum: ['mouse', 'touch'],
+        description: 'scroll: mouse wheel or touch drag (default: mouse)',
+      },
+      repeat: {
+        type: 'number',
+        description: 'scroll: extra times to repeat the gesture (default: 0)',
+      },
+      repeatDelayMs: {
+        type: 'number',
+        description: 'scroll: pause between repeats in ms (default: 250)',
+      },
     },
     required: ['method'],
   },
@@ -2007,6 +2178,8 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         return handlePress(input);
       case 'wait':
         return handleWait(input);
+      case 'scroll':
+        return handleScroll(input);
       default:
         return {
           success: false,
