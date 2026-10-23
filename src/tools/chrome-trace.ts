@@ -209,6 +209,13 @@ interface ProfileChunkData {
   timeDeltas?: number[];
 }
 
+/**
+ * Only a real array counts. An array-like such as { length: 1e309 } would
+ * otherwise drive the sample loop without end, and a sync loop cannot be stopped.
+ */
+const arrayOr = <T>(value: unknown): T[] => (Array.isArray(value) ? value : []);
+const stringOr = (value: unknown): string => (typeof value === 'string' ? value : '');
+
 function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], topFunctions: number): CpuProfile | null {
   if (!Number.isInteger(topFunctions) || topFunctions < 1) {
     throw new RangeError(`topFunctions must be a positive integer, got ${topFunctions}`);
@@ -236,15 +243,16 @@ function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], 
     const nodes = new Map<number, ProfileNode>();
     for (const chunk of chunks) {
       const data = chunk.args?.data as ProfileChunkData | undefined;
-      for (const node of data?.cpuProfile?.nodes ?? []) nodes.set(node.id, node);
+      for (const node of arrayOr<ProfileNode>(data?.cpuProfile?.nodes)) nodes.set(node.id, node);
     }
     const samples: { time: number; node: ProfileNode }[] = [];
     let time = 0;
     for (const chunk of chunks) {
       const data = chunk.args?.data as ProfileChunkData | undefined;
-      const ids = data?.cpuProfile?.samples ?? [];
+      const ids = arrayOr<number>(data?.cpuProfile?.samples);
+      const deltas = arrayOr<unknown>(data?.timeDeltas);
       for (let i = 0; i < ids.length; i++) {
-        const delta = data?.timeDeltas?.[i];
+        const delta = deltas[i];
         if (typeof delta !== 'number' || !Number.isFinite(delta)) continue;
         time += delta;
         const node = nodes.get(ids[i]);
@@ -260,17 +268,18 @@ function analyzeProfile(events: TraceEvent[], main: TraceSummary['mainThread'], 
       if (durationUs === 0) continue;
       sampledUs += durationUs;
       const frame = sample.node.callFrame;
-      if (frame.functionName === '(idle)') idleUs += durationUs;
-      if (frame.functionName === '(program)') programUs += durationUs;
-      if (frame.functionName === '(root)' || frame.functionName === '(idle)' || frame.functionName === '(program)') continue;
-      const url = frame.url ?? '';
+      const functionName = stringOr(frame.functionName);
+      if (functionName === '(idle)') idleUs += durationUs;
+      if (functionName === '(program)') programUs += durationUs;
+      if (functionName === '(root)' || functionName === '(idle)' || functionName === '(program)') continue;
+      const url = stringOr(frame.url);
       const position = (value: number | undefined) =>
         url && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + 1 : null;
-      const identity = JSON.stringify([frame.functionName, url, String(frame.lineNumber), String(frame.columnNumber)]);
+      const identity = JSON.stringify([functionName, url, String(frame.lineNumber), String(frame.columnNumber)]);
       let bucket = buckets.get(identity);
       if (!bucket) {
         buckets.set(identity, (bucket = {
-          name: frame.functionName || '(anonymous)', url,
+          name: functionName || '(anonymous)', url,
           line: position(frame.lineNumber), column: position(frame.columnNumber), selfUs: 0,
         }));
       }

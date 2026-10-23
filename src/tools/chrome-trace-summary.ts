@@ -1,11 +1,12 @@
 /**
- * control/chrome-trace-summary — a short, bounded summary of a trace file
+ * control/chrome-trace-summary — a short summary of a trace file, limited in size
  *
- * Reads a trace that stop just wrote and runs analyzeTrace over it. The trace
- * is data from a page we do not trust: function names, URLs and node names can
- * say anything, including text aimed at whoever reads the result. So the work
- * is capped by size, what comes back is capped by count and length, and a bad
- * or huge file yields a reason instead of an error.
+ * Reads a trace that stop just wrote and runs analyzeTrace over it. Chrome
+ * writes the structure, but function names, URLs and node names come from the
+ * page and can say anything, including text aimed at whoever reads the result.
+ * The input is limited by file size (SUMMARY_MAX_BYTES, decompressed); the
+ * result by count (10 long tasks, 10 hot functions, 10 shifts) and string
+ * length (200). A bad or oversized file yields a reason instead of an error.
  */
 
 import { readFile, stat } from 'node:fs/promises';
@@ -16,8 +17,10 @@ import { analyzeTrace, type TraceEvent, type TraceSummary } from './chrome-trace
 const gunzipAsync = promisify(gunzip);
 
 /**
- * Decompressed size above which the summary is skipped. JSON.parse of a trace
- * costs about 6x its size in memory (98MB / 437k events measured 581MB RSS).
+ * Decompressed size above which the summary is skipped. It limits memory only as
+ * far as the parse cost per byte holds: a real 98MB trace took 581MB RSS, and a
+ * synthetic 120MB one took +506MB plain and +637MB gzipped (raw, inflated and
+ * parsed copies at once), under a second. A trace of heavier events may cost more.
  */
 export const SUMMARY_MAX_BYTES = 128 * 1024 * 1024;
 
@@ -32,11 +35,17 @@ export type BoundedSummary = TraceSummary & {
 const MiB = 1024 * 1024;
 const size = (n: number) => (n >= MiB ? `${Math.round(n / MiB)}MB` : `${n} bytes`);
 
-const round = (n: number) => Math.round(n * 100) / 100;
+function round(n: number): number {
+  const r = Math.round(n * 100) / 100;
+  // n * 100 overflows near 1e308; NaN and Infinity have no rounded value to invent, so they stay as they are.
+  if (!Number.isFinite(r)) return n;
+  return r === 0 ? 0 : r; // -0 reads as a negative score
+}
 const roundOrNull = (n: number | null) => (n === null ? null : round(n));
 
-/** At most MAX_STRING UTF-16 units, ending in an ellipsis when cut; never half a surrogate pair. */
-function truncate(s: string): string {
+/** At most MAX_STRING UTF-16 units, ending in an ellipsis when cut; never half a surrogate pair. Not a string: ''. */
+function truncate(s: unknown): string {
+  if (typeof s !== 'string') return '';
   if (s.length <= MAX_STRING) return s;
   let end = MAX_STRING - 1;
   const last = s.charCodeAt(end - 1);
@@ -44,11 +53,15 @@ function truncate(s: string): string {
   return s.slice(0, end) + '…';
 }
 
+const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+
 export function boundSummary(s: TraceSummary): BoundedSummary {
   const { frames, vitals, profile } = s;
   return {
     windowMs: round(s.windowMs),
-    mainThread: s.mainThread,
+    // The ids come from the file as-is; only numbers may pass.
+    mainThread: s.mainThread && finite(s.mainThread.pid) && finite(s.mainThread.tid)
+      ? { pid: s.mainThread.pid, tid: s.mainThread.tid } : null,
     busyPct: round(s.busyPct),
     // Stable sort: equal durations keep their order in time.
     longTasks: [...s.longTasks]
@@ -118,13 +131,15 @@ export async function summarizeTraceFile(
 
   let raw: Buffer;
   try {
-    // Before the read, so a huge file is never loaded.
+    // Before the read: a file the stat shows over the cap is not loaded.
     const onDisk = (await stat(path)).size;
     if (onDisk > cap) return tooBig(onDisk);
     raw = await readFile(path);
   } catch (error) {
     return { skipped: `The trace file could not be read (${codeOf(error)})` };
   }
+  // The file grew between the stat and the read; already loaded, but not parsed.
+  if (raw.length > cap) return tooBig(raw.length);
 
   let text: Buffer = raw;
   if (options.compressed) {
@@ -137,9 +152,6 @@ export async function summarizeTraceFile(
       }
       return { skipped: 'The trace file is not valid gzip' };
     }
-  } else if (raw.length > cap) {
-    // The file grew between the stat and the read.
-    return tooBig(raw.length);
   }
 
   let parsed: unknown;

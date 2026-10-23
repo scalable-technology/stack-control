@@ -390,6 +390,9 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
     const d = await record({});
     expect(d.summary).toBeDefined();
     const s = d.summary!;
+    // An empty trace also has no long tasks and no shift: these show the recording happened.
+    expect(s.mainThread).not.toBeNull();
+    expect(s.windowMs).toBeGreaterThan(0);
     expect(s.longTasks).toEqual([]);
     expect(s.longTaskCount).toBe(0);
     expect(s.vitals.cls).toBe(0);
