@@ -6,9 +6,10 @@
  * memory or sent back over MCP. Chrome gzips the stream when asked.
  */
 
-import { closeSync, mkdtempSync, openSync, rmSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { closeSync, lstatSync, mkdtempSync, openSync, renameSync, rmSync, statSync, writeSync, type Stats } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { CdpSender } from './cdp-object.js';
 
 export interface TraceCdp extends CdpSender {
@@ -55,6 +56,144 @@ export interface StoppedTrace {
   bytes: number;
   compressed: boolean;
   dataLoss: boolean;
+  /** Present only when overwrite: true replaced a file that was there. */
+  overwritten?: true;
+}
+
+export interface SinkOptions {
+  compress: boolean;
+  /** Parent of the fresh directory when no outPath is given (default: the OS temp directory). */
+  dir?: string;
+  /** An absolute path chosen by the caller. */
+  outPath?: string;
+  overwrite?: boolean;
+}
+
+/** Where a trace is written. commit makes it final; abort removes everything the sink created. */
+export interface TraceSink {
+  path: string;
+  fd: number;
+  /** True when commit will replace a file that was there when the sink was opened. */
+  replaces: boolean;
+  commit(): void;
+  abort(): void;
+}
+
+const kindOf = (s: Stats) =>
+  s.isSymbolicLink() ? 'a symlink' : s.isDirectory() ? 'a directory' : 'a special file';
+
+/** The fd is closed exactly once, whatever mix of commit and abort follows. */
+function closer(fd: number): () => void {
+  let open = true;
+  return () => {
+    if (!open) return;
+    open = false;
+    closeSync(fd);
+  };
+}
+
+/**
+ * Check the path and create the file, before Chrome is asked to end the trace,
+ * so a bad path costs the caller nothing: the recording keeps running.
+ */
+export function openTraceSink(options: SinkOptions): TraceSink {
+  const ext = options.compress ? '.json.gz' : '.json';
+
+  if (options.outPath === undefined) {
+    // A new owner-only directory per trace (mkdtemp makes it 0700 with an unpredictable name):
+    // traces hold URLs and source text, and nothing pre-existing is reused or trusted.
+    const fresh = mkdtempSync(join(options.dir ?? tmpdir(), 'control-trace-'));
+    const path = join(fresh, `trace${ext}`);
+    let fd: number;
+    try {
+      fd = openSync(path, 'wx', 0o600);
+    } catch (error) {
+      rmSync(fresh, { recursive: true, force: true });
+      throw error;
+    }
+    const close = closer(fd);
+    return {
+      path,
+      fd,
+      replaces: false,
+      commit: close,
+      abort: () => {
+        close();
+        rmSync(fresh, { recursive: true, force: true });
+      },
+    };
+  }
+
+  if (!isAbsolute(options.outPath)) {
+    throw new Error(
+      `outPath must be an absolute path, got "${options.outPath}" (~ is not expanded and the server's working directory is not yours)`
+    );
+  }
+  // Collapse .. first, so every check and message is about the path that is really written.
+  const target = resolve(options.outPath);
+  if (!target.endsWith(ext)) {
+    throw new Error(
+      `outPath must end in ${ext} for a trace started with compress: ${options.compress}; got ${target}`
+    );
+  }
+  const parent = dirname(target);
+  let parentStat: Stats;
+  try {
+    parentStat = statSync(parent);
+  } catch {
+    throw new Error(`The directory for outPath does not exist: ${parent}. Create it, or choose another path.`);
+  }
+  if (!parentStat.isDirectory()) throw new Error(`The parent of outPath is not a directory: ${parent}`);
+
+  let existing: Stats | undefined;
+  try {
+    existing = lstatSync(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (existing && !existing.isFile()) {
+    // A rename would replace a symlink rather than write through it, which surprises people.
+    throw new Error(`outPath already exists and is ${kindOf(existing)}, not a regular file; choose another path: ${target}`);
+  }
+  if (existing && options.overwrite !== true) {
+    throw new Error(`outPath already exists: ${target}. Pass overwrite: true to replace it, or choose another path.`);
+  }
+
+  if (options.overwrite !== true) {
+    // O_EXCL: fails if anything, even a symlink, appeared since the check.
+    const fd = openSync(target, 'wx', 0o600);
+    const close = closer(fd);
+    return {
+      path: target,
+      fd,
+      replaces: false,
+      commit: close,
+      abort: () => {
+        close();
+        // Created by us a moment ago, so ours to remove.
+        rmSync(target, { force: true });
+      },
+    };
+  }
+
+  // Write beside the target and rename over it on success: the old file is untouched until then,
+  // and rename replaces whatever is at the path without following it.
+  const temp = join(parent, `.${basename(target)}.${randomBytes(6).toString('hex')}.tmp`);
+  const fd = openSync(temp, 'wx', 0o600);
+  const close = closer(fd);
+  return {
+    path: target,
+    fd,
+    replaces: existing !== undefined,
+    commit: () => {
+      close();
+      renameSync(temp, target);
+    },
+    abort: () => {
+      close();
+      rmSync(temp, { force: true });
+    },
+  };
 }
 
 export async function startTrace(cdp: TraceCdp, options: StartOptions): Promise<void> {
@@ -84,63 +223,62 @@ export function writeAll(write: (buf: Buffer, offset: number) => number, buf: Bu
 
 export async function stopTrace(
   cdp: TraceCdp,
-  options: { compress: boolean; dir?: string; maxBytes?: number; deadlineMs?: number }
+  options: { compress: boolean; dir?: string; maxBytes?: number; deadlineMs?: number; sink?: TraceSink }
 ): Promise<StoppedTrace> {
-  // Register for the completion event before ending, so a fast finish is not missed.
-  const waiter = new AbortController();
-  const complete = cdp.waitForEvent('Tracing.tracingComplete', COMPLETE_TIMEOUT_MS, waiter.signal);
-  complete.catch(() => {});
+  // The file exists before Chrome is asked to end: if it cannot be made, the recording is untouched.
+  const sink = options.sink ?? openTraceSink({ compress: options.compress, dir: options.dir });
+  let stream: string | undefined;
   try {
-    const end = await cdp.sendCommand('Tracing.end');
-    if (end.error) throw new Error(end.error.message);
-  } catch (error) {
-    waiter.abort();
-    throw error;
-  }
-  const done = await complete;
+    // Register for the completion event before ending, so a fast finish is not missed.
+    const waiter = new AbortController();
+    const complete = cdp.waitForEvent('Tracing.tracingComplete', COMPLETE_TIMEOUT_MS, waiter.signal);
+    complete.catch(() => {});
+    try {
+      const end = await cdp.sendCommand('Tracing.end');
+      if (end.error) throw new Error(end.error.message);
+    } catch (error) {
+      waiter.abort();
+      throw error;
+    }
+    const done = await complete;
 
-  const stream = done.stream;
-  if (typeof stream !== 'string' || stream === '') {
-    throw new Error('Chrome finished the trace without a stream handle');
-  }
+    if (typeof done.stream !== 'string' || done.stream === '') {
+      throw new Error('Chrome finished the trace without a stream handle');
+    }
+    // From here the Chrome-side stream is held, so it is closed in the finally below.
+    const handle = done.stream;
+    stream = handle;
 
-  // From here the Chrome-side stream is held, so everything below sits inside the cleanup.
-  const maxBytes = options.maxBytes ?? MAX_TRACE_BYTES;
-  const deadline = Date.now() + (options.deadlineMs ?? DRAIN_DEADLINE_MS);
-  let fresh: string | undefined;
-  let fd: number | undefined;
-  try {
-    // A new owner-only directory per trace (mkdtemp makes it 0700 with an unpredictable name):
-    // traces hold URLs and source text, and nothing pre-existing is reused or trusted.
-    fresh = mkdtempSync(join(options.dir ?? tmpdir(), 'control-trace-'));
-    const path = join(fresh, options.compress ? 'trace.json.gz' : 'trace.json');
-    fd = openSync(path, 'wx', 0o600);
-    const out = fd;
-
+    const maxBytes = options.maxBytes ?? MAX_TRACE_BYTES;
+    const deadline = Date.now() + (options.deadlineMs ?? DRAIN_DEADLINE_MS);
     let bytes = 0;
     for (;;) {
       if (Date.now() > deadline) throw new Error('Reading the trace from Chrome took too long; giving up');
-      const r = await cdp.sendCommand('IO.read', { handle: stream, size: READ_CHUNK_BYTES });
+      const r = await cdp.sendCommand('IO.read', { handle, size: READ_CHUNK_BYTES });
       if (r.error) throw new Error(r.error.message);
       const chunk = r.result as { data?: string; eof?: boolean; base64Encoded?: boolean };
       if (chunk.data) {
         const buf = Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8');
-        bytes += writeAll((b, offset) => writeSync(out, b, offset), buf);
+        bytes += writeAll((b, offset) => writeSync(sink.fd, b, offset), buf);
         if (bytes > maxBytes) {
           throw new Error(`The trace exceeds ${Math.round(maxBytes / (1024 * 1024))}MB; record a shorter run`);
         }
       }
       if (chunk.eof) break;
     }
-    closeSync(out);
-    fd = undefined;
-    return { path, bytes, compressed: options.compress, dataLoss: done.dataLossOccurred === true };
+    sink.commit();
+    return {
+      path: sink.path,
+      bytes,
+      compressed: options.compress,
+      dataLoss: done.dataLossOccurred === true,
+      ...(sink.replaces ? { overwritten: true as const } : {}),
+    };
   } catch (error) {
-    if (fd !== undefined) closeSync(fd);
-    if (fresh) rmSync(fresh, { recursive: true, force: true });
+    sink.abort();
     throw error;
   } finally {
-    await cdp.sendCommand('IO.close', { handle: stream }).catch(() => {});
+    if (stream !== undefined) await cdp.sendCommand('IO.close', { handle: stream }).catch(() => {});
   }
 }
 
@@ -167,15 +305,20 @@ export class TraceRecorder {
     this.active = { startedAt: Date.now(), compress: options.compress };
   }
 
-  async stop(cdp: TraceCdp, options: { dir?: string } = {}): Promise<StoppedTrace & { durationMs: number }> {
+  async stop(
+    cdp: TraceCdp,
+    options: { dir?: string; outPath?: string; overwrite?: boolean } = {}
+  ): Promise<StoppedTrace & { durationMs: number }> {
     const trace = this.active;
     if (!trace) {
       throw new Error('No trace is running. Start one with chrome({ method: "trace", action: "start" }).');
     }
     // The recording ends when stop is called; flushing and downloading come after.
     const durationMs = Date.now() - trace.startedAt;
+    // Outside the try: a bad path leaves the trace running, so the caller can fix it and stop again.
+    const sink = openTraceSink({ compress: trace.compress, ...options });
     try {
-      const out = await stopTrace(cdp, { compress: trace.compress, dir: options.dir });
+      const out = await stopTrace(cdp, { compress: trace.compress, sink });
       return { ...out, durationMs };
     } finally {
       // Worked or not, Chrome has ended this trace.

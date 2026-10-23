@@ -1,5 +1,6 @@
-import { readFileSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
@@ -52,6 +53,9 @@ describe('chrome trace: input validation', () => {
     [{ method: 'trace', action: 'start', categories: ['a,b'] }, 'categories'],
     [{ method: 'trace', action: 'start', categories: [] }, 'categories'],
     [{ method: 'trace', action: 'start', compress: 'yes' }, 'compress'],
+    [{ method: 'trace', action: 'stop', outPath: '' }, 'outPath'],
+    [{ method: 'trace', action: 'stop', outPath: '/tmp/a\0b.json.gz' }, 'outPath'],
+    [{ method: 'trace', action: 'stop', overwrite: 'yes' }, 'overwrite'],
   ])('rejects %j and names the field %s', async (input, field) => {
     const r = await call(input);
     expect(r.success).toBe(false);
@@ -153,6 +157,34 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     expect(events.length).toBeGreaterThan(10);
     expect(countOf(events, 'DrawFrame')).toBe(0);
     expect(countOf(events, 'FireAnimationFrame')).toBe(0);
+  }, 60_000);
+
+  it('writes to a chosen outPath, and a taken path leaves the trace running', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'control-trace-out-'));
+    try {
+      const target = join(dir, 'scroll.json.gz');
+      expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+      await new Promise((r) => setTimeout(r, 300));
+      const e = await call({ method: 'trace', action: 'stop', outPath: target });
+      expect(e.success, e.error).toBe(true);
+      const d = e.data as TraceData;
+      expect(d.path).toBe(target);
+      expect(statSync(target).size).toBe(d.bytes);
+      expect(statSync(target).mode & 0o777).toBe(0o600);
+      expect(readTrace(target).length).toBeGreaterThan(50);
+
+      expect((await call({ method: 'trace', action: 'start' })).success).toBe(true);
+      const taken = await call({ method: 'trace', action: 'stop', outPath: target });
+      expect(taken.success).toBe(false);
+      expect(taken.error).toMatch(/already exists.*overwrite: true/);
+      const other = join(dir, 'second.json.gz');
+      const again = await call({ method: 'trace', action: 'stop', outPath: other });
+      expect(again.success, again.error).toBe(true);
+      expect(readTrace(other).length).toBeGreaterThan(10);
+      expect(existsSync(target)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it('refuses to stop when nothing is recording and to start twice', async () => {
