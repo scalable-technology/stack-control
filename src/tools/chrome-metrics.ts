@@ -4,8 +4,11 @@
  * Counters come from Chrome (Performance.getMetrics). Vitals come from one script that asks
  * PerformanceObserver for what the browser has buffered since load. It runs in an isolated world
  * Chrome makes for it, so the page's own scripts (a replaced PerformanceObserver or String
- * prototype) are not there; the entries are the browser's. It never falls back to the page's
- * world. What comes back is still checked here: arrays, finite numbers in a sane range, short strings.
+ * prototype) are not there and the entries are the browser's, except in a rare race with a
+ * navigation that replaces the page between creating the world and reading it: the world is
+ * addressed by a numeric context id, which a new document can reuse. It never falls back to the
+ * page's world. What comes back is validated and bounded here either way: arrays, finite numbers
+ * in a sane range, short strings.
  */
 
 import type { ToolResult } from '../types.js';
