@@ -727,7 +727,7 @@ const WaitInput = z.object({
     .describe('Wait for no network activity for 500ms'),
 });
 
-const ScrollInput = z.object({
+export const ScrollInput = z.object({
   method: z.literal('scroll'),
   distance: z
     .number()
@@ -784,7 +784,7 @@ const traceOutPath = z
 const traceOverwrite = z.boolean().optional().default(false);
 const traceSummary = z.boolean().optional().default(true);
 
-const TraceInput = z.object({
+export const TraceInput = z.object({
   method: z.literal('trace'),
   action: z.enum(['start', 'stop']).describe('start recording, or stop and write the trace file'),
   categories: traceCategories.describe(
@@ -800,7 +800,7 @@ const TraceInput = z.object({
   ),
 });
 
-const ProfileInput = z.object({
+export const ProfileInput = z.object({
   method: z.literal('profile'),
   durationMs: z
     .number()
@@ -2260,6 +2260,42 @@ async function handleScroll(input: z.infer<typeof ScrollInput>): Promise<ToolRes
   }
 }
 
+/**
+ * The scroll fields in JSON schema, for the scroll method and profile's scroll. Advisory: zod
+ * (ScrollInput) is the contract, and chrome-schema.test.ts keeps the bounds equal.
+ */
+const SCROLL_FIELDS_SCHEMA = {
+  distance: {
+    type: 'number',
+    minimum: -100000,
+    maximum: 100000,
+    description: 'scroll: pixels to scroll vertically (positive = down, negative = up)',
+  },
+  speed: {
+    type: 'integer',
+    exclusiveMinimum: 0,
+    maximum: 20000,
+    description: 'scroll: gesture speed in px/s (default: 800)',
+  },
+  source: {
+    type: 'string',
+    enum: ['mouse', 'touch'],
+    description: 'scroll: mouse wheel or touch drag (default: mouse)',
+  },
+  repeat: {
+    type: 'integer',
+    minimum: 0,
+    maximum: 100,
+    description: 'scroll: extra times to repeat the gesture (default: 0)',
+  },
+  repeatDelayMs: {
+    type: 'integer',
+    minimum: 0,
+    maximum: 10000,
+    description: 'scroll: pause between repeats in ms (default: 250)',
+  },
+};
+
 export const chromeTool: Tool = {
   name: 'chrome',
   description: `Chrome browser inspection via CDP (Chrome DevTools Protocol).
@@ -2588,11 +2624,13 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       action: {
         type: 'string',
         enum: ['start', 'stop'],
-        description: 'trace: start recording, or stop and write the trace file',
+        description: 'trace: start recording, or stop and write the trace file; required when method is trace',
       },
       categories: {
         type: 'array',
-        items: { type: 'string' },
+        items: { type: 'string', maxLength: 200 },
+        minItems: 1,
+        maxItems: 60,
         description: 'trace start, profile: Chrome trace categories (default: DevTools Performance set plus frame and input)',
       },
       compress: {
@@ -2601,6 +2639,8 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       },
       outPath: {
         type: 'string',
+        minLength: 1,
+        maxLength: 4096,
         description:
           'trace stop, profile: absolute path for the trace file instead of a fresh temp directory; must end in .json.gz (.json with compress: false)',
       },
@@ -2614,35 +2654,19 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
           'trace stop, profile: return a summary of the trace with the path, capped in count and length (default: true); false skips it',
       },
       durationMs: {
-        type: 'number',
+        type: 'integer',
+        minimum: 1000,
+        maximum: 30000,
         description: 'profile: target recording length in ms (1000-30000, default: 5000); a stalled page can run longer',
       },
       scroll: {
         type: 'object',
+        properties: { ...SCROLL_FIELDS_SCHEMA, selector: { type: 'string', description: 'aim the gesture at the center of this element' } },
+        required: ['distance'],
         description:
           'profile: a scroll gesture to run during the recording, with the scroll method\'s fields (distance, speed, selector, source, repeat, repeatDelayMs)',
       },
-      distance: {
-        type: 'number',
-        description: 'scroll: pixels to scroll vertically (positive = down, negative = up)',
-      },
-      speed: {
-        type: 'number',
-        description: 'scroll: gesture speed in px/s (default: 800)',
-      },
-      source: {
-        type: 'string',
-        enum: ['mouse', 'touch'],
-        description: 'scroll: mouse wheel or touch drag (default: mouse)',
-      },
-      repeat: {
-        type: 'number',
-        description: 'scroll: extra times to repeat the gesture (default: 0)',
-      },
-      repeatDelayMs: {
-        type: 'number',
-        description: 'scroll: pause between repeats in ms (default: 250)',
-      },
+      ...SCROLL_FIELDS_SCHEMA,
     },
     required: ['method'],
   },
