@@ -1,6 +1,7 @@
 import { tmpdir } from 'node:os';
 import { basename } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
 import { chromeTool } from './chrome.js';
 import {
   chromeAvailable,
@@ -307,4 +308,78 @@ describe.skipIf(!chromeAvailable)('chrome scroll: a page that lies', () => {
     expect(r.error).toMatch(/gesture point/i);
     expect(await evaluate('window.__pwned')).toBeUndefined();
   }, 30_000);
+});
+
+describe.skipIf(!chromeAvailable)('chrome connection: commands in flight when it ends', () => {
+  let browser: TestBrowser;
+  const HANG = 'new Promise(() => {})';
+
+  beforeAll(async () => {
+    browser = await launchTestBrowser();
+  }, 60_000);
+
+  afterAll(async () => {
+    await call({ method: 'disconnect' });
+    await browser?.close();
+  }, 30_000);
+
+  /** A new tab, connected. */
+  const freshTab = async (): Promise<string> => {
+    const created = await fetch(`http://127.0.0.1:${browser.port}/json/new?about:blank`, { method: 'PUT' });
+    const tab = (await created.json()) as { id: string };
+    const c = await call({ method: 'connect', port: browser.port, targetId: tab.id });
+    expect(c.success, c.error).toBe(true);
+    return tab.id;
+  };
+
+  /** Starts an evaluate that never settles; resolves, once its command is on the socket, with the call (boxed, so it is not awaited). */
+  const hangingEvaluate = async () => {
+    const real = WebSocket.prototype.send;
+    let sent!: () => void;
+    const onSocket = new Promise<void>((r) => (sent = r));
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      if (typeof data === 'string' && data.includes(HANG)) sent();
+      return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
+    const pending = call({ method: 'evaluate', expression: HANG });
+    try {
+      await onSocket;
+    } finally {
+      spy.mockRestore();
+    }
+    return { pending };
+  };
+
+  const within = async <T>(p: Promise<T>, ms: number): Promise<T | 'still pending'> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([p, new Promise<'still pending'>((r) => (timer = setTimeout(() => r('still pending'), ms)))]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  it('ends an evaluate in flight at once when its tab closes', async () => {
+    const id = await freshTab();
+    const { pending } = await hangingEvaluate();
+    const startedAt = Date.now();
+    await fetch(`http://127.0.0.1:${browser.port}/json/close/${id}`);
+    const r = await within(pending, 5000);
+    expect(r).not.toBe('still pending');
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+    const result = r as Awaited<typeof pending>;
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Connection to Chrome closed/);
+  }, 60_000);
+
+  it('ends an evaluate in flight at once on disconnect', async () => {
+    await freshTab();
+    const { pending } = await hangingEvaluate();
+    const startedAt = Date.now();
+    await call({ method: 'disconnect' });
+    const r = await within(pending, 5000);
+    expect(r).not.toBe('still pending');
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+    expect((r as Awaited<typeof pending>).error).toMatch(/Connection to Chrome closed/);
+  }, 60_000);
 });

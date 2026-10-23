@@ -336,8 +336,7 @@ export class ChromeCDPClient extends EventEmitter {
         // event must not mark the newer connection as closed.
         if (this.ws !== socket) return;
         this.connected = false;
-        this.epoch++;
-        this.emit('teardown');
+        this.endSession();
         this.emit('close');
       };
 
@@ -480,23 +479,29 @@ export class ChromeCDPClient extends EventEmitter {
     const command: CDPCommand = { id, method, params };
 
     return new Promise((resolve, reject) => {
-      this.pendingCommands.set(id, { resolve, reject });
-
       const timeout = setTimeout(() => {
         this.pendingCommands.delete(id);
         reject(new Error(`Command ${method} timed out after ${timeoutMs / 1000}s`));
       }, timeoutMs);
-
-      this.ws!.send(JSON.stringify(command));
-
-      const originalResolve = this.pendingCommands.get(id)!.resolve;
+      // However the command settles, its timer goes with it, so nothing holds the event loop.
       this.pendingCommands.set(id, {
         resolve: (response) => {
           clearTimeout(timeout);
-          originalResolve(response);
+          resolve(response);
         },
-        reject,
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
       });
+
+      try {
+        this.ws!.send(JSON.stringify(command));
+      } catch (error) {
+        this.pendingCommands.delete(id);
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -536,10 +541,21 @@ export class ChromeCDPClient extends EventEmitter {
       this.ws = null;
     }
     this.connected = false;
-    this.pendingCommands.clear();
+    this.endSession();
+  }
+
+  /**
+   * The session is over: Chrome will answer nothing more on it. Teardown (the trace recorder resets)
+   * and the rejection of every command in flight happen in one synchronous step, so code awaiting a
+   * command resumes after both and sees the reset, instead of waiting out the command's timeout.
+   */
+  private endSession(): void {
     this.epoch++;
     // Chrome ends a session's trace with the session; listeners drop what depended on it.
     this.emit('teardown');
+    const pending = [...this.pendingCommands.values()];
+    this.pendingCommands.clear();
+    for (const command of pending) command.reject(new Error('Connection to Chrome closed'));
   }
 
   disconnect(): void {

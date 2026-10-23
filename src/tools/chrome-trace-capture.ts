@@ -408,6 +408,9 @@ interface ActiveTrace {
   compress: boolean;
 }
 
+const CLOSED_DURING_STOP =
+  'The connection to Chrome closed during stop; Chrome ends a trace with its session, so nothing was kept.';
+
 /** An id mismatch shows only that this call's recording is not the active one, not why. */
 export const TRACE_GONE =
   'The trace this call started is no longer the active recording: Chrome ends a trace with its tab or connection, ' +
@@ -494,6 +497,12 @@ export class TraceRecorder {
       return { ...out, durationMs };
     } catch (error) {
       stillRunning = mayStillRun(error);
+      // No answer to the end because the session itself ended (the recorder was reset with it):
+      // Chrome ended the trace with the session, so it is not running.
+      if (stillRunning && this.active !== trace) {
+        stillRunning = false;
+        throw new Error(CLOSED_DURING_STOP, { cause: error });
+      }
       throw error;
     } finally {
       // Chrome has ended this trace unless Tracing.end got no answer. Only this trace is cleared:
@@ -548,6 +557,14 @@ export async function abandonTrace(
       if (typeof done?.stream === 'string' && done.stream !== '') {
         await cdp.sendCommand('IO.close', { handle: done.stream }).catch(() => {});
       }
+    }
+    if (end === undefined && !recorder.isCurrent(id)) {
+      // No answer because the session ended (the recorder was reset with it), and the trace with it.
+      // The first stop's message is left out: its "may still be running" is no longer true.
+      return (
+        `${failure} Stopping the trace failed, and then the connection to Chrome closed: ` +
+        'Chrome ends a trace with its session, so nothing was kept.'
+      );
     }
     if (end === undefined) {
       return (

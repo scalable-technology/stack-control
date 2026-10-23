@@ -302,7 +302,8 @@ describe.skipIf(!chromeAvailable)('chrome trace: recording in headless Chrome', 
     const stopping = call({ method: 'trace', action: 'stop' });
     await fetch(`http://127.0.0.1:${browser.port}/json/close/${doomed.id}`);
     await stopping; // either outcome is fine; what matters is that it comes back quickly
-    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    // A closed tab ends every command in flight at once; 10s leaves room for a loaded machine.
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
 
     const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
     const original = targets.find((x) => x.url.startsWith(server.url));

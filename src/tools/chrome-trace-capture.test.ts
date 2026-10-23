@@ -21,6 +21,7 @@ import {
   TRACE_GONE,
   TraceRecorder,
   TraceStartUncertainError,
+  TraceStillRunningError,
   abandonTrace,
   openTraceSink,
   startTrace,
@@ -71,6 +72,8 @@ interface FakeOptions {
   startRejects?: boolean;
   /** tracingComplete never arrives: the wait rejects at its timeout, or when its signal aborts. */
   completeNever?: boolean;
+  /** Runs when Tracing.end arrives, before it is answered or rejected (a session can end here). */
+  onEnd?: () => void;
   /** Runs when IO.read call number n (0-based) arrives, before its chunk is returned. */
   onRead?: (n: number) => void;
 }
@@ -89,6 +92,7 @@ function fake(options: FakeOptions = {}) {
     sendCommand: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       sent.push({ method, params });
       if (method === 'Tracing.start' && options.startRejects) throw new Error('Command Tracing.start timed out after 30s');
+      if (method === 'Tracing.end') options.onEnd?.();
       if (method === 'Tracing.end' && endRejects > 0) {
         endRejects--;
         throw new Error('Command Tracing.end timed out after 30s');
@@ -522,6 +526,21 @@ describe('TraceRecorder', () => {
     // Chrome ends a trace with its session, so nothing may be running: the plain error comes back.
     expect(failed).not.toBeInstanceOf(TraceStartUncertainError);
     expect((failed as Error).message).toBe('socket closed');
+    expect(rec.running).toBe(false);
+  });
+
+  it('says the connection closed, not "may still be running", when the session ends during the end', async () => {
+    const dir = tempDir();
+    const rec = new TraceRecorder();
+    // The socket drops while Tracing.end is in flight: teardown resets the recorder, then the end rejects.
+    const f = fake({ endRejects: 1, onEnd: () => rec.reset() });
+    const id = await rec.start(f.cdp, { compress: false });
+    const error = (await rec.stop(f.cdp, { dir, id }).catch((e: unknown) => e)) as Error;
+    expect(error.message).toBe(
+      'The connection to Chrome closed during stop; Chrome ends a trace with its session, so nothing was kept.'
+    );
+    expect(error).not.toBeInstanceOf(TraceStillRunningError);
+    expect(readdirSync(dir)).toEqual([]);
     expect(rec.running).toBe(false);
   });
 
@@ -1039,6 +1058,21 @@ describe('abandonTrace', () => {
     expect(path, message).toBeDefined();
     dirs.push(dirname(path!));
     expect(calls(f.sent, 'Tracing.end')).toHaveLength(1);
+    expect(rec.running).toBe(false);
+  });
+
+  it('says the connection closed when the session ends during its best-effort end', async () => {
+    const rec = new TraceRecorder();
+    let ends = 0;
+    // The first end gets no answer; the session ends during the second.
+    const f = fake({ endRejects: 2, onEnd: () => { if (++ends === 2) rec.reset(); } });
+    const id = await rec.start(f.cdp, { compress: false });
+    const message = await abandonTrace(rec, f.cdp, id, 'Scroll failed.');
+    expect(message).toBe(
+      'Scroll failed. Stopping the trace failed, and then the connection to Chrome closed: ' +
+        'Chrome ends a trace with its session, so nothing was kept.'
+    );
+    expect(message).not.toMatch(/may still be running/);
     expect(rec.running).toBe(false);
   });
 
