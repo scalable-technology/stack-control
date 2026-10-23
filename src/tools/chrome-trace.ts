@@ -4,9 +4,10 @@
  * Pure functions over Chrome trace events (the `traceEvents` array that
  * DevTools exports and Perfetto opens). No Chrome, no I/O: unit-testable.
  *
- * Reads complete ('X') events only; begin/end and async events are ignored.
- * The main thread is the CrRendererMain thread named by a thread_name
- * metadata event. A trace without one gives mainThread null and zeros.
+ * Task timing reads complete ('X') events; frames and vitals read instants
+ * and marks. Begin/end and async events are ignored. The main thread is the
+ * CrRendererMain thread named by a thread_name metadata event. Without one,
+ * mainThread is null and main-thread timing is zero.
  */
 
 export interface TraceEvent {
@@ -62,6 +63,23 @@ export interface FrameStats {
   chromeDroppedDrawn: number;
 }
 
+export interface LayoutShift {
+  /** Milliseconds from the start of the trace window (same origin as longTasks[].startMs). */
+  atMs: number;
+  score: number;
+}
+
+export interface Vitals {
+  /** Largest contentful paint; null when there is no candidate or no navigationStart before it. */
+  lcp: { ms: number; type: string; nodeName: string; size: number } | null;
+  /** Worst session window across all frames; whether to filter frames remains open. */
+  cls: number;
+  /** How many shifts were counted (had_recent_input excluded). */
+  shiftCount: number;
+  /** Counted shifts, largest score first, at most 10. */
+  shifts: LayoutShift[];
+}
+
 export interface AnalyzeOptions {
   /** One vsync interval. Default 1000/60; pass 1000/120 for a 120Hz display. */
   frameBudgetMs?: number;
@@ -74,6 +92,7 @@ export interface TraceSummary {
   longTasks: LongTask[];
   categoryMs: CategoryMs;
   frames: FrameStats;
+  vitals: Vitals;
 }
 
 const DEFAULT_FRAME_BUDGET_MS = 1000 / 60;
@@ -139,6 +158,68 @@ function analyzeFrames(events: TraceEvent[], budgetMs: number): FrameStats {
     dropped: gaps.reduce((n, g) => n + Math.max(0, Math.round(g / budgetMs) - 1), 0),
     chromeDropped,
     chromeDroppedDrawn,
+  };
+}
+
+function analyzeVitals(events: TraceEvent[], windowStart: number): Vitals {
+  const shifts: { ts: number; score: number }[] = [];
+  const navigations: TraceEvent[] = [];
+  let candidate: TraceEvent | null = null;
+  for (const e of events) {
+    if (e.name === 'LayoutShift' && (e.ph === 'I' || e.ph === 'i')) {
+      const data = e.args?.data as Record<string, unknown> | undefined;
+      if (data?.had_recent_input === true) continue;
+      if (typeof data?.score !== 'number' || !Number.isFinite(data.score)) continue;
+      shifts.push({ ts: e.ts, score: data.score });
+    } else if (e.name === 'navigationStart' && e.ph === 'R') {
+      navigations.push(e);
+    } else if (e.name === 'largestContentfulPaint::Candidate' && (e.ph === 'R' || e.ph === 'I' || e.ph === 'i')) {
+      const data = e.args?.data as Record<string, unknown> | undefined;
+      const isMain = data?.isOutermostMainFrame === undefined
+        ? data?.isMainFrame === true : data.isOutermostMainFrame === true;
+      if (isMain && (!candidate || e.ts > candidate.ts)) candidate = e;
+    }
+  }
+
+  shifts.sort((a, b) => a.ts - b.ts);
+  const origin = Number.isFinite(windowStart) ? windowStart : (shifts[0]?.ts ?? 0);
+  let cls = 0;
+  let sessionScore = 0;
+  let sessionStart = shifts[0]?.ts ?? 0;
+  let previousTs = sessionStart;
+  for (const shift of shifts) {
+    if ((shift.ts - previousTs) / 1000 > 1000 || (shift.ts - sessionStart) / 1000 >= 5000) {
+      cls = Math.max(cls, sessionScore);
+      sessionScore = 0;
+      sessionStart = shift.ts;
+    }
+    sessionScore += shift.score;
+    previousTs = shift.ts;
+  }
+  cls = Math.max(cls, sessionScore);
+
+  let lcp: Vitals['lcp'] = null;
+  if (candidate && typeof candidate.args?.frame === 'string') {
+    let navigation: TraceEvent | null = null;
+    for (const e of navigations) {
+      if (e.args?.frame === candidate.args.frame && e.ts <= candidate.ts && (!navigation || e.ts > navigation.ts)) {
+        navigation = e;
+      }
+    }
+    if (navigation) {
+      const data = candidate.args.data as Record<string, unknown>;
+      lcp = {
+        ms: (candidate.ts - navigation.ts) / 1000,
+        type: typeof data.type === 'string' ? data.type : '',
+        nodeName: typeof data.nodeName === 'string' ? data.nodeName : '',
+        size: typeof data.size === 'number' ? data.size : 0,
+      };
+    }
+  }
+  return {
+    lcp, cls, shiftCount: shifts.length,
+    shifts: shifts.sort((a, b) => b.score - a.score).slice(0, 10)
+      .map((s) => ({ atMs: (s.ts - origin) / 1000, score: s.score })),
   };
 }
 
@@ -294,5 +375,6 @@ export function analyzeTrace(events: TraceEvent[], options: AnalyzeOptions = {})
       })),
     categoryMs: selfTimeByCategory(mainSpans),
     frames: analyzeFrames(events, options.frameBudgetMs ?? DEFAULT_FRAME_BUDGET_MS),
+    vitals: analyzeVitals(events, windowStart),
   };
 }
