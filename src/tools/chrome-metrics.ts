@@ -2,10 +2,11 @@
  * control/chrome-metrics — a cheap snapshot of a page's counters and web vitals, without a trace
  *
  * Metrics come from Chrome (Performance.getMetrics). Node, document, frame and listener counts
- * and the heap are true at any instant. Layout, style, script and task counters are not: Chrome
- * counts them only while the Performance domain is enabled, and keeps them across a disable, so a
- * read made right after enable is about 0. They are returned only as a window: two reads sampleMs
- * apart with the domain enabled between them, and the difference. Vitals come from one script that asks
+ * and the heap are true at any instant (per renderer process). Layout, style, script and task
+ * counters are not: Chrome keeps them per CDP session, counts only while that session has the
+ * Performance domain enabled, and keeps them across a disable, so a read made right after enable
+ * is about 0. They are returned only as a window: two reads of our session sampleMs apart with
+ * the domain enabled between them, and the difference. Vitals come from one script that asks
  * PerformanceObserver for what the browser has buffered since load. It runs in an isolated world
  * Chrome makes for it, so the page's own scripts (a replaced PerformanceObserver or String
  * prototype) are not there and the entries are the browser's. The world is addressed by the unique
@@ -130,8 +131,11 @@ export function metricsWindow(a: unknown, b: unknown, wallMs: number): MetricsWi
     const x = before.get(name);
     const y = after.get(name);
     if (x === undefined || y === undefined) return null;
-    const d = seconds ? round2((y - x) * 1000) : y - x;
-    return finite(d) && d >= 0 ? (d === 0 ? 0 : d) : null;
+    // The sign of the raw difference: rounding first would turn a fall of 1e-6s into a valid 0.
+    const raw = y - x;
+    if (!finite(raw) || raw < 0) return null;
+    const d = seconds ? round2(raw * 1000) : raw;
+    return finite(d) ? d : null;
   };
   const stamped = before.has('Timestamp') && after.has('Timestamp');
   const ms = stamped ? delta('Timestamp', true) : finite(wallMs) && wallMs >= 0 ? round2(wallMs) : null;
@@ -335,7 +339,7 @@ export interface ReadMetricsOptions {
   contextWaitMs?: number;
   /** Read the counters twice, this many ms apart, and return what they counted in between. */
   sampleMs?: number;
-  /** The clock the window is waited and measured on; a test can move it. */
+  /** The monotonic clock the window is waited and measured on (performance.now); a test can move it. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -392,7 +396,8 @@ export async function readMetrics(
 ): Promise<ToolResult> {
   const changed = { success: false, error: TAB_CHANGED };
   if (!stillSelected()) return changed;
-  const { sampleMs, now = Date.now, sleep = sleepFor } = options;
+  // Monotonic: a system clock adjustment cannot stretch or cut the sample.
+  const { sampleMs, now = () => performance.now(), sleep = sleepFor } = options;
   let metrics: ChromeMetrics;
   let window: MetricsWindow | undefined;
   try {
@@ -404,8 +409,12 @@ export async function readMetrics(
       if (sampleMs !== undefined) {
         const started = now();
         const until = started + sampleMs;
-        // On the clock, not on the timer: a timer can fire a millisecond early.
-        while (now() < until) await sleep(until - now());
+        // On the clock, not on the timer: a timer can fire a millisecond early. The tab is checked
+        // every turn, so a switch early in a long sample returns without waiting it out.
+        while (now() < until) {
+          if (!stillSelected()) return changed;
+          await sleep(until - now());
+        }
         if (!stillSelected()) return changed;
         last = await getMetrics(cdp);
         window = metricsWindow(a, last, now() - started);

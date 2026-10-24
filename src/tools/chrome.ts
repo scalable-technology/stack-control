@@ -2508,9 +2508,11 @@ export const chromeTool: Tool = {
   -> { metrics: { nodes, documents, frames, jsEventListeners, jsHeapUsedBytes,
        jsHeapTotalBytes },
        vitals: { lcp: { ms, size, element }, cls, shiftCount, inp: { ms, interactions } } }
-  Chrome counts layout, style, script and task work only while it measures,
-  so those come back only with sampleMs (100-5000): two reads that far apart,
-  and what Chrome counted between them, in window. The call waits sampleMs.
+  Chrome counts layout, style, script and task work per CDP session, and only
+  while that session has the Performance domain enabled, so those come back
+  only with sampleMs (100-5000): two reads of the tool's own session that far
+  apart, and the difference, in window. Another client's activity does not
+  touch it. The call waits sampleMs.
   \`chrome({ method: "metrics", sampleMs: 1000 })\`  (measured, a page with 15ms
   of script and a layout every 40ms)
   -> { metrics: { nodes: 1033, documents: 6, frames: 6, jsEventListeners: 3,
@@ -2518,9 +2520,15 @@ export const chromeTool: Tool = {
        window: { ms: 1001.81, layoutCount: 24, recalcStyleCount: 24,
        layoutMs: 0.94, recalcStyleMs: 0.71, scriptMs: 378.48, v8CompileMs: 0,
        taskMs: 384.3 }, vitals: { ... } }
-  window.ms is Chrome's own time between the reads. A metric Chrome did not
-  report, or a counter that did not rise or stay, is null, never 0 or
-  negative. lcp is the last candidate (null when none); cls is the
+  window.ms is the difference of Chrome's own Timestamp, or of a monotonic
+  clock when Chrome gives none. A metric Chrome did not report, or a counter
+  that did not rise or stay, is null, never 0 or negative. The counts cover
+  the renderer process of the selected tab, not out-of-process iframes;
+  nodes, documents and frames are per renderer process, so a same-site tab
+  sharing it adds to them. A navigation during the window can make it null
+  (a cross-process swap resets the counters) or wrong. Disable is sent once
+  at the end; if Chrome does not answer it, the reading still returns.
+  lcp is the last candidate (null when none); cls is the
   worst session window of shifts without recent input (0 when none); inp is
   null when there was no interaction, never 0. INP is an estimate: event
   timing buffers only about 150 entries and only events of 40ms or more, so a
@@ -2533,8 +2541,9 @@ export const chromeTool: Tool = {
   200 characters. If that world cannot be made or is not found by its unique
   id (for example while the page navigates), vitals is null and vitalsError
   says why; the metrics still come back. A page that blocks its main thread
-  can hold a call for up to about 10s per step. Calls run one at a time, so a
-  call with sampleMs holds an overlapping call until its window ends; a tab
+  can hold a call for up to about 10s per step; with sampleMs, the worst case
+  is sampleMs plus several such timeouts. Calls run one at a time, so a call
+  with sampleMs holds an overlapping metrics call for its whole sample; a tab
   switch during a call, the window included, fails it.
 
 **Hidden-page handling:**
