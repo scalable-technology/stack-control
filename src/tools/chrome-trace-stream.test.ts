@@ -78,6 +78,10 @@ describe('TraceEventScanner', () => {
     expect(scan('{"traceEventsX":[{"n":1}]}').state).toBe('noEvents');
   });
 
+  it('reads an escaped quote or backslash inside a key without ending the key', () => {
+    expect(scan('{"a\\"b":1,"c\\\\":2,"traceEvents":[{"n":1}]}')).toMatchObject({ state: 'done', events: [{ n: 1 }] });
+  });
+
   it('accepts whitespace everywhere JSON allows it', () => {
     const text = ' \n\t{ \r\n "traceEvents" \t : \n [ \n { "a" : 1 } \n , \t {"b":[ 1 , 2 ]}\n ] \n } \n';
     expect(scan(text)).toMatchObject({ state: 'done', events: [{ a: 1 }, { b: [1, 2] }] });
