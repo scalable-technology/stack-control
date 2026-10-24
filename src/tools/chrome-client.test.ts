@@ -27,6 +27,8 @@ async function fakeChrome(silent: string[]) {
   await new Promise<void>((r) => server.listen(0, r));
   return {
     port: (server.address() as { port: number }).port,
+    /** Chrome sends an event on every open socket. */
+    emit: (event: Record<string, unknown>) => sockets.forEach((s) => s.send(JSON.stringify(event))),
     /** The tab dies: Chrome drops the socket. */
     dropSockets: () => sockets.forEach((s) => s.terminate()),
     close: async () => {
@@ -125,5 +127,34 @@ describe('ChromeCDPClient: commands in flight when the connection ends', () => {
   it('still times out a command that gets no answer on a live connection', async () => {
     const { client } = await connected(['Hang.forever']);
     await expect(client.sendCommand('Hang.forever', {}, 50)).rejects.toThrow('Command Hang.forever timed out after 0.05s');
+  });
+});
+
+describe('ChromeCDPClient: the execution contexts Chrome announced', () => {
+  const context = { id: 5, uniqueId: '1.2', name: 'control-metrics', origin: 'http://page', auxData: { frameId: 'T1', type: 'isolated' } };
+  const until = async (ok: () => boolean) => {
+    for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 10));
+  };
+
+  it('keeps them from the events, before re-emitting each, and forgets them when the session ends', async () => {
+    const { chrome, client } = await connected([]);
+    let inMapWhenEmitted: unknown;
+    client.on('cdp', () => (inMapWhenEmitted = client.executionContext(5)));
+    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context } });
+    await until(() => client.executionContext(5) !== undefined);
+    expect(client.executionContext(5)).toEqual({ id: 5, uniqueId: '1.2', name: 'control-metrics', type: 'isolated', frameId: 'T1' });
+    expect(inMapWhenEmitted).toEqual(client.executionContext(5));
+    chrome.dropSockets();
+    await until(() => client.executionContext(5) === undefined);
+    expect(client.executionContext(5)).toBeUndefined();
+  });
+
+  it('forgets them on disconnect', async () => {
+    const { chrome, client } = await connected([]);
+    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context } });
+    await until(() => client.executionContext(5) !== undefined);
+    expect(client.executionContext(5)).toBeDefined();
+    client.disconnect();
+    expect(client.executionContext(5)).toBeUndefined();
   });
 });

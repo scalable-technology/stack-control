@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { waitForCdpEvent, waitForCdpEventMatching } from './cdp-events.js';
+import { ExecutionContextMap, MAX_EXECUTION_CONTEXTS, waitForCdpEvent, waitForCdpEventMatching } from './cdp-events.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -161,5 +161,105 @@ describe('waitForCdpEventMatching', () => {
     await expect(p).rejects.toThrow(/Stopped waiting for X\.y/);
     expect(listeners(e)).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('ExecutionContextMap', () => {
+  const created = (context: Record<string, unknown>) => ({ method: 'Runtime.executionContextCreated', params: { context } });
+  const world = (id: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    uniqueId: `U-${id}`,
+    name: 'control-metrics',
+    origin: 'http://page.example',
+    auxData: { frameId: 'F1', isDefault: false, type: 'isolated' },
+    ...extra,
+  });
+
+  it('keeps a trimmed record of each announced context, never its origin', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3)));
+    expect(m.get(3)).toEqual({ id: 3, uniqueId: 'U-3', name: 'control-metrics', type: 'isolated', frameId: 'F1' });
+    expect(JSON.stringify(m.get(3))).not.toMatch(/page\.example|isDefault/);
+  });
+
+  it('lets a later context under the same number replace the earlier one', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3)));
+    m.onEvent(created(world(3, { uniqueId: 'PAGE', name: '', auxData: { frameId: 'F1', type: 'default' } })));
+    expect(m.get(3)).toMatchObject({ uniqueId: 'PAGE', name: '', type: 'default' });
+    expect(m.size).toBe(1);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['not a string', 7],
+    ['empty', ''],
+    ['10k characters', 'u'.repeat(10_000)],
+  ])('skips a context whose unique id is %s, and forgets what had its number', (_label, uniqueId) => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3)));
+    m.onEvent(created(world(3, { uniqueId })));
+    expect(m.get(3)).toBeUndefined();
+  });
+
+  it('keeps a 200-character unique id', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3, { uniqueId: 'u'.repeat(200) })));
+    expect(m.get(3)?.uniqueId).toBe('u'.repeat(200));
+  });
+
+  it('stores an over-long or non-string name, type or frame id as empty, so it matches nothing', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3, { name: 'control-metrics' + 'x'.repeat(10_000) })));
+    m.onEvent(created(world(4, { name: 5, auxData: { frameId: 'f'.repeat(201), type: 't'.repeat(33) } })));
+    m.onEvent(created(world(5, { auxData: null })));
+    expect(m.get(3)!.name).toBe('');
+    expect(m.get(4)).toMatchObject({ name: '', frameId: '', type: '' });
+    expect(m.get(5)).toMatchObject({ frameId: '', type: '' });
+    expect(JSON.stringify([m.get(3), m.get(4)]).length).toBeLessThan(300);
+  });
+
+  it('ignores a context that is not an object or has no finite numeric id', () => {
+    const m = new ExecutionContextMap();
+    for (const context of [null, 'x', { ...world(1), id: '1' }, { ...world(1), id: NaN }, { ...world(1), id: Infinity }]) {
+      m.onEvent({ method: 'Runtime.executionContextCreated', params: { context: context as Record<string, unknown> } });
+    }
+    m.onEvent({ method: 'Runtime.executionContextCreated' });
+    expect(m.size).toBe(0);
+  });
+
+  it('removes a destroyed context by numeric id, and by unique id', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3)));
+    m.onEvent(created(world(4)));
+    m.onEvent({ method: 'Runtime.executionContextDestroyed', params: { executionContextId: 3 } });
+    m.onEvent({ method: 'Runtime.executionContextDestroyed', params: { executionContextUniqueId: 'U-4' } });
+    expect(m.get(3)).toBeUndefined();
+    expect(m.get(4)).toBeUndefined();
+  });
+
+  it('forgets everything on executionContextsCleared and on clear', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(world(3)));
+    m.onEvent({ method: 'Runtime.executionContextsCleared', params: {} });
+    expect(m.size).toBe(0);
+    m.onEvent(created(world(4)));
+    m.clear();
+    expect(m.size).toBe(0);
+  });
+
+  it(`holds at most ${MAX_EXECUTION_CONTEXTS} contexts, dropping the oldest first`, () => {
+    const m = new ExecutionContextMap();
+    for (let id = 1; id <= MAX_EXECUTION_CONTEXTS + 5; id++) m.onEvent(created(world(id)));
+    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
+    for (let id = 1; id <= 5; id++) expect(m.get(id)).toBeUndefined();
+    expect(m.get(6)).toBeDefined();
+    expect(m.get(MAX_EXECUTION_CONTEXTS + 5)).toBeDefined();
+  });
+
+  it('ignores other events', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent({ method: 'Network.requestWillBeSent', params: { context: world(1) } });
+    expect(m.size).toBe(0);
   });
 });
