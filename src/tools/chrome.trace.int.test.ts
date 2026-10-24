@@ -924,12 +924,29 @@ const FAKE_ENTRIES_PAGE = `<!doctype html><body>
   }
 </script></body>`;
 
+// Script, task and layout work in every 40ms: 15ms of busy script, then a width change it reads back.
+const SAMPLE_PAGE = `<!doctype html><body><div id="box" style="width:10px">box</div>
+<script>
+  let n = 0;
+  setInterval(() => {
+    const end = performance.now() + 15;
+    while (performance.now() < end) {}
+    const box = document.getElementById('box');
+    box.style.width = (10 + (n++ % 50)) + 'px';
+    void box.offsetHeight;
+  }, 40);
+</script></body>`;
+
+const INSTANT_KEYS = ['documents', 'frames', 'jsEventListeners', 'jsHeapTotalBytes', 'jsHeapUsedBytes', 'nodes'];
+const WINDOW_KEYS = ['layoutCount', 'layoutMs', 'ms', 'recalcStyleCount', 'recalcStyleMs', 'scriptMs', 'taskMs', 'v8CompileMs'];
+
 /** The vitals probe's Runtime.evaluate, told apart from the tool's other evaluates by what it observes. */
 const isProbe = (m: { method?: string; params?: { expression?: unknown } }) =>
   m.method === 'Runtime.evaluate' && typeof m.params?.expression === 'string' && m.params.expression.includes("'largest-contentful-paint'");
 
 interface MetricsData {
   metrics: Record<string, number | null>;
+  window?: Record<string, number | null>;
   vitals: {
     lcp: { ms: number; size: number; element: string } | null;
     cls: number;
@@ -945,6 +962,12 @@ describe('chrome metrics: input', () => {
     const r = await call({ method: 'metrics' });
     expect(r.success).toBe(false);
     expect(r.error).toBe('Not connected. Use chrome({ method: "connect" }) first.');
+  });
+
+  it.each([99, 5001, 100.5, '1000'])('rejects sampleMs %j and names the field', async (sampleMs) => {
+    const r = await call({ method: 'metrics', sampleMs });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/"sampleMs"/);
   });
 });
 
@@ -986,7 +1009,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     browser = await launchTestBrowser();
     for (const [name, html] of Object.entries({
       nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, hostile: HOSTILE_PAGE, bigFrame: BIG_FRAME_NAME_PAGE,
-      fake: FAKE_ENTRIES_PAGE,
+      fake: FAKE_ENTRIES_PAGE, sample: SAMPLE_PAGE,
     })) {
       servers[name] = await servePage(html);
     }
@@ -1010,10 +1033,48 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect(d.metrics.jsHeapUsedBytes).toBeGreaterThan(0);
     expect(d.metrics.jsHeapTotalBytes).toBeGreaterThan(0);
     expect(d.metrics.documents).toBeGreaterThanOrEqual(1);
-    expect(d.metrics.taskMs).toBeGreaterThan(0);
+    expect(Object.keys(d.metrics).sort()).toEqual(INSTANT_KEYS);
+    expect(d).not.toHaveProperty('window');
     const size = JSON.stringify(r.data).length;
     console.log(`metrics result: ${size} chars`);
     expect(size).toBeLessThan(2000);
+  }, 60_000);
+
+  it('counts script, task and layout work over a sampleMs window, and only then', async () => {
+    await open(servers.sample.url);
+    const started = Date.now();
+    const r = await call({ method: 'metrics', sampleMs: 1000 });
+    expect(r.success, r.error).toBe(true);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+    const d = r.data as MetricsData;
+    console.log(`metrics window on a busy page: ${JSON.stringify(d.window)}; metrics: ${JSON.stringify(d.metrics)}`);
+    expect(Object.keys(d.window!).sort()).toEqual(WINDOW_KEYS);
+    expect(d.window!.ms).toBeGreaterThanOrEqual(900);
+    expect(d.window!.ms).toBeLessThanOrEqual(1400);
+    // About 25 runs of 15ms in a second: well over 0 even on a loaded machine.
+    expect(d.window!.scriptMs).toBeGreaterThan(50);
+    expect(d.window!.taskMs).toBeGreaterThan(50);
+    expect(d.window!.layoutCount).toBeGreaterThan(0);
+    expect(Object.keys(d.metrics).sort()).toEqual(INSTANT_KEYS);
+    expect(d.metrics.nodes).toBeGreaterThan(0);
+
+    const plain = await metrics();
+    expect(plain).not.toHaveProperty('window');
+    expect(Object.keys(plain.metrics).sort()).toEqual(INSTANT_KEYS);
+  }, 60_000);
+
+  it('gives small non-negative deltas on a quiet page', async () => {
+    await open(servers.quiet.url);
+    const r = await call({ method: 'metrics', sampleMs: 200 });
+    expect(r.success, r.error).toBe(true);
+    const w = (r.data as MetricsData).window!;
+    expect(Object.keys(w).sort()).toEqual(WINDOW_KEYS);
+    for (const key of WINDOW_KEYS) {
+      expect(typeof w[key], key).toBe('number');
+      expect(w[key], key).toBeGreaterThanOrEqual(0);
+    }
+    expect(w.ms).toBeGreaterThanOrEqual(150);
+    expect(w.scriptMs).toBeLessThan(100);
   }, 60_000);
 
   it('gives inp null and cls 0 on a quiet page with no interaction', async () => {

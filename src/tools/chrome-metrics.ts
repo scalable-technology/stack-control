@@ -1,7 +1,11 @@
 /**
  * control/chrome-metrics — a cheap snapshot of a page's counters and web vitals, without a trace
  *
- * Counters come from Chrome (Performance.getMetrics). Vitals come from one script that asks
+ * Metrics come from Chrome (Performance.getMetrics). Node, document, frame and listener counts
+ * and the heap are true at any instant. Layout, style, script and task counters are not: Chrome
+ * counts them only while the Performance domain is enabled, and keeps them across a disable, so a
+ * read made right after enable is about 0. They are returned only as a window: two reads sampleMs
+ * apart with the domain enabled between them, and the difference. Vitals come from one script that asks
  * PerformanceObserver for what the browser has buffered since load. It runs in an isolated world
  * Chrome makes for it, so the page's own scripts (a replaced PerformanceObserver or String
  * prototype) are not there and the entries are the browser's. The world is addressed by the unique
@@ -20,6 +24,7 @@ import { truncate } from './chrome-trace-summary.js';
 import { worstSessionWindow } from './chrome-trace.js';
 import { contextRecord, type ExecutionContextRecord } from './cdp-events.js';
 
+/** What is true at the instant of the read. */
 export interface ChromeMetrics {
   nodes: number | null;
   documents: number | null;
@@ -27,6 +32,12 @@ export interface ChromeMetrics {
   jsEventListeners: number | null;
   jsHeapUsedBytes: number | null;
   jsHeapTotalBytes: number | null;
+}
+
+/** What Chrome counted between two reads. Null when either read lacks it, or it is not a finite rise. */
+export interface MetricsWindow {
+  /** Between the reads, by Chrome's Timestamp; by the clock when Chrome gave none. */
+  ms: number | null;
   layoutCount: number | null;
   recalcStyleCount: number | null;
   layoutMs: number | null;
@@ -46,14 +57,18 @@ export interface PageVitals {
   inp: { ms: number; interactions: number } | null;
 }
 
-/** Chrome's metric name, our key, and whether Chrome reports it in seconds. */
-const METRICS: [string, keyof ChromeMetrics, boolean][] = [
-  ['Nodes', 'nodes', false],
-  ['Documents', 'documents', false],
-  ['Frames', 'frames', false],
-  ['JSEventListeners', 'jsEventListeners', false],
-  ['JSHeapUsedSize', 'jsHeapUsedBytes', false],
-  ['JSHeapTotalSize', 'jsHeapTotalBytes', false],
+/** Chrome's metric name and our key. */
+const INSTANT: [string, keyof ChromeMetrics][] = [
+  ['Nodes', 'nodes'],
+  ['Documents', 'documents'],
+  ['Frames', 'frames'],
+  ['JSEventListeners', 'jsEventListeners'],
+  ['JSHeapUsedSize', 'jsHeapUsedBytes'],
+  ['JSHeapTotalSize', 'jsHeapTotalBytes'],
+];
+
+/** Chrome's counter name, our key, and whether Chrome reports it in seconds. */
+const COUNTERS: [string, Exclude<keyof MetricsWindow, 'ms'>, boolean][] = [
   ['LayoutCount', 'layoutCount', false],
   ['RecalcStyleCount', 'recalcStyleCount', false],
   ['LayoutDuration', 'layoutMs', true],
@@ -86,18 +101,42 @@ const DOMAIN = {
 const within = (n: unknown, max: number): n is number => finite(n) && n >= 0 && n <= max;
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-/** The metrics array of a Performance.getMetrics result, reduced to our keys. A missing one is null. */
-export function pickMetrics(raw: unknown): ChromeMetrics {
-  const out = Object.fromEntries(METRICS.map(([, key]) => [key, null])) as Record<keyof ChromeMetrics, number | null>;
+/** The finite values of a Performance.getMetrics metrics array, by name; the rest are not read. */
+function metricValues(raw: unknown): Map<string, number> {
+  const out = new Map<string, number>();
   if (!Array.isArray(raw)) return out;
-  const wanted = new Map(METRICS.map(([name, key, seconds]) => [name, { key, seconds }]));
   for (let i = 0; i < Math.min(raw.length, MAX_METRICS); i++) {
     const m = raw[i] as { name?: unknown; value?: unknown } | null;
-    const found = typeof m?.name === 'string' ? wanted.get(m.name) : undefined;
-    if (!found || !finite(m?.value)) continue;
-    const value = found.seconds ? round2(m.value * 1000) : m.value;
-    if (finite(value)) out[found.key] = value;
+    if (typeof m?.name === 'string' && finite(m.value) && !out.has(m.name)) out.set(m.name, m.value);
   }
+  return out;
+}
+
+/** The metrics array of a Performance.getMetrics result, reduced to the instantaneous keys. A missing one is null. */
+export function pickMetrics(raw: unknown): ChromeMetrics {
+  const values = metricValues(raw);
+  return Object.fromEntries(INSTANT.map(([name, key]) => [key, values.get(name) ?? null])) as unknown as ChromeMetrics;
+}
+
+/**
+ * The counters of read b minus those of read a. Durations go from seconds to ms with 2 decimals.
+ * A counter missing from either read, or one that did not rise or stay (a negative or non-finite
+ * difference), is null: never 0, never negative. wallMs is the window when Chrome gives no Timestamp.
+ */
+export function metricsWindow(a: unknown, b: unknown, wallMs: number): MetricsWindow {
+  const before = metricValues(a);
+  const after = metricValues(b);
+  const delta = (name: string, seconds: boolean): number | null => {
+    const x = before.get(name);
+    const y = after.get(name);
+    if (x === undefined || y === undefined) return null;
+    const d = seconds ? round2((y - x) * 1000) : y - x;
+    return finite(d) && d >= 0 ? (d === 0 ? 0 : d) : null;
+  };
+  const stamped = before.has('Timestamp') && after.has('Timestamp');
+  const ms = stamped ? delta('Timestamp', true) : finite(wallMs) && wallMs >= 0 ? round2(wallMs) : null;
+  const out = { ms } as MetricsWindow;
+  for (const [name, key, seconds] of COUNTERS) out[key] = delta(name, seconds);
   return out;
 }
 
@@ -294,7 +333,20 @@ async function makeWorld(
 export interface ReadMetricsOptions {
   /** How long after createIsolatedWorld answers to wait for Chrome to announce the world. */
   contextWaitMs?: number;
+  /** Read the counters twice, this many ms apart, and return what they counted in between. */
+  sampleMs?: number;
+  /** The clock the window is waited and measured on; a test can move it. */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const sleepFor = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const getMetrics = async (cdp: MetricsCdp): Promise<unknown> => {
+  const r = await cdp.sendCommand('Performance.getMetrics');
+  if (r.error) throw new Error(r.error.message);
+  return (r.result as { metrics?: unknown } | undefined)?.metrics;
+};
 
 /**
  * The vitals, read in a world of our own, or our own words for why not. Never the page's text.
@@ -327,9 +379,10 @@ async function readVitals(
 }
 
 /**
- * One snapshot: Chrome's counters, then the vitals. stillSelected says the tab measured is still
- * the selected one; it is checked before, between and after, so counters of one tab are never
- * returned with vitals of another.
+ * One snapshot: Chrome's metrics, then the vitals; with sampleMs, a window of counters between.
+ * stillSelected says the tab measured is still the selected one; it is checked before, between
+ * the two reads, after them and after the vitals, so numbers of one tab are never returned with
+ * those of another.
  */
 export async function readMetrics(
   cdp: MetricsCdp,
@@ -339,14 +392,25 @@ export async function readMetrics(
 ): Promise<ToolResult> {
   const changed = { success: false, error: TAB_CHANGED };
   if (!stillSelected()) return changed;
+  const { sampleMs, now = Date.now, sleep = sleepFor } = options;
   let metrics: ChromeMetrics;
+  let window: MetricsWindow | undefined;
   try {
     try {
       const enabled = await cdp.sendCommand('Performance.enable');
       if (enabled.error) throw new Error(enabled.error.message);
-      const r = await cdp.sendCommand('Performance.getMetrics');
-      if (r.error) throw new Error(r.error.message);
-      metrics = pickMetrics((r.result as { metrics?: unknown } | undefined)?.metrics);
+      const a = await getMetrics(cdp);
+      let last = a;
+      if (sampleMs !== undefined) {
+        const started = now();
+        const until = started + sampleMs;
+        // On the clock, not on the timer: a timer can fire a millisecond early.
+        while (now() < until) await sleep(until - now());
+        if (!stillSelected()) return changed;
+        last = await getMetrics(cdp);
+        window = metricsWindow(a, last, now() - started);
+      }
+      metrics = pickMetrics(last);
     } finally {
       // An enable with no answer may still have turned the domain on: always ask to turn it off.
       // A failed disable must not hide the reading.
@@ -359,21 +423,26 @@ export async function readMetrics(
   if (!stillSelected()) return changed;
   const vitals = await readVitals(cdp, frameId, options);
   if (!stillSelected()) return changed;
-  return { success: true, data: { metrics, ...('vitals' in vitals ? vitals : { vitals: null, ...vitals }) } };
+  return {
+    success: true,
+    data: { metrics, ...(window ? { window } : {}), ...('vitals' in vitals ? vitals : { vitals: null, ...vitals }) },
+  };
 }
 
 /**
  * readMetrics, one call at a time: Performance is one domain per tab, so an overlapping call would
- * turn it off under another's getMetrics. A call that fails does not hold up the next.
+ * turn it off under another's getMetrics, or in the middle of another's window. A call with
+ * sampleMs holds the next one for its window. A call that fails does not hold up the next.
  */
 export function createMetricsReader(): (
   cdp: MetricsCdp,
   stillSelected: () => boolean,
-  frameId: string | undefined
+  frameId: string | undefined,
+  options?: ReadMetricsOptions
 ) => Promise<ToolResult> {
   let tail: Promise<unknown> = Promise.resolve();
-  return (cdp, stillSelected, frameId) => {
-    const run = tail.then(() => readMetrics(cdp, stillSelected, frameId));
+  return (cdp, stillSelected, frameId, options) => {
+    const run = tail.then(() => readMetrics(cdp, stillSelected, frameId, options));
     tail = run.catch(() => {});
     return run;
   };

@@ -33,7 +33,7 @@
  *                  then action stop (outPath, overwrite, summary)
  * - profile        Trace, scroll, stop and summarize in one call: durationMs, scroll,
  *                  and trace's categories, compress, outPath, overwrite, summary
- * - metrics        Snapshot of Chrome's counters and the page's web vitals, no trace
+ * - metrics        Snapshot of the page's DOM and heap counts and web vitals, no trace; sampleMs adds a window of work counters
  */
 
 import { EventEmitter } from 'events';
@@ -855,8 +855,15 @@ export const ProfileInput = z.object({
   summary: traceSummary.describe('return a summary of the trace, capped in count and length (default: true); false skips it'),
 });
 
-const MetricsInput = z.object({
+export const MetricsInput = z.object({
   method: z.literal('metrics'),
+  sampleMs: z
+    .number()
+    .int()
+    .min(100)
+    .max(5000)
+    .optional()
+    .describe('Also count layout, style, script and task work over this many ms (100-5000); the call waits that long'),
 });
 
 const ChromeInput = z.discriminatedUnion('method', [
@@ -2107,7 +2114,7 @@ async function handleProfile(input: z.infer<typeof ProfileInput>): Promise<ToolR
 /** One metrics call at a time; see createMetricsReader. */
 const readMetrics = createMetricsReader();
 
-async function handleMetrics(): Promise<ToolResult> {
+async function handleMetrics(input: z.infer<typeof MetricsInput>): Promise<ToolResult> {
   if (!client?.isConnected()) {
     return { success: false, error: 'Not connected. Use chrome({ method: "connect" }) first.' };
   }
@@ -2115,7 +2122,7 @@ async function handleMetrics(): Promise<ToolResult> {
   // The tab selected when the call was made: a switch while it waits or reads fails it.
   const epoch = c.selectionEpoch;
   // A page target's id is its main frame's id; the epoch check covers a switch to another target.
-  return readMetrics(c, () => client === c && c.selectionEpoch === epoch, c.getCurrentTarget()?.id);
+  return readMetrics(c, () => client === c && c.selectionEpoch === epoch, c.getCurrentTarget()?.id, { sampleMs: input.sampleMs });
 }
 
 // =============================================================================
@@ -2493,17 +2500,26 @@ export const chromeTool: Tool = {
   settle sends no scroll; a switch while the scroll itself starts is not
   caught.
 
-• **metrics** - A cheap snapshot, no trace: Chrome's counters for the page and
-  its web vitals so far, since load, from what the browser buffered.
+• **metrics** - A cheap snapshot, no trace: the page's node, document, frame
+  and listener counts and heap, and its web vitals so far, since load, from
+  what the browser buffered.
   \`chrome({ method: "metrics" })\`
-  -> { metrics: { nodes: 512, documents: 1, frames: 1, jsEventListeners: 3,
-       jsHeapUsedBytes: 1500000, jsHeapTotalBytes: 3000000, layoutCount: 4,
-       recalcStyleCount: 5, layoutMs: 12.35, recalcStyleMs: 2, scriptMs: 250,
-       v8CompileMs: 1.23, taskMs: 1500 },
-       vitals: { lcp: { ms: 412.35, size: 90000, element: "h1" }, cls: 0.12,
-       shiftCount: 2, inp: { ms: 152, interactions: 1 } } }
-  Durations are Chrome's running totals in ms. A counter Chrome did not report
-  is null, never 0. lcp is the last candidate (null when none); cls is the
+  -> { metrics: { nodes, documents, frames, jsEventListeners, jsHeapUsedBytes,
+       jsHeapTotalBytes },
+       vitals: { lcp: { ms, size, element }, cls, shiftCount, inp: { ms, interactions } } }
+  Chrome counts layout, style, script and task work only while it measures,
+  so those come back only with sampleMs (100-5000): two reads that far apart,
+  and what Chrome counted between them, in window. The call waits sampleMs.
+  \`chrome({ method: "metrics", sampleMs: 1000 })\`  (measured, a page with 15ms
+  of script and a layout every 40ms)
+  -> { metrics: { nodes: 1033, documents: 6, frames: 6, jsEventListeners: 3,
+       jsHeapUsedBytes: 1571012, jsHeapTotalBytes: 2883584 },
+       window: { ms: 1001.81, layoutCount: 24, recalcStyleCount: 24,
+       layoutMs: 0.94, recalcStyleMs: 0.71, scriptMs: 378.48, v8CompileMs: 0,
+       taskMs: 384.3 }, vitals: { ... } }
+  window.ms is Chrome's own time between the reads. A metric Chrome did not
+  report, or a counter that did not rise or stay, is null, never 0 or
+  negative. lcp is the last candidate (null when none); cls is the
   worst session window of shifts without recent input (0 when none); inp is
   null when there was no interaction, never 0. INP is an estimate: event
   timing buffers only about 150 entries and only events of 40ms or more, so a
@@ -2516,8 +2532,9 @@ export const chromeTool: Tool = {
   200 characters. If that world cannot be made or is not found by its unique
   id (for example while the page navigates), vitals is null and vitalsError
   says why; the metrics still come back. A page that blocks its main thread
-  can hold a call for up to about 10s per step. Calls run one at a time; a
-  tab switch during a call fails it.
+  can hold a call for up to about 10s per step. Calls run one at a time, so a
+  call with sampleMs holds an overlapping call until its window ends; a tab
+  switch during a call, the window included, fails it.
 
 **Hidden-page handling:**
 evaluate, screenshot, and scene auto-detect document.hidden and bring the tab
@@ -2699,6 +2716,12 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
         description:
           'trace stop, profile: return a summary of the trace with the path, capped in count and length (default: true); false skips it',
       },
+      sampleMs: {
+        type: 'integer',
+        minimum: 100,
+        maximum: 5000,
+        description: 'metrics: also count layout, style, script and task work over this many ms (100-5000); the call waits that long',
+      },
       durationMs: {
         type: 'integer',
         minimum: 1000,
@@ -2770,7 +2793,7 @@ No Puppeteer dependency. Raw CDP over WebSocket.`,
       case 'profile':
         return handleProfile(input);
       case 'metrics':
-        return handleMetrics();
+        return handleMetrics(input);
       default:
         return {
           success: false,
