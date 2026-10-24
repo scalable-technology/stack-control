@@ -54,7 +54,9 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
       const gone = await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]);
       if (!gone) throw new Error(`Chrome (pid ${proc.pid}) did not exit; left ${dir} in place`);
     }
-    rmSync(dir, { recursive: true, force: true });
+    // Chrome's helper processes can still be writing into the profile for a moment after the main
+    // process is gone (seen under heavy load as ENOTEMPTY), so retry the removal.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
   };
 
   const portFile = join(dir, 'DevToolsActivePort');
@@ -110,7 +112,7 @@ export function usePrivateTmpdir(): () => string {
   afterAll(() => {
     if (previous === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previous;
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
   });
   return () => {
     if (!dir) throw new Error('usePrivateTmpdir: read before its beforeAll ran');

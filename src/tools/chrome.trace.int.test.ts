@@ -1153,7 +1153,9 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
       socket.on('message', onMessage);
       try {
         real.call(socket, JSON.stringify({ id: raw++, method: 'Page.navigate', params: { url: `${otherSite}?n=${Math.min(200, worldId! * 2 + 10)}` } }));
-        for (let i = 0; i < 100 && !hazard; i++) {
+        // The client gives the held probe 10s; build the hazard inside 7s or release it and fail clearly.
+        const heldSince = Date.now();
+        for (let i = 0; i < 100 && !hazard && Date.now() - heldSince < 7000; i++) {
           await sleep(50);
           const id = raw++;
           // Proof that the id now names a world of the new page: the page's own PerformanceObserver is there.
@@ -1193,7 +1195,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
       spy.mockRestore();
     }
     console.log(`reuse race: world id ${worldId}, page world now holds it: ${hazard}, vitals ${JSON.stringify((r.data as MetricsData).vitals)}, ${(r.data as MetricsData).vitalsError}`);
-    expect(hazard, 'the numeric id of our world did not come to name a page world on the other site').toBe(true);
+    expect(hazard, 'the numeric id of our world did not come to name a page world on the other site within 7s (a heavily loaded machine?)').toBe(true);
     expect(probes).toHaveLength(1);
     expect(probes[0]).not.toHaveProperty('contextId');
     expect(typeof probes[0].uniqueContextId).toBe('string');
