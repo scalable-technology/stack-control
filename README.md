@@ -171,7 +171,8 @@ the compositor handles as input, not a `scrollTo`: `distance`, `selector`, `spee
 Performance panel records. `start` takes `categories` and `compress`; `stop`
 writes the file (a fresh private temp directory, or `outPath` with
 `overwrite`) and returns its path and, unless `summary: false`, a short
-summary: long tasks, frames, LCP, CLS and the hottest functions. DevTools and
+summary: long tasks, frames, LCP, CLS and the hottest functions. The summary
+streams the file and keeps only what it reads, up to 1GB decompressed. DevTools and
 Perfetto open the file. `profile` does trace, an optional `scroll`, and stop
 in one call over `durationMs`, with the same trace options. `metrics` is the
 cheap check: Chrome's counters (nodes, heap, layout and script time) and the

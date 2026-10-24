@@ -1,12 +1,22 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { accessSync, chmodSync, constants, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeTrace, type TraceEvent, type TraceSummary } from './chrome-trace.js';
-import { boundSummary, summarizeTraceFile, type BoundedSummary } from './chrome-trace-summary.js';
+import {
+  MAX_KEPT_EVENTS,
+  MAX_THREADS,
+  SUMMARY_MAX_BYTES,
+  boundSummary,
+  reduceTraceEvents,
+  summarizeTraceFile,
+  summarizeTraceSource,
+  type BoundedSummary,
+} from './chrome-trace-summary.js';
 
 // Test seam: stat can report a smaller size than the file has, as when the file grows after the stat.
 const fsSeam = vi.hoisted(() => ({ statSize: undefined as number | undefined }));
@@ -93,31 +103,35 @@ describe('summarizeTraceFile', () => {
     const bomb = gzipSync(Buffer.alloc(8 * 1024 * 1024, 0x20));
     expect(bomb.length).toBeLessThan(64 * 1024);
     const reason = skippedOf(await summarizeTraceFile(write('bomb.json.gz', bomb), { compressed: true, maxBytes: 1024 * 1024 }));
-    expect(reason).toMatch(/inflates past the 1MB summary limit/);
+    expect(reason).toBe('The trace inflates past the 1MB summary limit; open the file in DevTools or Perfetto');
   });
 
   it.each([
-    ['corrupt gzip', 'x.json.gz', true, Buffer.from('SECRET-TEXT not gzip at all'), /not valid gzip/],
-    ['truncated gzip', 'y.json.gz', true, gzipSync('{"traceEvents":[{"name":"SECRET-TEXT"}]}').subarray(0, 20), /not valid gzip/],
-    ['truncated JSON', 'x.json', false, '{"traceEvents":[{"name":"SECRET-TEXT', /not valid JSON/],
-    ['a JSON number', 'n.json', false, '42', /traceEvents/],
-    ['an object without traceEvents', 'o.json', false, '{"SECRET-TEXT":[1,2,3]}', /traceEvents/],
-    ['events that are not objects', 'e.json', false, '{"traceEvents":[null,"SECRET-TEXT"]}', /could not be analyzed/],
+    ['corrupt gzip', 'x.json.gz', true, Buffer.from('SECRET-TEXT not gzip at all'), 'The trace file is not valid gzip'],
+    ['truncated gzip', 'y.json.gz', true, gzipSync('{"traceEvents":[{"name":"SECRET-TEXT"}]}').subarray(0, 20), 'The trace file is not valid gzip'],
+    ['random bytes gzipped', 'r.json.gz', true, gzipSync(Buffer.concat([Buffer.from('['), randomBytes(1500)])), 'The trace is not valid JSON'],
+    ['truncated JSON', 'x.json', false, '{"traceEvents":[{"name":"SECRET-TEXT', 'The trace is not valid JSON'],
+    ['an event JSON.parse refuses', 'b.json', false, '{"traceEvents":[{"name":SECRET-TEXT}]}', 'The trace is not valid JSON'],
+    ['a JSON number', 'n.json', false, '42', 'The trace has no traceEvents array'],
+    ['an object without traceEvents', 'o.json', false, '{"SECRET-TEXT":[1,2,3]}', 'The trace has no traceEvents array'],
   ])('skips %s and says why without quoting the file', async (_label, name, compressed, data, why) => {
     const reason = skippedOf(await summarizeTraceFile(write(name, data), { compressed }));
-    expect(reason).toMatch(why);
-    expect(reason).not.toMatch(/SECRET|traceEvents":/);
+    expect(reason).toBe(why);
   });
 
-  it.each([
-    ['plain', 'grown.json', false, () => Buffer.alloc(2000, 0x20)],
-    // Random bytes do not compress, so without the size re-check this file would fail as "inflates past" instead.
-    ['gzipped', 'grown.json.gz', true, () => gzipSync(randomBytes(1500))],
-  ])('skips a %s file that grew past the cap after the stat', async (_label, name, compressed, data) => {
-    const path = write(name, data());
+  // Changed with the streaming summary: events that are not objects used to fail the whole summary.
+  it('skips events that are not objects and summarizes the rest', async () => {
+    const text = JSON.stringify({ traceEvents: [null, 'SECRET-TEXT', 7, [1], ...EVENTS] });
+    const s = summaryOf(await summarizeTraceFile(write('e.json', text), { compressed: false }));
+    expect(s).toStrictEqual(boundSummary(analyzeTrace(EVENTS)));
+  });
+
+  // Changed with the streaming summary: the size past the cap is not known, since the read stops there.
+  it('skips a plain file that grew past the cap after the stat', async () => {
+    const path = write('grown.json', Buffer.alloc(2000, 0x20));
     fsSeam.statSize = 10;
-    const reason = skippedOf(await summarizeTraceFile(path, { compressed, maxBytes: 1000 }));
-    expect(reason).toMatch(/The trace is \d+ bytes, over the 1000 bytes summary limit/);
+    const reason = skippedOf(await summarizeTraceFile(path, { compressed: false, maxBytes: 1000 }));
+    expect(reason).toBe('The trace is over the 1000 bytes summary limit; open the file in DevTools or Perfetto');
   });
 
   it('keeps structure from a hand-written file out of the result', async () => {
@@ -264,4 +278,255 @@ describe('boundSummary', () => {
     expect(b.profile).toBeNull();
     expect(b.longTaskCount).toBe(0);
   });
+});
+
+// --- The streaming summary: the reduced events must give what all the events give ---
+
+const fixtureEvents = (name: string): TraceEvent[] =>
+  (JSON.parse(readFileSync(fixture(name), 'utf8')) as { traceEvents: TraceEvent[] }).traceEvents;
+
+const at = (pid: number | string, tid: number | string) => ({ pid, tid }) as { pid: number; tid: number };
+const thread = (where: { pid: number; tid: number }, name: string): TraceEvent => ({ name: 'thread_name', ph: 'M', ts: 0, ...where, args: { name } });
+const x = (name: string, tsMs: number, durMs: number, where = MAIN): TraceEvent => ({ name, ph: 'X', ts: tsMs * 1000, dur: durMs * 1000, ...where });
+const instant = (name: string, tsMs: number, where: { pid: number; tid: number }, args: Record<string, unknown>): TraceEvent =>
+  ({ name, ph: 'I', ts: tsMs * 1000, ...where, args });
+
+const COMPOSITOR = { pid: 1, tid: 12 };
+const OTHER = { pid: 2, tid: 20 };
+const node = (id: number, functionName: string) => ({ id, callFrame: { functionName, url: functionName === 'tick' ? 'http://x/' : '' } });
+const NODES = [node(1, '(root)'), node(2, 'tick'), node(3, '(idle)'), node(4, '(program)')];
+
+/** Every kind of event an analyzer reads, among the kinds it does not, on several threads. */
+const BUSY_PAGE: TraceEvent[] = [
+  // The window is set by events on other threads: earliest on pid 2, latest end on pid 3.
+  x('GPUTask', 0.5, 1, OTHER),
+  thread(MAIN, 'CrRendererMain'),
+  thread(COMPOSITOR, 'Compositor'),
+  thread(OTHER, 'CrRendererMain'),
+  x('RunTask', 10, 120), x('FunctionCall', 12, 60), x('Layout', 80, 20), x('Paint', 101, 5), x('MajorGC', 110, 10),
+  x('ThreadControllerImpl::RunTask', 10, 119), { name: 'NoDuration', ph: 'X', ts: 9000, ...MAIN },
+  x('RunTask', 200, 30), x('v8.compile', 201, 3), x('UpdateLayoutTree', 210, 4), x('Commit', 220, 2),
+  x('RunTask', 5, 40, OTHER), x('RunTask', 300, 400, COMPOSITOR), x('Receive mojo message', 15, 1, COMPOSITOR),
+  { name: 'flow', ph: 's', ts: 11_000, id: 1, ...MAIN }, { name: 'flow', ph: 'f', ts: 12_000, id: 1, ...OTHER },
+  { name: 'Begin', ph: 'B', ts: 13_000, ...MAIN }, { name: 'Begin', ph: 'E', ts: 14_000, ...MAIN },
+  ...[0, 16.7, 33.4, 50.1, 120, 136.7].map((t, i) => instant('DrawFrame', 100 + t, COMPOSITOR, { layerTreeId: 2, frameSeqId: i })),
+  instant('DrawFrame', 101, OTHER, { layerTreeId: 9, frameSeqId: 1 }),
+  { ...instant('DrawFrame', 102, COMPOSITOR, { layerTreeId: 2, frameSeqId: 50 }), ph: 'b' },
+  instant('DroppedFrame', 190, COMPOSITOR, { layerTreeId: 2, frameSeqId: 4 }),
+  instant('DroppedFrame', 191, COMPOSITOR, { layerTreeId: 2, frameSeqId: 77 }),
+  { name: 'navigationStart', ph: 'R', ts: 1000, ...MAIN, args: { frame: 'F', data: { navigationId: 'N' } } },
+  { name: 'largestContentfulPaint::Candidate', ph: 'R', ts: 1051_000, ...MAIN,
+    args: { frame: 'F', data: { navigationId: 'N', isOutermostMainFrame: true, type: 'text', nodeName: 'P', size: 500, candidateIndex: 1 } } },
+  instant('LayoutShift', 300, MAIN, { data: { score: 0.125, had_recent_input: false } }),
+  instant('LayoutShift', 900, MAIN, { data: { score: 0.5, had_recent_input: true } }),
+  { name: 'Profile', ph: 'P', ts: 0, ...MAIN, id: '0x1' },
+  { name: 'Profile', ph: 'P', ts: 0, ...OTHER, id: '0x9' },
+  { name: 'ProfileChunk', ph: 'P', ts: 20, pid: 1, tid: 99, id: '0x1',
+    args: { data: { cpuProfile: { nodes: NODES, samples: [2, 2, 3, 4, 2] }, timeDeltas: [1000, 1500, 2000, 500, 250] } } },
+  { name: 'ProfileChunk', ph: 'P', ts: 10, pid: 2, tid: 98, id: '0x9',
+    args: { data: { cpuProfile: { nodes: NODES, samples: [2, 2] }, timeDeltas: [1000, 9000] } } },
+  x('VizCompositor', 9000, 3000, { pid: 3, tid: 30 }),
+];
+
+/** Two renderer main threads with equal task time: the first one named is the main thread. */
+const TIE: TraceEvent[] = [
+  thread(OTHER, 'CrRendererMain'),
+  thread(MAIN, 'CrRendererMain'),
+  x('RunTask', 0, 100, MAIN), x('Layout', 10, 20, MAIN),
+  x('RunTask', 0, 100, OTHER), x('FunctionCall', 10, 20, OTHER),
+];
+
+/**
+ * Task time is summed per `${pid}:${tid}`, while the main thread's events match pid and tid exactly:
+ * a RunTask with a string pid counts toward the main thread's time but is none of its tasks. Here it
+ * is what lifts that time above -1 (Chrome writes neither form; the rule must still be the one rule).
+ */
+const MIXED_IDS: TraceEvent[] = [
+  thread(MAIN, 'CrRendererMain'),
+  x('RunTask', 0, -5, MAIN),
+  x('RunTask', 50, 10, at('1', 10)),
+  x('Layout', 1, 2, MAIN),
+];
+
+/** No renderer main thread at all: frames, vitals and the window still count. */
+const NO_MAIN: TraceEvent[] = [
+  x('RunTask', 0, 10, OTHER),
+  ...[0, 16, 40].map((t, i) => instant('DrawFrame', t, COMPOSITOR, { layerTreeId: 1, frameSeqId: i })),
+  instant('LayoutShift', 5, OTHER, { data: { score: 0.25 } }),
+];
+
+const TRACES: [string, () => TraceEvent[]][] = [
+  ['the busy synthetic page', () => BUSY_PAGE],
+  ['a tie between two main threads', () => TIE],
+  ['mixed id types', () => MIXED_IDS],
+  ['no main thread', () => NO_MAIN],
+  ['an empty trace', () => []],
+  ['the unit-test events', () => EVENTS],
+  ['frames-real.json', () => fixtureEvents('frames-real.json')],
+  ['frames-devtools.json', () => fixtureEvents('frames-devtools.json')],
+  ['profile-real.json', () => fixtureEvents('profile-real.json')],
+  ['vitals-real.json', () => fixtureEvents('vitals-real.json')],
+];
+
+describe('reduceTraceEvents', () => {
+  it.each(TRACES)('gives analyzeTrace the same summary as all the events: %s', (_label, events) => {
+    const all = events();
+    expect(analyzeTrace(reduceTraceEvents(all))).toStrictEqual(analyzeTrace(all));
+  });
+
+  it('keeps the events the analyzers read and drops the rest', () => {
+    const reduced = reduceTraceEvents(BUSY_PAGE);
+    const names = new Set(reduced.map((e) => e.name));
+    for (const kept of ['DrawFrame', 'DroppedFrame', 'LayoutShift', 'navigationStart', 'largestContentfulPaint::Candidate',
+      'Profile', 'ProfileChunk', 'thread_name', 'RunTask', 'FunctionCall', 'Layout', 'Paint', 'ThreadControllerImpl::RunTask']) {
+      expect(names, kept).toContain(kept);
+    }
+    for (const dropped of ['Receive mojo message', 'flow', 'Begin', 'NoDuration']) expect(names, dropped).not.toContain(dropped);
+    // Only the main thread's tasks, its name, its profile and the chunks of its process.
+    expect(reduced.filter((e) => e.name === 'RunTask').map((e) => e.pid)).toEqual([1, 1]);
+    expect(reduced.filter((e) => e.name === 'thread_name')).toEqual([thread(MAIN, 'CrRendererMain')]);
+    expect(reduced.filter((e) => e.name === 'Profile').map((e) => e.id)).toEqual(['0x1']);
+    expect(reduced.filter((e) => e.name === 'ProfileChunk').map((e) => e.pid)).toEqual([1]);
+    // The async DrawFrame is not a frame; the instants on every compositor are.
+    expect(reduced.filter((e) => e.name === 'DrawFrame')).toHaveLength(7);
+  });
+
+  it('carries the window in two events at the front that match no thread', () => {
+    const reduced = reduceTraceEvents(BUSY_PAGE);
+    const [first, second] = reduced;
+    expect(first).toMatchObject({ ph: 'X', ts: 500, dur: 1000 });
+    expect(second).toMatchObject({ ph: 'X', ts: 9_000_000, dur: 3_000_000 });
+    for (const e of [first, second]) {
+      expect(e.pid).toBeNaN();
+      expect(e.tid).toBeNaN();
+    }
+    expect(reduced.filter((e) => e.name === 'GPUTask' || e.name === 'VizCompositor')).toEqual([]);
+  });
+
+  it('carries one window event when one event sets both ends', () => {
+    const reduced = reduceTraceEvents([thread(MAIN, 'CrRendererMain'), x('RunTask', 0, 1000, OTHER), x('RunTask', 10, 10)]);
+    expect(reduced.filter((e) => Number.isNaN(e.pid))).toHaveLength(1);
+  });
+});
+
+/** A source that gives these buffers each time it is opened. */
+const sourceOf = (...parts: (string | Buffer)[]) => () =>
+  (async function* () {
+    for (const p of parts) yield typeof p === 'string' ? Buffer.from(p) : p;
+  })();
+
+describe('summarizeTraceFile: streaming', () => {
+  it.each(TRACES)('gives boundSummary(analyzeTrace) of the whole file, plain and gzipped: %s', async (_label, events) => {
+    const all = events();
+    const text = JSON.stringify({ traceEvents: all, metadata: { source: 'test' } });
+    const expected = boundSummary(analyzeTrace(all));
+    expect(summaryOf(await summarizeTraceFile(write('t.json', text), { compressed: false }))).toStrictEqual(expected);
+    expect(summaryOf(await summarizeTraceFile(write('t.json.gz', gzipSync(text)), { compressed: true }))).toStrictEqual(expected);
+  });
+
+  it('allows 1GiB inflated by default', () => {
+    expect(SUMMARY_MAX_BYTES).toBe(1024 * 1024 * 1024);
+  });
+
+  it(`skips a trace with more than ${MAX_KEPT_EVENTS} events the summary keeps, generated lazily`, async () => {
+    const block = '{"name":"a","ph":"X","pid":1,"tid":10,"ts":1,"dur":1},'.repeat(10_000);
+    const open = () => (async function* () {
+      yield Buffer.from(`[${JSON.stringify(EVENTS[0])},`);
+      for (let i = 0; i < 500; i++) yield Buffer.from(block); // 5 million events
+      yield Buffer.from('{}]');
+    })();
+    const r = await summarizeTraceSource(open, { compressed: false });
+    expect(skippedOf(r)).toBe(`The trace has over ${MAX_KEPT_EVENTS} events the summary reads; open the file in DevTools or Perfetto`);
+  }, 120_000);
+
+  it(`skips a trace with tasks on more than ${MAX_THREADS} threads`, async () => {
+    const events = Array.from({ length: MAX_THREADS + 1 }, (_, i) => x('RunTask', i, 1, { pid: 1, tid: 100 + i }));
+    const r = await summarizeTraceSource(sourceOf(JSON.stringify(events)), { compressed: false });
+    expect(skippedOf(r)).toBe(`The trace has tasks on over ${MAX_THREADS} threads; open the file in DevTools or Perfetto`);
+    const fits = events.slice(0, MAX_THREADS);
+    expect(summaryOf(await summarizeTraceSource(sourceOf(JSON.stringify(fits)), { compressed: false })).windowMs).toBe(MAX_THREADS);
+  });
+
+  it('skips a summary that runs past its time limit, on its clock', async () => {
+    let t = 0;
+    const text = JSON.stringify({ traceEvents: BUSY_PAGE });
+    const r = await summarizeTraceSource(sourceOf(text.slice(0, 50), text.slice(50)), { compressed: false, timeLimitMs: 60_000, now: () => (t += 40_000) });
+    expect(skippedOf(r)).toBe('The summary took over 60s; open the file in DevTools or Perfetto');
+  });
+
+  it('allows 60s by default', async () => {
+    let t = 0;
+    const text = JSON.stringify({ traceEvents: BUSY_PAGE });
+    // Each read of the clock is 1s later: well under 60 reads gives a summary.
+    expect('summary' in await summarizeTraceSource(sourceOf(text), { compressed: false, now: () => (t += 1000) })).toBe(true);
+    t = 0;
+    expect(skippedOf(await summarizeTraceSource(sourceOf(text), { compressed: false, now: () => (t += 61_000) })))
+      .toBe('The summary took over 60s; open the file in DevTools or Perfetto');
+  });
+
+  it('skips a file that changed between its two reads', async () => {
+    let opened = 0;
+    const texts = [JSON.stringify(EVENTS), JSON.stringify([...EVENTS, x('RunTask', 300, 100)])];
+    const open = () => sourceOf(texts[opened++])();
+    expect(skippedOf(await summarizeTraceSource(open, { compressed: false }))).toBe('The trace file changed while it was read');
+  });
+
+  it('says why a gzipped source is too big in its own words', async () => {
+    const r = await summarizeTraceSource(sourceOf('[', ' '.repeat(2000), ']'), { compressed: true, maxBytes: 1000 });
+    expect(skippedOf(r)).toBe('The trace inflates past the 1000 bytes summary limit; open the file in DevTools or Perfetto');
+  });
+});
+
+// --- Opt-in: the real 184MB trace the streaming summary was built for ---
+
+const REAL_TRACE = process.env.CONTROL_REAL_TRACE;
+const realReadable = (() => {
+  if (!REAL_TRACE) return false;
+  try {
+    accessSync(REAL_TRACE, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe.skipIf(!realReadable)('the real trace in CONTROL_REAL_TRACE (skipped unless that names a readable .json.gz file)', () => {
+  const readAll = (): TraceEvent[] =>
+    (JSON.parse(gunzipSync(readFileSync(REAL_TRACE!)).toString('utf8')) as { traceEvents: TraceEvent[] }).traceEvents;
+
+  it('gives the same summary from the reduced events and from the stream as from all the events', async () => {
+    const all = readAll();
+    const full = analyzeTrace(all);
+    const reduced = reduceTraceEvents(all);
+    console.log(`real trace: ${all.length} events, ${reduced.length} kept`);
+    expect(analyzeTrace(reduced)).toStrictEqual(full);
+    const started = Date.now();
+    const streamed = summaryOf(await summarizeTraceFile(REAL_TRACE!, { compressed: true }));
+    console.log(`real trace: streaming summary in ${Date.now() - started}ms`);
+    expect(streamed).toStrictEqual(boundSummary(full));
+    expect(streamed.frames.count).toBe(475);
+  }, 300_000);
+
+  /** Peak RSS growth and time of one summary in a fresh node process. */
+  const measure = (path: 'old' | 'new') => {
+    const module = fileURLToPath(new URL(path === 'new' ? './chrome-trace-summary.ts' : './chrome-trace.ts', import.meta.url));
+    const run = path === 'new'
+      ? `const r = await m.summarizeTraceFile(file, { compressed: true }); if (!('summary' in r)) throw new Error(r.skipped);`
+      : `const z = await import('node:zlib'); const fs = await import('node:fs');
+         const e = JSON.parse(z.gunzipSync(fs.readFileSync(file)).toString('utf8')).traceEvents; m.analyzeTrace(e);`;
+    const script = `const m = await import(${JSON.stringify(module)}); const file = ${JSON.stringify(REAL_TRACE)};
+      const before = process.memoryUsage().rss; const t = Date.now(); ${run}
+      console.log(JSON.stringify({ before, maxRss: process.resourceUsage().maxRSS * 1024, ms: Date.now() - t }));`;
+    const out = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { encoding: 'utf8' });
+    const r = JSON.parse(out.trim().split('\n').at(-1)!) as { before: number; maxRss: number; ms: number };
+    return { growthMB: Math.round((r.maxRss - r.before) / 1024 / 1024), ms: r.ms };
+  };
+
+  it('stays under 500MB of peak RSS growth where reading the whole file took about 1GB', () => {
+    const fresh = measure('new');
+    const whole = measure('old');
+    console.log(`real trace: streaming +${fresh.growthMB}MB in ${fresh.ms}ms; whole file +${whole.growthMB}MB in ${whole.ms}ms`);
+    expect(fresh.growthMB).toBeLessThan(500);
+    expect(whole.growthMB).toBeGreaterThan(fresh.growthMB);
+  }, 300_000);
 });

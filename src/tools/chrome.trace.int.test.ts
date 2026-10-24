@@ -5,7 +5,7 @@ import { gunzipSync } from 'node:zlib';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { analyzeTrace, type TraceEvent } from './chrome-trace.js';
-import { boundSummary, type BoundedSummary } from './chrome-trace-summary.js';
+import { boundSummary, reduceTraceEvents, type BoundedSummary } from './chrome-trace-summary.js';
 import { ChromeCDPClient, chromeTool } from './chrome.js';
 import {
   chromeAvailable,
@@ -459,7 +459,10 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
     const s = d.summary!;
     expect(s.longTasks.some((t) => t.durationMs >= 100)).toBe(true);
     expect(s.vitals.cls).toBeGreaterThan(0);
-    expect(s).toEqual(boundSummary(analyzeTrace(readTrace(d.path))));
+    // The streaming summary, read the old way: the whole file, every event.
+    const events = readTrace(d.path);
+    expect(s).toStrictEqual(boundSummary(analyzeTrace(events)));
+    expect(analyzeTrace(reduceTraceEvents(events))).toStrictEqual(analyzeTrace(events));
     expect(JSON.stringify(s).length).toBeLessThan(5000);
   }, 60_000);
 
@@ -491,7 +494,7 @@ describe.skipIf(!chromeAvailable)('chrome trace: summary on stop in headless Chr
       const target = join(dir, 'quiet.json.gz');
       const d = await record({ outPath: target });
       expect(d.path).toBe(target);
-      expect(d.summary).toEqual(boundSummary(analyzeTrace(readTrace(target))));
+      expect(d.summary).toStrictEqual(boundSummary(analyzeTrace(readTrace(target))));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -839,7 +842,9 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     expect(d.path).toBe(target);
     expect(d.overwritten).toBe(true);
     expect(readTrace(target).length).toBeGreaterThan(10);
-    expect(d.summary).toEqual(boundSummary(analyzeTrace(readTrace(target))));
+    const events = readTrace(target);
+    expect(d.summary).toStrictEqual(boundSummary(analyzeTrace(events)));
+    expect(analyzeTrace(reduceTraceEvents(events))).toStrictEqual(analyzeTrace(events));
   }, 60_000);
 
   it('returns no summary keys with summary: false', async () => {

@@ -432,34 +432,105 @@ const spanOf = (e: TraceEvent): Span => ({
   end: e.ts + (e.dur ?? 0),
 });
 
+/** The key findMainThread sums task time under; two ids that print the same share it. */
+export const threadKey = (e: { pid: unknown; tid: unknown }) => `${e.pid}:${e.tid}`;
+
 /**
  * The renderer main thread: the CrRendererMain thread with the most RunTask
- * time. A browser-level trace can hold several (other tabs, iframes).
+ * time; on a tie, the one named first. A browser-level trace can hold several
+ * (other tabs, iframes). Fed one event at a time, so the streaming summary
+ * applies this same rule without holding the trace.
  */
-function findMainThread(events: TraceEvent[]): { pid: number; tid: number } | null {
-  const key = (e: { pid: number; tid: number }) => `${e.pid}:${e.tid}`;
-  const mains = new Map<string, { pid: number; tid: number }>();
-  for (const e of events) {
+export class MainThreadTally {
+  private readonly mains = new Map<string, { pid: number; tid: number }>();
+  private readonly busy = new Map<string, number>();
+
+  add(e: TraceEvent): void {
     if (e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain') {
-      mains.set(key(e), { pid: e.pid, tid: e.tid });
+      this.mains.set(threadKey(e), { pid: e.pid, tid: e.tid });
     }
-  }
-  const busy = new Map<string, number>();
-  for (const e of events) {
     if (e.ph === 'X' && e.name === 'RunTask') {
-      busy.set(key(e), (busy.get(key(e)) ?? 0) + (e.dur ?? 0));
+      const key = threadKey(e);
+      this.busy.set(key, (this.busy.get(key) ?? 0) + (e.dur ?? 0));
     }
   }
-  let best: { pid: number; tid: number } | null = null;
-  let bestBusy = -1;
-  for (const [k, thread] of mains) {
-    const b = busy.get(k) ?? 0;
-    if (b > bestBusy) {
-      best = thread;
-      bestBusy = b;
+
+  /** How many threads it holds a name or a time for: what the tally costs. */
+  get threads(): number {
+    return this.mains.size + this.busy.size;
+  }
+
+  pick(): { pid: number; tid: number } | null {
+    let best: { pid: number; tid: number } | null = null;
+    let bestBusy = -1;
+    for (const [k, thread] of this.mains) {
+      const b = this.busy.get(k) ?? 0;
+      if (b > bestBusy) {
+        best = thread;
+        bestBusy = b;
+      }
+    }
+    return best;
+  }
+}
+
+function findMainThread(events: TraceEvent[]): { pid: number; tid: number } | null {
+  const tally = new MainThreadTally();
+  for (const e of events) tally.add(e);
+  return tally.pick();
+}
+
+/** Complete events with a duration: what task timing and the trace window read. */
+export const isTimed = (e: TraceEvent) => e.ph === 'X' && e.dur !== undefined;
+
+/**
+ * The trace window: from the earliest start to the latest end of all timed events, on any
+ * thread. It remembers which event set each end (the first to reach it) and that event's
+ * position, so the streaming summary can carry the window without the events.
+ */
+export class TraceWindow {
+  start = Infinity;
+  end = -Infinity;
+  first: { event: TraceEvent; at: number } | null = null;
+  last: { event: TraceEvent; at: number } | null = null;
+
+  add(e: TraceEvent, at = 0): void {
+    // A loop, not Math.min(...xs): real traces exceed the spread argument limit.
+    if (e.ts < this.start) {
+      this.start = e.ts;
+      this.first = { event: e, at };
+    }
+    if (e.ts + (e.dur ?? 0) > this.end) {
+      this.end = e.ts + (e.dur ?? 0);
+      this.last = { event: e, at };
     }
   }
-  return best;
+}
+
+/**
+ * Whether analyzeTrace reads this event, given the main thread. The streaming summary keeps
+ * only these, so the rule lives here beside the analyzers: whoever changes what an analyzer
+ * reads changes this in the same file, and the equivalence tests fail until they do.
+ * Window events are not here: the summary carries the window itself (see TraceWindow).
+ */
+export function eventsAnalysisReads(e: TraceEvent, main: { pid: number; tid: number } | null): boolean {
+  const instant = e.ph === 'I' || e.ph === 'i';
+  // analyzeFrames: instants on any compositor.
+  if ((e.name === 'DrawFrame' || e.name === 'DroppedFrame') && instant) return true;
+  // analyzeVitals: any frame.
+  if (e.name === 'LayoutShift' && instant) return true;
+  if (e.name === 'navigationStart' && e.ph === 'R') return true;
+  if (e.name === 'largestContentfulPaint::Candidate' && (e.ph === 'R' || instant)) return true;
+  if (!main) return false;
+  const onMain = e.pid === main.pid && e.tid === main.tid;
+  // analyzeProfile: the main thread's profiles, and chunks of its process (a chunk's tid is the sampler's).
+  if (e.name === 'Profile' && e.ph === 'P' && onMain) return true;
+  if (e.name === 'ProfileChunk' && e.ph === 'P' && e.pid === main.pid) return true;
+  // findMainThread: the main thread's name and task time, under its key.
+  if (e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain' && threadKey(e) === threadKey(main)) return true;
+  if (e.ph === 'X' && e.name === 'RunTask' && threadKey(e) === threadKey(main)) return true;
+  // Task timing and time by category: every timed event of the main thread.
+  return isTimed(e) && onMain;
 }
 
 /** Total length of the union of [start, end) spans, in microseconds. */
@@ -518,20 +589,16 @@ function selfTimeByCategory(spans: Span[]): CategoryMs {
 }
 
 export function analyzeTrace(events: TraceEvent[], options: AnalyzeOptions = {}): TraceSummary {
-  const timed = events.filter((e) => e.ph === 'X' && e.dur !== undefined);
+  const timed = events.filter(isTimed);
   const main = findMainThread(events);
   const mainSpans = main
     ? timed.filter((e) => e.pid === main.pid && e.tid === main.tid).map(spanOf)
     : [];
   const tasks = mainSpans.filter((s) => s.name === 'RunTask');
 
-  // A loop, not Math.min(...xs): real traces exceed the spread argument limit.
-  let windowStart = Infinity;
-  let windowEnd = -Infinity;
-  for (const e of timed) {
-    if (e.ts < windowStart) windowStart = e.ts;
-    if (e.ts + (e.dur ?? 0) > windowEnd) windowEnd = e.ts + (e.dur ?? 0);
-  }
+  const window = new TraceWindow();
+  for (const e of timed) window.add(e);
+  const { start: windowStart, end: windowEnd } = window;
   const windowUs = timed.length ? windowEnd - windowStart : 0;
 
   return {
