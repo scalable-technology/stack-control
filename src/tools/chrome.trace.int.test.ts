@@ -719,12 +719,27 @@ describe.skipIf(!chromeAvailable)('chrome profile: one call in headless Chrome',
     const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as { id: string; url: string }[];
     const original = targets.find((x) => x.url.startsWith(quiet.url));
     expect(original).toBeDefined();
+    // Every CDP method sent while the profile runs: the proof is that no gesture went out at all,
+    // not only that no page moved (a late gesture on the old tab is cut off by the switch).
+    const sent: string[] = [];
+    const realSend = WebSocket.prototype.send;
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      if (typeof data === 'string') sent.push(String((JSON.parse(data) as { method?: string }).method));
+      return (realSend as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
     try {
-      const running = profile({ durationMs: 3000, scroll: { distance: 1200, speed: 800 } });
-      // The trace has started, and the 500ms settle leaves room: the scroll has not been sent yet.
-      await traceStarted(browser.port);
-      expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
-      const r = await running;
+      let r: Awaited<ReturnType<typeof profile>>;
+      try {
+        const running = profile({ durationMs: 3000, scroll: { distance: 1200, speed: 800 } });
+        // The trace has started, and the 500ms settle leaves room: the scroll has not been sent yet.
+        await traceStarted(browser.port);
+        expect((await call({ method: 'select', targetId: other.id })).success).toBe(true);
+        r = await running;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(sent).toContain('Tracing.start');
+      expect(sent).not.toContain('Input.synthesizeScrollGesture');
       expect(r.success).toBe(false);
       expect(r.error).toMatch(/no longer the active recording/);
       for (let i = 0; i < 50 && (await evaluate('document.readyState')) !== 'complete'; i++) await sleep(100);
