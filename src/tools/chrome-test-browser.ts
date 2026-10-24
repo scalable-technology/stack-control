@@ -39,7 +39,8 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
       '--window-size=1000,800',
       'about:blank',
     ],
-    { stdio: 'ignore' }
+    // Its own process group, so close() can kill Chrome's helper processes with the main one.
+    { stdio: 'ignore', detached: true }
   );
   let spawnError: Error | null = null;
   proc.once('error', (e) => {
@@ -50,7 +51,11 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
     // A spawn that failed has no pid and never exits; a live process must be gone before its
     // profile is deleted, and if it will not die the profile is left in place rather than raced.
     if (proc.pid !== undefined) {
-      proc.kill('SIGKILL');
+      try {
+        process.kill(-proc.pid, 'SIGKILL');
+      } catch {
+        proc.kill('SIGKILL');
+      }
       const gone = await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]);
       if (!gone) throw new Error(`Chrome (pid ${proc.pid}) did not exit; left ${dir} in place`);
     }
@@ -60,7 +65,8 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
   };
 
   const portFile = join(dir, 'DevToolsActivePort');
-  for (let i = 0; i < 100; i++) {
+  // A cold start can be slow while the machine scans the freshly started binary; wait up to 45s.
+  for (let i = 0; i < 300; i++) {
     if (spawnError) {
       await close();
       throw new Error(`Could not start Chrome at ${CHROME_PATH}: ${(spawnError as Error).message}`);
@@ -72,7 +78,7 @@ export async function launchTestBrowser(): Promise<TestBrowser> {
     await sleep(150);
   }
   await close();
-  throw new Error('Headless Chrome did not report a debug port within 15s');
+  throw new Error('Headless Chrome did not report a debug port within 45s');
 }
 
 export interface TestServer {
