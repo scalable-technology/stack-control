@@ -223,6 +223,17 @@ describe('TraceEventScanner', () => {
     expect(r).toMatchObject({ state: 'done', oversized: 1, events: [{ n: 1 }] });
   });
 
+  it('gives the callback the byte length of each element, in one chunk or many', () => {
+    const text = '[{"a":"é"}, {"b":[1,2]}]';
+    for (const size of [1, 3, 4096]) {
+      const sizes: number[] = [];
+      const scanner = new TraceEventScanner((_e, bytes) => { sizes.push(bytes); });
+      const b = Buffer.from(text);
+      for (let i = 0; i < b.length; i += size) scanner.write(b.subarray(i, i + size));
+      expect(sizes, `chunk ${size}`).toEqual([Buffer.byteLength('{"a":"é"}'), Buffer.byteLength('{"b":[1,2]}')]);
+    }
+  });
+
   it('stops when the callback returns false', () => {
     const scanner = new TraceEventScanner(() => false);
     scanner.write(Buffer.from('[{"a":1},{"b":2}'));

@@ -95,7 +95,7 @@ export class TraceEventScanner {
   private keyIsEvents = false;
 
   constructor(
-    private readonly onEvent: (event: Record<string, unknown>) => boolean | void,
+    private readonly onEvent: (event: Record<string, unknown>, bytes: number) => boolean | void,
     private readonly maxEventBytes = MAX_EVENT_BYTES
   ) {}
 
@@ -350,6 +350,7 @@ export class TraceEventScanner {
     this.mode = AFTER_ELEMENT;
     start = Math.max(start, 0);
     let text: string;
+    let bytes = end - start;
     if (this.pending === null && !this.tooLarge) {
       // The whole element is in this chunk: decoded from it, no copy.
       if (end - start > this.maxEventBytes) this.tooLarge = true;
@@ -357,6 +358,7 @@ export class TraceEventScanner {
     } else {
       this.keepPiece(chunk, start, end);
       text = this.tooLarge ? '' : this.pending!.toString('utf8', 0, this.valueBytes);
+      bytes = this.valueBytes;
     }
     this.pending = null;
     if (this.tooLarge) {
@@ -373,7 +375,7 @@ export class TraceEventScanner {
     }
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return;
     this.events++;
-    if (this.onEvent(value as Record<string, unknown>) === false) this.state = 'stopped';
+    if (this.onEvent(value as Record<string, unknown>, bytes) === false) this.state = 'stopped';
   }
 }
 
@@ -411,7 +413,7 @@ const STALLED = Symbol('stalled');
  */
 export async function scanTraceEvents(
   source: AsyncIterable<Buffer>,
-  onEvent: (event: Record<string, unknown>) => boolean | void,
+  onEvent: (event: Record<string, unknown>, bytes: number) => boolean | void,
   options: ScanOptions
 ): Promise<ScanResult> {
   const { maxBytes, deadline, now = Date.now, tick = nextTurn, yieldBytes = 1024 * 1024, closeWaitMs = 2000 } = options;

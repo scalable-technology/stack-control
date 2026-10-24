@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeTrace, type TraceEvent, type TraceSummary } from './chrome-trace.js';
 import { scanTraceEvents } from './chrome-trace-stream.js';
 import {
+  MAX_KEPT_BYTES,
   MAX_KEPT_EVENTS,
   MAX_THREADS,
   SUMMARY_MAX_BYTES,
@@ -516,6 +517,37 @@ describe('summarizeTraceFile: streaming', () => {
     expect(skippedOf(r)).toBe(`The trace has tasks on over ${MAX_THREADS} threads; open the file in DevTools or Perfetto`);
     const fits = events.slice(0, MAX_THREADS);
     expect(summaryOf(await summarizeTraceSource(sourceOf(JSON.stringify(fits)), { compressed: false })).windowMs).toBe(MAX_THREADS);
+  });
+
+  it('allows 256MiB of kept event text by default', () => {
+    expect(MAX_KEPT_BYTES).toBe(256 * 1024 * 1024);
+  });
+
+  describe('kept event text', () => {
+    // 100 kept events of about 560 bytes fit in 64KiB; 300 do not.
+    const named = (n: number, where = MAIN) => [
+      thread(MAIN, 'CrRendererMain'),
+      ...Array.from({ length: n }, (_, i) => x(`SECRET-${'n'.repeat(500)}-${i}`, i, 0.5, where)),
+    ];
+    const cap = 64 * 1024;
+
+    it('skips a trace whose kept events carry more text than the cap, in our own words', async () => {
+      const r = await summarizeTraceSource(sourceOf(JSON.stringify(named(300))), { compressed: false, maxKeptBytes: cap });
+      expect(skippedOf(r)).toBe('The trace has over 65536 bytes of events the summary reads; open the file in DevTools or Perfetto');
+    });
+
+    it('summarizes the same trace with fewer events', async () => {
+      const events = named(100);
+      const r = await summarizeTraceSource(sourceOf(JSON.stringify(events)), { compressed: false, maxKeptBytes: cap });
+      expect(summaryOf(r)).toStrictEqual(boundSummary(analyzeTrace(events)));
+    });
+
+    it('does not count the text of events it drops', async () => {
+      // Dropped first: a kept event after them would see their bytes if they were counted.
+      const events = [...named(300, OTHER), ...named(10).slice(1)];
+      const r = await summarizeTraceSource(sourceOf(JSON.stringify(events)), { compressed: false, maxKeptBytes: cap });
+      expect(summaryOf(r)).toStrictEqual(boundSummary(analyzeTrace(events)));
+    });
   });
 
   it('skips a summary that runs past its time limit, on its clock', async () => {

@@ -2466,7 +2466,8 @@ export const chromeTool: Tool = {
   The summary streams the file twice and holds only the events it reads, so
   memory grows with those, not with the file: a real 8s profile (184MB
   decompressed) took about 130MB and 2-3s. No summary for a trace over
-  1024MB decompressed, one with over 1000000 events to keep, or one whose two
+  1024MB decompressed, one with over 1000000 events to keep (or over 256MB
+  of their text), or one whose two
   reads take over 60s (the analysis after them, about 0.2s at that cap, is
   not timed). What it returns is limited by count and length: the 10 longest tasks with a total
   count, the 10 hottest functions, 10 shifts, strings cut at 200 characters,

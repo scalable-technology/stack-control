@@ -6,7 +6,10 @@
  * page and can say anything, including text aimed at whoever reads the result.
  *
  * The file is streamed twice and never held whole (see chrome-trace-stream); what
- * is kept is held, and grows with the trace up to MAX_KEPT_EVENTS. The first pass
+ * is kept is held, and grows with the trace up to MAX_KEPT_EVENTS and MAX_KEPT_BYTES.
+ * The structure is trusted to be Chrome's; the strings in it are the page's. A trace
+ * with forged structure (deep or dense arrays) can cost several times its text in
+ * memory once parsed, bounded then only by SUMMARY_MAX_BYTES. The first pass
  * keeps almost nothing: which thread is the main thread, and the trace window. The
  * second keeps only the events analyzeTrace reads for that thread
  * (eventsAnalysisReads), plus two events that carry the window, and analyzeTrace
@@ -41,13 +44,21 @@ import { scanTraceEvents, type ScanResult } from './chrome-trace-stream.js';
 export const SUMMARY_MAX_BYTES = 1024 * 1024 * 1024;
 
 /**
- * Events the second pass may keep. A real 8s three.js profile kept 180,577 of 856,875 and grew
- * RSS by 133MB (about 700 bytes an event), so a 30s one keeps about 700,000. At the cap that is
- * about 700MB, as much as the old whole-file summary took at its 128MB limit. Events with large
- * args cost more: the cap counts events, not bytes. analyzeTrace over 1,000,000 kept task and
- * frame events took 212ms (measured); it runs after the scans, outside their time limit.
+ * Events the second pass may keep; MAX_KEPT_BYTES bounds their text. A real 8s three.js profile
+ * kept 180,577 of 856,875 and grew RSS by 133MB (about 700 bytes an event), so a 30s one keeps
+ * about 700,000. At the cap that is about 700MB, as much as the old whole-file summary took at its
+ * 128MB limit. analyzeTrace over 1,000,000 kept task and frame events took 212ms (measured); it
+ * runs after the scans, outside their time limit.
  */
 export const MAX_KEPT_EVENTS = 1_000_000;
+
+/**
+ * Text of the events the second pass may keep, counted as the scanner reads it. Kept memory is
+ * the parsed size of these events: about their text for the strings a page chooses (mark names,
+ * function names, URLs), more only for structure, which is trusted to be Chrome's. The real 8s
+ * profile kept 37.7MB of text (180,575 events, of 174MB in all), so a 30s one keeps about 140MB.
+ */
+export const MAX_KEPT_BYTES = 256 * 1024 * 1024;
 
 /** Threads the first pass may hold a name or task time for. A real browser trace has a few hundred. */
 export const MAX_THREADS = 10_000;
@@ -191,6 +202,8 @@ export interface SourceOptions {
   /** Picks the words for a source past the cap: a gzip inflates past it. */
   compressed: boolean;
   maxBytes?: number;
+  /** Text of kept events; MAX_KEPT_BYTES by default. */
+  maxKeptBytes?: number;
   timeLimitMs?: number;
   now?: () => number;
 }
@@ -233,14 +246,23 @@ export async function summarizeTraceSource(
   const main = first.tally.pick();
   const kept = first.windowEvents();
   let count = 0;
-  const two = await scanTraceEvents(open(), (e) => {
+  const maxKeptBytes = options.maxKeptBytes ?? MAX_KEPT_BYTES;
+  let keptBytes = 0;
+  const two = await scanTraceEvents(open(), (e, bytes) => {
     const event = e as unknown as TraceEvent;
     if (!eventsAnalysisReads(event, main)) return true;
-    if (++count > MAX_KEPT_EVENTS) return false;
+    keptBytes += bytes;
+    if (++count > MAX_KEPT_EVENTS || keptBytes > maxKeptBytes) return false;
     kept.push(event);
     return true;
   }, scan);
-  if (two.end === 'stopped') return { skipped: `The trace has over ${MAX_KEPT_EVENTS} events the summary reads; ${DEVTOOLS}` };
+  if (two.end === 'stopped') {
+    return {
+      skipped: count > MAX_KEPT_EVENTS
+        ? `The trace has over ${MAX_KEPT_EVENTS} events the summary reads; ${DEVTOOLS}`
+        : `The trace has over ${size(maxKeptBytes)} of events the summary reads; ${DEVTOOLS}`,
+    };
+  }
   if (two.end !== 'done') return why(two);
   // The main thread and window came from the first read: a different file now would not match them.
   if (two.events !== one.events || two.bytes !== one.bytes) return { skipped: 'The trace file changed while it was read' };
