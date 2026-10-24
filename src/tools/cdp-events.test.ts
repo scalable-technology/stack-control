@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { waitForCdpEvent } from './cdp-events.js';
+import { waitForCdpEvent, waitForCdpEventMatching } from './cdp-events.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -89,5 +89,77 @@ describe('waitForCdpEvent', () => {
     e.emit('cdp', { method: 'X.y', params: { ok: true } });
     await expect(p).resolves.toEqual({ ok: true });
     expect(() => c.abort()).not.toThrow();
+  });
+});
+
+describe('waitForCdpEventMatching', () => {
+  const created = (name: string) => ({ method: 'Runtime.executionContextCreated', params: { context: { name } } });
+  const named = (want: string) => (p: Record<string, unknown>) => (p.context as { name?: unknown }).name === want;
+
+  it('ignores events the predicate refuses and resolves with the first it accepts', async () => {
+    const e = new EventEmitter();
+    const p = waitForCdpEventMatching(e, 'Runtime.executionContextCreated', named('ours'), 1000);
+    e.emit('cdp', created(''));
+    e.emit('cdp', { method: 'Other.event', params: { context: { name: 'ours' } } });
+    e.emit('cdp', created('ours'));
+    e.emit('cdp', created('ours-later'));
+    await expect(p).resolves.toEqual({ context: { name: 'ours' } });
+    expect(listeners(e)).toBe(0);
+  });
+
+  it('is already listening when it returns, and only for that method', async () => {
+    const e = new EventEmitter();
+    const seen: string[] = [];
+    const p = waitForCdpEventMatching(e, 'X.y', (params) => { seen.push(String(params.n)); return params.n === 2; }, 1000);
+    expect(e.listenerCount('cdp')).toBe(1);
+    e.emit('cdp', { method: 'X.z', params: { n: 2 } });
+    e.emit('cdp', { method: 'X.y', params: { n: 1 } });
+    e.emit('cdp', { method: 'X.y', params: { n: 2 } });
+    await expect(p).resolves.toEqual({ n: 2 });
+    expect(seen).toEqual(['1', '2']);
+  });
+
+  it('counts a predicate that throws as a no, without throwing into the emitter', async () => {
+    const e = new EventEmitter();
+    const p = waitForCdpEventMatching(e, 'X.y', (params) => { if (params.bad) throw new Error('page data'); return true; }, 1000);
+    expect(() => e.emit('cdp', { method: 'X.y', params: { bad: true } })).not.toThrow();
+    expect(listeners(e)).toBe(2);
+    e.emit('cdp', { method: 'X.y', params: { good: true } });
+    await expect(p).resolves.toEqual({ good: true });
+  });
+
+  it('rejects on timeout when nothing matches, and removes its listeners', async () => {
+    vi.useFakeTimers();
+    const e = new EventEmitter();
+    const p = waitForCdpEventMatching(e, 'X.y', () => false, 2000);
+    const assertion = expect(p).rejects.toThrow(/Timed out after 2s waiting for X\.y/);
+    e.emit('cdp', { method: 'X.y', params: {} });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(listeners(e)).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await assertion;
+    expect(listeners(e)).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects on teardown and removes its listeners and timer', async () => {
+    vi.useFakeTimers();
+    const e = new EventEmitter();
+    const p = waitForCdpEventMatching(e, 'X.y', () => false, 2000);
+    e.emit('teardown');
+    await expect(p).rejects.toThrow(/Connection closed while waiting for X\.y/);
+    expect(listeners(e)).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects on abort and removes its listeners and timer', async () => {
+    vi.useFakeTimers();
+    const e = new EventEmitter();
+    const c = new AbortController();
+    const p = waitForCdpEventMatching(e, 'X.y', () => false, 2000, c.signal);
+    c.abort();
+    await expect(p).rejects.toThrow(/Stopped waiting for X\.y/);
+    expect(listeners(e)).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
