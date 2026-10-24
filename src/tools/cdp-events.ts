@@ -17,11 +17,33 @@ export function waitForCdpEvent(
   timeoutMs: number,
   signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
+  return waitForCdpEventMatching(emitter, method, () => true, timeoutMs, signal);
+}
+
+/**
+ * waitForCdpEvent for the first event of this method whose params the predicate accepts. Params are
+ * Chrome's data: a predicate that throws on them counts as a no, and the event goes on to the client.
+ */
+export function waitForCdpEventMatching(
+  emitter: EventEmitter,
+  method: string,
+  predicate: (params: Record<string, unknown>) => boolean,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const onEvent = (event: { method?: string; params?: Record<string, unknown> }) => {
       if (event.method !== method) return;
+      const params = event.params ?? {};
+      let matches = false;
+      try {
+        matches = predicate(params);
+      } catch {
+        matches = false;
+      }
+      if (!matches) return;
       cleanup();
-      resolve(event.params ?? {});
+      resolve(params);
     };
     const onTeardown = () => {
       cleanup();
