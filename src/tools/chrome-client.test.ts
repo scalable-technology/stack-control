@@ -1,6 +1,8 @@
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer, type WebSocket as ServerSocket } from 'ws';
+import { MAX_EXECUTION_CONTEXTS } from './cdp-events.js';
+import { METRICS_WORLD_NAME } from './chrome-metrics.js';
 import { ChromeCDPClient } from './chrome.js';
 
 /**
@@ -156,5 +158,22 @@ describe('ChromeCDPClient: the execution contexts Chrome announced', () => {
     expect(client.executionContext(5)).toBeDefined();
     client.disconnect();
     expect(client.executionContext(5)).toBeUndefined();
+  });
+});
+
+describe('ChromeCDPClient: the metrics world survives a page of many frames', () => {
+  it(`keeps its world when more than ${MAX_EXECUTION_CONTEXTS} other contexts follow it`, async () => {
+    const { chrome, client } = await connected([]);
+    const ctx = (id: number, name: string) => ({
+      method: 'Runtime.executionContextCreated',
+      params: { context: { id, uniqueId: `U-${id}`, name, auxData: { frameId: 'T1', type: name ? 'isolated' : 'default' } } },
+    });
+    chrome.emit(ctx(1, METRICS_WORLD_NAME));
+    const last = MAX_EXECUTION_CONTEXTS + 50;
+    for (let id = 2; id <= last; id++) chrome.emit(ctx(id, ''));
+    for (let i = 0; i < 200 && client.executionContext(last) === undefined; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(client.executionContext(last)).toBeDefined();
+    expect(client.executionContext(1)?.name).toBe(METRICS_WORLD_NAME);
+    expect(client.executionContext(2)).toBeUndefined();
   });
 });

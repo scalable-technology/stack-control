@@ -1196,11 +1196,13 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect(hazard, 'the numeric id of our world did not come to name a page world on the other site').toBe(true);
     expect(probes).toHaveLength(1);
     expect(probes[0]).not.toHaveProperty('contextId');
+    expect(typeof probes[0].uniqueContextId).toBe('string');
+    expect((probes[0].uniqueContextId as string).length).toBeGreaterThan(0);
     expect(r.success, r.error).toBe(true);
     const d = r.data as MetricsData;
     // The probe found its world gone and said so; it never ran where the page's 0.777 shift lives.
     expect(d.vitals).toBeNull();
-    expect(d.vitalsError).toBe('Chrome refused to run the vitals probe.');
+    expect(d.vitalsError).toBe('The page navigated while measuring the vitals; run metrics again.');
   }, 60_000);
 
   it('reuses one world per document: repeated calls and navigations make no extra worlds', async () => {
@@ -1212,7 +1214,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     let socket: WebSocket | undefined;
     const onMessage = (raw: WebSocket.RawData) => {
       const m = JSON.parse(String(raw)) as { method?: string; params?: { context?: { name?: string; uniqueId?: string } } };
-      if (m.method === 'Runtime.executionContextCreated' && m.params?.context?.name === 'control-metrics') announced.push(doc);
+      if (m.method === 'Runtime.executionContextCreated' && m.params?.context?.name?.startsWith('control-metrics-')) announced.push(doc);
     };
     const real = WebSocket.prototype.send;
     const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {

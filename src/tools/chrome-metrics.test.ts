@@ -1,8 +1,9 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ExecutionContextMap, waitForCdpEventMatching } from './cdp-events.js';
 import {
   MAX_VITAL_ENTRIES,
+  METRICS_WORLD_NAME,
   TAB_CHANGED,
   createMetricsReader,
   inpOf,
@@ -336,7 +337,7 @@ interface FakeMetricsOptions {
 const ourWorld = (id: number, extra: Record<string, unknown> = {}) => ({
   id,
   uniqueId: `U-${id}`,
-  name: 'control-metrics',
+  name: METRICS_WORLD_NAME,
   origin: 'http://127.0.0.1:1',
   auxData: { frameId: 'T1', isDefault: false, type: 'isolated' },
   ...extra,
@@ -378,6 +379,9 @@ function fakeCdp(options: FakeMetricsOptions = {}) {
         : options.answers && method in options.answers ? options.answers[method] : defaults[method];
       if (answer === 'reject') throw new Error(`Command ${method} timed out after 30s`);
       if (answer === 'error') return { error: { message: `${method} refused` } };
+      if (typeof answer === 'object' && answer !== null && 'cdpError' in answer) {
+        return { error: (answer as { cdpError: { code: number; message: string } }).cdpError };
+      }
       if (method === 'Page.createIsolatedWorld' && answer === undefined) {
         const id = nextWorld++;
         if (options.announce === 'after') setTimeout(() => announce(id), 5);
@@ -422,7 +426,9 @@ describe('readMetrics', () => {
       'Page.createIsolatedWorld', 'Runtime.evaluate',
     ]);
     // The page target's id is its main frame's id: no frame tree (page names and URLs) is fetched.
-    expect(f.sent[3].params).toEqual({ frameId: 'T1', worldName: 'control-metrics' });
+    expect(f.sent[3].params).toEqual({ frameId: 'T1', worldName: METRICS_WORLD_NAME });
+    // A page that blocks its main thread holds createIsolatedWorld too: bounded like the probe.
+    expect(f.sent[3].timeoutMs).toBe(10_000);
     const evaluate = f.sent[4];
     // The world is addressed by the unique id Chrome announced for it, never by its numeric id.
     expect(evaluate.params).toMatchObject({ uniqueContextId: 'U-77', returnByValue: true, awaitPromise: true });
@@ -575,6 +581,51 @@ describe('readMetrics', () => {
     const f = fakeCdp({ contexts: (id) => [ourWorld(id, { uniqueId: 'u'.repeat(200) })] });
     await readMetrics(f.cdp, always, 'T1');
     expect(f.evaluates()).toEqual([expect.objectContaining({ uniqueContextId: 'u'.repeat(200) })]);
+  });
+
+  it('names its world with a nonce of this process: stable across calls, new in a fresh module', async () => {
+    expect(METRICS_WORLD_NAME).toMatch(/^control-metrics-[0-9a-f]{12}$/);
+    expect(METRICS_WORLD_NAME.length).toBeLessThanOrEqual(64);
+    const f = fakeCdp();
+    await readMetrics(f.cdp, always, 'T1');
+    await readMetrics(f.cdp, always, 'T1');
+    const names = f.sent.filter((x) => x.method === 'Page.createIsolatedWorld').map((x) => x.params?.worldName);
+    expect(names).toEqual([METRICS_WORLD_NAME, METRICS_WORLD_NAME]);
+    vi.resetModules();
+    const fresh = await import('./chrome-metrics.js');
+    expect(fresh.METRICS_WORLD_NAME).toMatch(/^control-metrics-[0-9a-f]{12}$/);
+    expect(fresh.METRICS_WORLD_NAME).not.toBe(METRICS_WORLD_NAME);
+  });
+
+  it.each([
+    ["the plain name another tool or an extension could use", { name: 'control-metrics' }],
+    ['our nonce name with type default', { auxData: { frameId: 'T1', isDefault: true, type: 'default' } }],
+  ])('refuses an isolated context with %s', async (_label, extra) => {
+    const f = fakeCdp({ contexts: (id) => [ourWorld(id, extra)] });
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toMatch(/names another context/);
+    expect(f.evaluates()).toEqual([]);
+  });
+
+  it.each([
+    [-32000, 'Cannot find context with specified id'],
+    [-32602, 'uniqueContextId not found'],
+  ])('says the page navigated when the probe finds its world gone (%d %s)', async (code, message) => {
+    const f = fakeCdp({ answers: { 'Runtime.evaluate': { cdpError: { code, message } } } });
+    const r = await readMetrics(f.cdp, always, 'T1');
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toBe('The page navigated while measuring the vitals; run metrics again.');
+  });
+
+  it.each([
+    [-32000, 'Execution was terminated'],
+    [-32602, 'Cannot find context with specified id'],
+    [-32000, 'uniqueContextId not found'],
+  ])('keeps the refusal text for any other error (%d %s)', async (code, message) => {
+    const f = fakeCdp({ answers: { 'Runtime.evaluate': { cdpError: { code, message } } } });
+    const r = await readMetrics(f.cdp, always, 'T1');
+    expect((r.data as VitalsData).vitalsError).toBe('Chrome refused to run the vitals probe.');
   });
 
   it('gives vitals null, and sends no probe, without a target id to make the world in', async () => {

@@ -263,3 +263,36 @@ describe('ExecutionContextMap', () => {
     expect(m.size).toBe(0);
   });
 });
+
+describe('ExecutionContextMap: a protected name', () => {
+  const created = (id: number, name: string) => ({
+    method: 'Runtime.executionContextCreated',
+    params: { context: { id, uniqueId: `U-${id}`, name, auxData: { frameId: 'F1', type: 'isolated' } } },
+  });
+
+  it('never evicts a context with that name; the others go oldest first', () => {
+    const m = new ExecutionContextMap({ protectedName: 'ours-nonce' });
+    m.onEvent(created(1, 'ours-nonce'));
+    for (let id = 2; id <= MAX_EXECUTION_CONTEXTS + 10; id++) m.onEvent(created(id, ''));
+    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
+    expect(m.get(1)?.name).toBe('ours-nonce');
+    for (let id = 2; id <= 11; id++) expect(m.get(id)).toBeUndefined();
+    expect(m.get(12)).toBeDefined();
+    expect(m.get(MAX_EXECUTION_CONTEXTS + 10)).toBeDefined();
+  });
+
+  it('evicts the oldest when every context has the protected name', () => {
+    const m = new ExecutionContextMap({ protectedName: 'p' });
+    for (let id = 1; id <= MAX_EXECUTION_CONTEXTS + 1; id++) m.onEvent(created(id, 'p'));
+    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
+    expect(m.get(1)).toBeUndefined();
+    expect(m.get(2)).toBeDefined();
+  });
+
+  it('protects nothing without the option', () => {
+    const m = new ExecutionContextMap();
+    m.onEvent(created(1, ''));
+    for (let id = 2; id <= MAX_EXECUTION_CONTEXTS + 1; id++) m.onEvent(created(id, 'x'));
+    expect(m.get(1)).toBeUndefined();
+  });
+});
