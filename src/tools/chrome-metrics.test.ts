@@ -8,6 +8,7 @@ import {
   createMetricsReader,
   inpOf,
   lcpOf,
+  metricsWindow,
   pageVitals,
   pickMetrics,
   readMetrics,
@@ -142,21 +143,14 @@ describe('pickMetrics', () => {
     { name: 'TaskDuration', value: 1.5 },
   ];
 
-  it('keeps the named metrics, converts durations to ms with 2 decimals, and drops the rest', () => {
-    expect(pickMetrics(real)).toEqual({
+  it('keeps the instantaneous metrics and drops the counters, which read about 0 outside a window', () => {
+    expect(pickMetrics(real)).toStrictEqual({
       nodes: 512,
       documents: 2,
       frames: 1,
       jsEventListeners: 7,
       jsHeapUsedBytes: 1_500_000,
       jsHeapTotalBytes: 3_000_000,
-      layoutCount: 4,
-      recalcStyleCount: 5,
-      layoutMs: 12.35,
-      recalcStyleMs: 2,
-      scriptMs: 250,
-      v8CompileMs: 1.23,
-      taskMs: 1500,
     });
   });
 
@@ -170,15 +164,75 @@ describe('pickMetrics', () => {
       'Nodes',
     ]);
     expect(Object.values(m).every((v) => v === null)).toBe(true);
-    expect(Object.keys(m)).toHaveLength(13);
+    expect(Object.keys(m)).toHaveLength(6);
   });
 
   it('gives all null for a result that is not an array', () => {
     for (const raw of [undefined, null, {}, 'metrics', { length: 3, 0: { name: 'Nodes', value: 1 } }]) {
       const m = pickMetrics(raw);
       expect(m.nodes).toBeNull();
-      expect(Object.keys(m)).toHaveLength(13);
+      expect(Object.keys(m)).toHaveLength(6);
     }
+  });
+});
+
+/** A getMetrics answer: [name, value] pairs. */
+const answer = (...pairs: [string, unknown][]) => pairs.map(([name, value]) => ({ name, value }));
+
+const A = answer(['Timestamp', 100], ['Nodes', 10], ['JSHeapUsedSize', 1000], ['LayoutCount', 4], ['RecalcStyleCount', 5],
+  ['LayoutDuration', 0.01], ['RecalcStyleDuration', 0.002], ['ScriptDuration', 0.25], ['V8CompileDuration', 0.001], ['TaskDuration', 1.5]);
+const B = answer(['Timestamp', 101.00123], ['Nodes', 12], ['JSHeapUsedSize', 2000], ['LayoutCount', 10], ['RecalcStyleCount', 5],
+  ['LayoutDuration', 0.0223456], ['RecalcStyleDuration', 0.002], ['ScriptDuration', 0.75], ['V8CompileDuration', 0.001], ['TaskDuration', 2.123]);
+const WINDOW = { ms: 1001.23, layoutCount: 6, recalcStyleCount: 0, layoutMs: 12.35, recalcStyleMs: 0, scriptMs: 500, v8CompileMs: 0, taskMs: 623 };
+
+describe('metricsWindow', () => {
+  it('gives each counter as B minus A, durations in ms to 2 decimals, and ms from Chrome\'s Timestamp', () => {
+    expect(metricsWindow(A, B, 5)).toStrictEqual(WINDOW);
+  });
+
+  it('gives null for a counter missing from either read, never 0', () => {
+    const w = metricsWindow(A.filter((m) => m.name !== 'LayoutCount'), B.filter((m) => m.name !== 'ScriptDuration'), 5);
+    expect(w).toStrictEqual({ ...WINDOW, layoutCount: null, scriptMs: null });
+  });
+
+  it('gives null for a value that is not a finite number', () => {
+    const bad = B.map((m) => (m.name === 'RecalcStyleCount' ? { ...m, value: NaN } : m.name === 'TaskDuration' ? { ...m, value: Infinity } : m));
+    const str = B.map((m) => (m.name === 'LayoutCount' ? { ...m, value: '10' } : m));
+    expect(metricsWindow(A, bad, 5)).toStrictEqual({ ...WINDOW, recalcStyleCount: null, taskMs: null });
+    expect(metricsWindow(A, str, 5)).toStrictEqual({ ...WINDOW, layoutCount: null });
+  });
+
+  it('gives null for a counter that went down, never a negative number', () => {
+    const w = metricsWindow(B, A, 5);
+    expect(Object.values(w).every((v) => v === null || v === 0)).toBe(true);
+    expect(w).toStrictEqual({ ms: null, layoutCount: null, recalcStyleCount: 0, layoutMs: null, recalcStyleMs: 0, scriptMs: null, v8CompileMs: 0, taskMs: null });
+  });
+
+  it('falls back to the measured wall time when Timestamp is missing', () => {
+    expect(metricsWindow(A.slice(1), B, 1234.567).ms).toBe(1234.57);
+    expect(metricsWindow(A, B.slice(1), 999).ms).toBe(999);
+  });
+
+  it('checks the raw difference before rounding: a fall too small to show is still a fall', () => {
+    const at = (v: number) => answer(['ScriptDuration', v]);
+    expect(metricsWindow(at(0.5), at(0.5 - 1e-6), 5).scriptMs).toBeNull();
+    expect(metricsWindow(at(0.5), at(0.5), 5).scriptMs).toBe(0);
+    expect(Object.is(metricsWindow(at(0.5), at(0.5 + 1e-6), 5).scriptMs, 0)).toBe(true);
+    expect(metricsWindow(answer(['LayoutCount', 3]), answer(['LayoutCount', 3]), 5).layoutCount).toBe(0);
+  });
+
+  it('reads metric names like __proto__ and constructor as data and pollutes nothing', () => {
+    const odd = answer(['__proto__', 5], ['constructor', 6], ['toString', 7], ['hasOwnProperty', 8], ['Nodes', 3]);
+    expect(pickMetrics(odd)).toStrictEqual({ nodes: 3, documents: null, frames: null, jsEventListeners: null, jsHeapUsedBytes: null, jsHeapTotalBytes: null });
+    expect(metricsWindow(odd, odd, 5).layoutCount).toBeNull();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+  });
+
+  it('gives all null for answers that are not arrays', () => {
+    expect(metricsWindow({ length: 1 }, null, 5)).toStrictEqual({
+      ms: 5, layoutCount: null, recalcStyleCount: null, layoutMs: null, recalcStyleMs: null, scriptMs: null, v8CompileMs: null, taskMs: null,
+    });
   });
 });
 
@@ -420,6 +474,9 @@ describe('readMetrics', () => {
     const d = r.data as { metrics: Record<string, unknown>; vitals: Record<string, unknown> };
     expect(d.metrics.nodes).toBe(42);
     expect(d.metrics.documents).toBeNull();
+    // Only what is true at an instant: no counters, not even as null, and no window without sampleMs.
+    expect(Object.keys(d.metrics).sort()).toEqual(['documents', 'frames', 'jsEventListeners', 'jsHeapTotalBytes', 'jsHeapUsedBytes', 'nodes']);
+    expect(d).not.toHaveProperty('window');
     expect(d.vitals).toEqual({ lcp: null, cls: 0.25, shiftCount: 1, inp: null });
     expect(f.methods()).toEqual([
       'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
@@ -728,8 +785,159 @@ describe('readMetrics', () => {
   });
 });
 
+/** A clock whose sleep returns 1ms early, as a timer can against Date.now(). */
+function fakeClock(start = 5000) {
+  const c = {
+    t: start,
+    sleeps: [] as number[],
+    now: () => c.t,
+    sleep: async (ms: number) => {
+      c.sleeps.push(ms);
+      c.t += ms > 1 ? ms - 1 : ms;
+    },
+  };
+  return c;
+}
+
+describe('readMetrics with sampleMs', () => {
+  const always = () => true;
+  const sampled = { 'Performance.getMetrics': [{ metrics: A }, { metrics: B }] };
+
+  it('reads A, waits sampleMs on the clock, reads B, then disables, and returns the window', async () => {
+    const clock = fakeClock();
+    let readBAt = 0;
+    const f = fakeCdp({ sequence: sampled, onSend: (m) => { if (m === 'Performance.getMetrics' && clock.sleeps.length) readBAt = clock.t; } });
+    const r = await readMetrics(f.cdp, always, 'T1', { sampleMs: 1000, now: clock.now, sleep: clock.sleep });
+    expect(r.success, r.error).toBe(true);
+    expect(f.methods()).toEqual([
+      'Performance.enable', 'Performance.getMetrics', 'Performance.getMetrics', 'Performance.disable',
+      'Page.createIsolatedWorld', 'Runtime.evaluate',
+    ]);
+    const d = r.data as { metrics: Record<string, unknown>; window: unknown };
+    expect(d.window).toStrictEqual(WINDOW);
+    // The instantaneous fields come from B.
+    expect(d.metrics).toMatchObject({ nodes: 12, jsHeapUsedBytes: 2000 });
+    // The timer came back 1ms early, so it slept again: B is read only once the clock says 1000ms passed.
+    expect(clock.sleeps).toEqual([1000, 1]);
+    expect(readBAt).toBe(6000);
+  });
+
+  it('waits on a monotonic clock by default, so a jump of the system clock neither cuts nor stretches it', async () => {
+    const real = Date.now.bind(Date);
+    let calls = 0;
+    // The system clock jumps an hour ahead after its first read.
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => real() + (calls++ > 0 ? 3_600_000 : 0));
+    try {
+      const f = fakeCdp({ sequence: { 'Performance.getMetrics': [{ metrics: A.slice(1) }, { metrics: B.slice(1) }] } });
+      const started = performance.now();
+      const r = await readMetrics(f.cdp, always, 'T1', { sampleMs: 150 });
+      const took = performance.now() - started;
+      expect(took).toBeGreaterThanOrEqual(149);
+      const ms = (r.data as { window: { ms: number } }).window.ms;
+      expect(ms).toBeGreaterThanOrEqual(149);
+      expect(ms).toBeLessThan(2000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('checks the tab on every turn of the wait, so a switch early in a long sample returns at once', async () => {
+    let selected = true;
+    const clock = fakeClock();
+    const f = fakeCdp({ sequence: sampled });
+    // Each sleep moves the clock at most 100ms, as a timer that wakes early would.
+    const sleep = async (ms: number) => {
+      await clock.sleep(Math.min(ms, 100));
+      selected = false;
+    };
+    const r = await readMetrics(f.cdp, () => selected, 'T1', { sampleMs: 5000, now: clock.now, sleep });
+    expect(r).toEqual({ success: false, error: TAB_CHANGED });
+    expect(clock.t - 5000).toBeLessThanOrEqual(100);
+    expect(f.methods()).toEqual(['Performance.enable', 'Performance.getMetrics', 'Performance.disable']);
+  });
+
+  describe('sends Performance.disable exactly once however the call fails', () => {
+    const disables = (methods: string[]) => methods.filter((m) => m === 'Performance.disable').length;
+    it.each([
+      ['enable is refused', { answers: { 'Performance.enable': 'error' } }],
+      ['enable gets no answer', { answers: { 'Performance.enable': 'reject' } }],
+      ['read A is refused', { sequence: { 'Performance.getMetrics': ['error'] } }],
+      ['read A gets no answer', { sequence: { 'Performance.getMetrics': ['reject'] } }],
+      ['read B is refused', { sequence: { 'Performance.getMetrics': [{ metrics: A }, 'error'] } }],
+      ['read B gets no answer', { sequence: { 'Performance.getMetrics': [{ metrics: A }, 'reject'] } }],
+    ] as const)('when %s', async (_label, setup) => {
+      const clock = fakeClock();
+      const f = fakeCdp(setup as FakeMetricsOptions);
+      const r = await readMetrics(f.cdp, always, 'T1', { sampleMs: 100, now: clock.now, sleep: clock.sleep });
+      expect(r.success).toBe(false);
+      expect(disables(f.methods())).toBe(1);
+      expect(f.methods().at(-1)).toBe('Performance.disable');
+    });
+
+    it('when the tab changed before the first read: nothing was enabled, so nothing is sent', async () => {
+      const f = fakeCdp({ sequence: sampled });
+      expect(await readMetrics(f.cdp, () => false, 'T1', { sampleMs: 100 })).toEqual({ success: false, error: TAB_CHANGED });
+      expect(f.methods()).toEqual([]);
+    });
+
+    it.each(['Performance.getMetrics', 'Runtime.evaluate'])('when the tab changes at %s', async (at) => {
+      let selected = true;
+      const clock = fakeClock();
+      const f = fakeCdp({ sequence: sampled, onSend: (m) => { if (m === at) selected = false; } });
+      const r = await readMetrics(f.cdp, () => selected, 'T1', { sampleMs: 100, now: clock.now, sleep: clock.sleep });
+      expect(r).toEqual({ success: false, error: TAB_CHANGED });
+      expect(disables(f.methods())).toBe(1);
+    });
+  });
+
+  it('measures the window with the clock when Chrome gives no Timestamp', async () => {
+    const clock = fakeClock();
+    const f = fakeCdp({ sequence: { 'Performance.getMetrics': [{ metrics: A.slice(1) }, { metrics: B.slice(1) }] } });
+    const r = await readMetrics(f.cdp, always, 'T1', { sampleMs: 300, now: clock.now, sleep: clock.sleep });
+    expect((r.data as { window: { ms: number } }).window.ms).toBe(300);
+  });
+
+  it.each(['error', 'reject'])('sends Performance.disable when read B gets %s', async (failure) => {
+    const clock = fakeClock();
+    const f = fakeCdp({ sequence: { 'Performance.getMetrics': [{ metrics: A }, failure] } });
+    const r = await readMetrics(f.cdp, always, 'T1', { sampleMs: 100, now: clock.now, sleep: clock.sleep });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/^Could not read Chrome's metrics: /);
+    expect(f.methods()).toEqual(['Performance.enable', 'Performance.getMetrics', 'Performance.getMetrics', 'Performance.disable']);
+  });
+
+  it('fails with the tab-changed error, reads no B and still disables, when the tab changes during the wait', async () => {
+    let selected = true;
+    const clock = fakeClock();
+    const f = fakeCdp({ sequence: sampled });
+    const sleep = async (ms: number) => {
+      selected = false;
+      await clock.sleep(ms);
+    };
+    const r = await readMetrics(f.cdp, () => selected, 'T1', { sampleMs: 500, now: clock.now, sleep });
+    expect(r).toEqual({ success: false, error: TAB_CHANGED });
+    expect(f.methods()).toEqual(['Performance.enable', 'Performance.getMetrics', 'Performance.disable']);
+  });
+});
+
 describe('createMetricsReader', () => {
   const perf = (methods: string[]) => methods.filter((m) => m.startsWith('Performance.'));
+
+  it('holds an overlapping call until a sampled call has disabled', async () => {
+    const f = fakeCdp({ sequence: { 'Performance.getMetrics': [{ metrics: A }, { metrics: B }] } });
+    const read = createMetricsReader();
+    const [a, b] = await Promise.all([
+      read(f.cdp, () => true, 'T1', { sampleMs: 100 }),
+      read(f.cdp, () => true, 'T1'),
+    ]);
+    expect(a.success && b.success).toBe(true);
+    expect(perf(f.methods())).toEqual([
+      'Performance.enable', 'Performance.getMetrics', 'Performance.getMetrics', 'Performance.disable',
+      'Performance.enable', 'Performance.getMetrics', 'Performance.disable',
+    ]);
+    expect((a.data as { window?: unknown }).window).toStrictEqual(WINDOW);
+    expect(b.data).not.toHaveProperty('window');
+  });
 
   it('runs overlapping calls one at a time, so one never disables the other mid-read', async () => {
     const f = fakeCdp({ onSend: () => new Promise((r) => setTimeout(r, 5)) });

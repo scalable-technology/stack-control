@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { analyzeTrace, type AnalyzeOptions, type TraceEvent } from './chrome-trace.js';
+import { MainThreadTally, analyzeTrace, type AnalyzeOptions, type TraceEvent } from './chrome-trace.js';
 
 const MAIN = { pid: 1, tid: 10 };
 
@@ -66,6 +66,18 @@ describe('analyzeTrace: long tasks', () => {
       ev('RunTask', 0, 200, compositor),
     ]);
     expect(s.longTasks).toEqual([]);
+  });
+
+  it('counts each thread once, named or timed or both', () => {
+    const tally = new MainThreadTally();
+    for (let i = 0; i < 5; i++) {
+      tally.add(threadName(1, i, 'CrRendererMain'));
+      tally.add(ev('RunTask', i, 1, { pid: 1, tid: i }));
+    }
+    tally.add(ev('RunTask', 0, 1, { pid: 2, tid: 0 }));
+    tally.add(threadName(3, 0, 'CrRendererMain'));
+    tally.add(threadName(1, 0, 'CrRendererMain'));
+    expect(tally.threads).toBe(7);
   });
 
   it('picks the busiest CrRendererMain when there are several', () => {

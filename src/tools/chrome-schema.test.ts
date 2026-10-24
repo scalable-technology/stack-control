@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ZodTypeAny } from 'zod';
-import { ProfileInput, ScrollInput, TraceInput, chromeTool } from './chrome.js';
+import { MetricsInput, ProfileInput, ScrollInput, TraceInput, chromeTool } from './chrome.js';
 
 // zod is the contract; the JSON schema is what a client sees first. Where both state a bound, they must agree.
 
@@ -52,6 +52,10 @@ const numericScrollFields = ['distance', 'speed', 'repeat', 'repeatDelayMs'] as 
 describe('chrome JSON schema matches the zod bounds', () => {
   it('profile durationMs', () => {
     expectNumberParity(ProfileInput.shape.durationMs, props.durationMs, 'durationMs');
+  });
+
+  it('metrics sampleMs', () => {
+    expectNumberParity(MetricsInput.shape.sampleMs, props.sampleMs, 'sampleMs');
   });
 
   it.each(numericScrollFields)('scroll field %s, at the top level and inside profile.scroll', (field) => {
