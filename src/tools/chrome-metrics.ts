@@ -6,12 +6,15 @@
  * Chrome makes for it, so the page's own scripts (a replaced PerformanceObserver or String
  * prototype) are not there and the entries are the browser's. The world is addressed by the unique
  * context id Chrome announced for it, not by its numeric id, which a new document in another
- * process can reuse; an id that names any other context is refused. Chrome keeps one such world per
- * frame and rebuilds it on navigation, so repeated calls make no new worlds. It never falls back to
+ * process can reuse: a context with a different name, type or frame is refused, and an id the client
+ * never saw is not used. The world's name carries a nonce of this process, so an extension's or
+ * another tool's isolated world never passes for it. Chrome keeps one such world per frame and
+ * rebuilds it on navigation, so repeated calls make no new worlds. It never falls back to
  * the page's world. What comes back is validated and bounded here either way: arrays, finite
  * numbers in a sane range, short strings.
  */
 
+import { randomBytes } from 'node:crypto';
 import type { ToolResult } from '../types.js';
 import { truncate } from './chrome-trace-summary.js';
 import { worstSessionWindow } from './chrome-trace.js';
@@ -196,7 +199,7 @@ export interface MetricsCdp {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number
-  ): Promise<{ result?: unknown; error?: { message: string } }>;
+  ): Promise<{ result?: unknown; error?: { code?: number; message: string } }>;
   /** What Chrome last announced for the context with this numeric id; see ExecutionContextMap. */
   executionContext(id: number): ExecutionContextRecord | undefined;
   /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
@@ -216,16 +219,29 @@ const VITALS_TIMEOUT_MS = 10_000;
 /** How long after Chrome answers createIsolatedWorld its announcement of the world may still come. */
 const CONTEXT_WAIT_MS = 2000;
 
-/** createIsolatedWorld runs on the page's main thread, which a busy page holds. */
-const CREATE_TIMEOUT_MS = 30_000;
+/** createIsolatedWorld runs on the page's main thread, which a busy page holds; bounded like the probe. */
+const CREATE_TIMEOUT_MS = 10_000;
 
-const WORLD_NAME = 'control-metrics';
+/**
+ * Our world's name, the one thing that tells it from other isolated worlds in the frame (an
+ * extension's content scripts are isolated worlds too). Made once per process, never per call or
+ * connection: Chrome keeps a world per name for good and has a finite range of world ids.
+ */
+export const METRICS_WORLD_NAME = `control-metrics-${randomBytes(6).toString('hex')}`;
+const WORLD_NAME = METRICS_WORLD_NAME;
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
 const unannounced = 'Chrome did not announce the JS world it made for the vitals (the page may be navigating); run metrics again.';
 const unusableId = 'Chrome announced the JS world it made for the vitals with no usable id; run metrics again.';
+const navigated = 'The page navigated while measuring the vitals; run metrics again.';
+
+/** Chrome's answers to a probe whose world went with its document, in this process or another. */
+const worldGone = (e: { code?: number; message: string }) =>
+  (e.code === -32000 && e.message === 'Cannot find context with specified id') ||
+  (e.code === -32602 && e.message === 'uniqueContextId not found');
+
 const notOurs = 'The id Chrome gave for the vitals world names another context (the page may have navigated); run metrics again.';
 
 /**
@@ -297,7 +313,7 @@ async function readVitals(
       VITALS_TIMEOUT_MS
     );
     const result = r.result as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
-    if (r.error) return { vitalsError: 'Chrome refused to run the vitals probe.' };
+    if (r.error) return { vitalsError: worldGone(r.error) ? navigated : 'Chrome refused to run the vitals probe.' };
     if (result?.exceptionDetails !== undefined) return { vitalsError: 'The vitals probe threw while reading performance entries.' };
     const vitals = pageVitals(result?.result?.value);
     return vitals ? { vitals } : { vitalsError: 'The vitals probe returned something other than performance entries.' };

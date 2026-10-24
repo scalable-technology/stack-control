@@ -54,7 +54,7 @@ import {
   validateOutPath,
 } from './chrome-trace-capture.js';
 import { summarizeTraceFile } from './chrome-trace-summary.js';
-import { createMetricsReader } from './chrome-metrics.js';
+import { createMetricsReader, METRICS_WORLD_NAME } from './chrome-metrics.js';
 
 // =============================================================================
 // Types
@@ -212,7 +212,7 @@ export class ChromeCDPClient extends EventEmitter {
   private currentTarget: ChromeTarget | null = null;
 
   /** Runtime is enabled at connect, so Chrome announces every context; see ExecutionContextMap. */
-  private contexts = new ExecutionContextMap();
+  private contexts = new ExecutionContextMap({ protectedName: METRICS_WORLD_NAME });
 
   // Event collection buffers
   private networkRequests: NetworkRequest[] = [];
@@ -2512,9 +2512,11 @@ export const chromeTool: Tool = {
   scripts cannot replace what the probe uses; what comes back is validated
   and bounded in Node either way. At most 500 entries of each kind
   are read, numbers outside a sane range are ignored, and strings are cut at
-  200 characters. If that world cannot be made (for example while the page
-  navigates), vitals is null and vitalsError says why; the metrics still come
-  back. Calls run one at a time; a tab switch during a call fails it.
+  200 characters. If that world cannot be made or is not found by its unique
+  id (for example while the page navigates), vitals is null and vitalsError
+  says why; the metrics still come back. A page that blocks its main thread
+  can hold a call for up to about 10s per step. Calls run one at a time; a
+  tab switch during a call fails it.
 
 **Hidden-page handling:**
 evaluate, screenshot, and scene auto-detect document.hidden and bring the tab

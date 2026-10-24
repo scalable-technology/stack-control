@@ -72,7 +72,10 @@ export function waitForCdpEventMatching(
   });
 }
 
-/** What is kept of one Runtime.executionContextCreated: never origin or anything else of the page's. */
+/**
+ * What is kept of one Runtime.executionContextCreated: the numeric and unique ids, and the name, type
+ * and frame id, each trimmed. Origin and every other field of the event are dropped.
+ */
 export interface ExecutionContextRecord {
   id: number;
   uniqueId: string;
@@ -82,7 +85,10 @@ export interface ExecutionContextRecord {
   frameId: string;
 }
 
-/** The page controls how many frames, so how many contexts, exist; past this the oldest is dropped. */
+/**
+ * The page controls how many frames, so how many contexts, exist; past this the oldest is dropped,
+ * except a context with the protected name.
+ */
 export const MAX_EXECUTION_CONTEXTS = 1000;
 const MAX_UNIQUE_ID = 200;
 const MAX_NAME = 64;
@@ -100,6 +106,15 @@ const short = (value: unknown, max: number): string => (typeof value === 'string
  */
 export class ExecutionContextMap {
   private contexts = new Map<number, ExecutionContextRecord>();
+  private protectedName: string | undefined;
+
+  /**
+   * protectedName: contexts with this name are never chosen for eviction, so a world of ours
+   * announced before a thousand frames is still found. If all have it, the oldest goes.
+   */
+  constructor(options: { protectedName?: string } = {}) {
+    this.protectedName = options.protectedName;
+  }
 
   get size(): number {
     return this.contexts.size;
@@ -111,6 +126,18 @@ export class ExecutionContextMap {
 
   clear(): void {
     this.contexts.clear();
+  }
+
+  /** The oldest context without the protected name, or the oldest of all when every one has it. */
+  private evictOne(): void {
+    let victim: number | undefined;
+    for (const [id, record] of this.contexts) {
+      if (record.name !== this.protectedName) {
+        victim = id;
+        break;
+      }
+    }
+    this.contexts.delete(victim ?? (this.contexts.keys().next().value as number));
   }
 
   /** Feed one CDP event; any other event is ignored. */
@@ -125,7 +152,7 @@ export class ExecutionContextMap {
         const uniqueId = short(c.uniqueId, MAX_UNIQUE_ID);
         if (uniqueId === '') return;
         const aux = (typeof c.auxData === 'object' && c.auxData !== null ? c.auxData : {}) as Record<string, unknown>;
-        if (this.contexts.size >= MAX_EXECUTION_CONTEXTS) this.contexts.delete(this.contexts.keys().next().value as number);
+        if (this.contexts.size >= MAX_EXECUTION_CONTEXTS) this.evictOne();
         this.contexts.set(c.id, {
           id: c.id,
           uniqueId,
