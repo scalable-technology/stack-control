@@ -71,3 +71,82 @@ export function waitForCdpEventMatching(
     }, timeoutMs);
   });
 }
+
+/** What is kept of one Runtime.executionContextCreated: never origin or anything else of the page's. */
+export interface ExecutionContextRecord {
+  id: number;
+  uniqueId: string;
+  /** '' when Chrome sent no string or a longer one than any world of ours has. */
+  name: string;
+  type: string;
+  frameId: string;
+}
+
+/** The page controls how many frames, so how many contexts, exist; past this the oldest is dropped. */
+export const MAX_EXECUTION_CONTEXTS = 1000;
+const MAX_UNIQUE_ID = 200;
+const MAX_NAME = 64;
+const MAX_TYPE = 32;
+const MAX_FRAME_ID = 200;
+
+/** A string of Chrome's within max characters, or '' (which matches nothing of ours). */
+const short = (value: unknown, max: number): string => (typeof value === 'string' && value.length <= max ? value : '');
+
+/**
+ * The live execution contexts of one session, by numeric id, from the Runtime events Chrome sends.
+ * A lookup answers what Chrome last announced for an id: a world it rebuilt on navigation, announced
+ * before anyone asked, or a page world that took over a number. Losing an entry (evicted, skipped)
+ * only turns a lookup into a miss.
+ */
+export class ExecutionContextMap {
+  private contexts = new Map<number, ExecutionContextRecord>();
+
+  get size(): number {
+    return this.contexts.size;
+  }
+
+  get(id: number): ExecutionContextRecord | undefined {
+    return this.contexts.get(id);
+  }
+
+  clear(): void {
+    this.contexts.clear();
+  }
+
+  /** Feed one CDP event; any other event is ignored. */
+  onEvent(event: { method?: string; params?: Record<string, unknown> }): void {
+    const params = event.params ?? {};
+    switch (event.method) {
+      case 'Runtime.executionContextCreated': {
+        const c = params.context as Record<string, unknown> | null | undefined;
+        if (typeof c !== 'object' || c === null || typeof c.id !== 'number' || !Number.isFinite(c.id)) return;
+        // A new context under this number replaces whatever had it, even when it cannot be kept.
+        this.contexts.delete(c.id);
+        const uniqueId = short(c.uniqueId, MAX_UNIQUE_ID);
+        if (uniqueId === '') return;
+        const aux = (typeof c.auxData === 'object' && c.auxData !== null ? c.auxData : {}) as Record<string, unknown>;
+        if (this.contexts.size >= MAX_EXECUTION_CONTEXTS) this.contexts.delete(this.contexts.keys().next().value as number);
+        this.contexts.set(c.id, {
+          id: c.id,
+          uniqueId,
+          name: short(c.name, MAX_NAME),
+          type: short(aux.type, MAX_TYPE),
+          frameId: short(aux.frameId, MAX_FRAME_ID),
+        });
+        return;
+      }
+      case 'Runtime.executionContextDestroyed': {
+        if (typeof params.executionContextId === 'number') this.contexts.delete(params.executionContextId);
+        if (typeof params.executionContextUniqueId === 'string') {
+          for (const [id, record] of this.contexts) {
+            if (record.uniqueId === params.executionContextUniqueId) this.contexts.delete(id);
+          }
+        }
+        return;
+      }
+      case 'Runtime.executionContextsCleared':
+        this.contexts.clear();
+        return;
+    }
+  }
+}

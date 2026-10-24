@@ -44,7 +44,7 @@ import WebSocket from 'ws';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
-import { waitForCdpEvent } from './cdp-events.js';
+import { ExecutionContextMap, waitForCdpEvent, waitForCdpEventMatching, type ExecutionContextRecord } from './cdp-events.js';
 import {
   TRACE_GONE,
   TraceRecorder,
@@ -211,6 +211,9 @@ export class ChromeCDPClient extends EventEmitter {
   private connected = false;
   private currentTarget: ChromeTarget | null = null;
 
+  /** Runtime is enabled at connect, so Chrome announces every context; see ExecutionContextMap. */
+  private contexts = new ExecutionContextMap();
+
   // Event collection buffers
   private networkRequests: NetworkRequest[] = [];
   private consoleMessages: ConsoleMessage[] = [];
@@ -364,6 +367,8 @@ export class ChromeCDPClient extends EventEmitter {
 
   private handleCDPEvent(event: CDPResponse): void {
     const params = event.params || {};
+    // Before the re-emit, so a listener woken by an announcement finds it in the map.
+    this.contexts.onEvent(event);
     this.emit('cdp', event);
 
     switch (event.method) {
@@ -510,6 +515,21 @@ export class ChromeCDPClient extends EventEmitter {
     return waitForCdpEvent(this, method, timeoutMs, signal);
   }
 
+  /** What Chrome last announced, on this session, for the context with this numeric id. */
+  executionContext(id: number): ExecutionContextRecord | undefined {
+    return this.contexts.get(id);
+  }
+
+  /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
+  waitForEventMatching(
+    method: string,
+    predicate: (params: Record<string, unknown>) => boolean,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    return waitForCdpEventMatching(this, method, predicate, timeoutMs, signal);
+  }
+
   async evaluate(expression: string): Promise<unknown> {
     const response = await this.sendCommand('Runtime.evaluate', {
       expression,
@@ -551,6 +571,7 @@ export class ChromeCDPClient extends EventEmitter {
    */
   private endSession(): void {
     this.epoch++;
+    this.contexts.clear();
     // Chrome ends a session's trace with the session; listeners drop what depended on it.
     this.emit('teardown');
     const pending = [...this.pendingCommands.values()];
