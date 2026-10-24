@@ -5,19 +5,22 @@
  * writes the structure, but function names, URLs and node names come from the
  * page and can say anything, including text aimed at whoever reads the result.
  *
- * The file is streamed twice and never held whole (see chrome-trace-stream). The
- * first pass keeps almost nothing: which thread is the main thread, and the trace
- * window. The second keeps only the events analyzeTrace reads for that thread
+ * The file is streamed twice and never held whole (see chrome-trace-stream); what
+ * is kept is held, and grows with the trace up to MAX_KEPT_EVENTS. The first pass
+ * keeps almost nothing: which thread is the main thread, and the trace window. The
+ * second keeps only the events analyzeTrace reads for that thread
  * (eventsAnalysisReads), plus two events that carry the window, and analyzeTrace
- * runs on those: the same summary as on every event, in the memory of what is kept.
- * The input is limited in bytes (SUMMARY_MAX_BYTES, decompressed), kept events,
- * threads and time; the result by count (10 long tasks, 10 hot functions, 10
- * shifts) and string length (200). A bad or oversized file yields a reason
- * instead of an error.
+ * runs on those. That it gives the same summary as all the events is verified on
+ * the traces in the tests (fixtures, synthetic traces, Chrome recordings, a real
+ * 184MB profile), not proven. The input is limited in bytes (SUMMARY_MAX_BYTES,
+ * decompressed), kept events, threads, and time for the two scans; the result by
+ * count (10 long tasks, 10 hot functions, 10 shifts) and string length (200). A
+ * bad or oversized file yields a reason instead of an error.
  */
 
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { pipeline } from 'node:stream';
 import { createGunzip } from 'node:zlib';
 import {
   analyzeTrace,
@@ -31,22 +34,25 @@ import {
 import { scanTraceEvents, type ScanResult } from './chrome-trace-stream.js';
 
 /**
- * Decompressed bytes the event array must end within. Memory no longer grows with the file, so
- * this bounds time: a 30s profile, the longest, is about 700MB inflated, and the two passes read
+ * Decompressed bytes the event array must end within. The file is not held, so this bounds time
+ * more than memory: a 30s profile, the longest, is about 700MB inflated, and the two passes read
  * about 100MB of it a second.
  */
 export const SUMMARY_MAX_BYTES = 1024 * 1024 * 1024;
 
 /**
  * Events the second pass may keep. A real 8s three.js profile kept 180,577 of 856,875 and grew
- * RSS by 133MB (about 700 bytes an event), so a 30s one keeps about 700,000; this is about 700MB.
+ * RSS by 133MB (about 700 bytes an event), so a 30s one keeps about 700,000. At the cap that is
+ * about 700MB, as much as the old whole-file summary took at its 128MB limit. Events with large
+ * args cost more: the cap counts events, not bytes. analyzeTrace over 1,000,000 kept task and
+ * frame events took 212ms (measured); it runs after the scans, outside their time limit.
  */
 export const MAX_KEPT_EVENTS = 1_000_000;
 
 /** Threads the first pass may hold a name or task time for. A real browser trace has a few hundred. */
 export const MAX_THREADS = 10_000;
 
-/** The whole summary, both passes. Measured: under 2s for the real 184MB trace. */
+/** The two scans; analyzeTrace after them is not covered. Measured: under 3s for the real 184MB trace. */
 export const SUMMARY_TIME_LIMIT_MS = 60_000;
 
 const MAX_LONG_TASKS = 10;
@@ -169,7 +175,8 @@ class FirstPass {
 
 /**
  * The events the summary keeps, from a trace in memory: the same two passes the file gets.
- * analyzeTrace of the result equals analyzeTrace of all the events (for numeric ts and dur).
+ * analyzeTrace of the result is verified equal to analyzeTrace of all the events on the traces in
+ * the tests; it can differ when ts or dur is not a number, which Chrome never writes.
  */
 export function reduceTraceEvents(events: TraceEvent[]): TraceEvent[] {
   const first = new FirstPass();
@@ -252,31 +259,29 @@ class SourceError extends Error {
   }
 }
 
-/** The file's bytes, inflated when compressed. Ending the iteration early closes the file. */
-async function* fileChunks(path: string, compressed: boolean): AsyncGenerator<Buffer> {
+/**
+ * The file's bytes, inflated when compressed. Ending the iteration, however it ends, destroys the
+ * read stream and the gunzip, so the fd is closed even when the scan stops early.
+ */
+export async function* fileChunks(path: string, compressed: boolean): AsyncGenerator<Buffer> {
   const file = createReadStream(path, { highWaterMark: 1024 * 1024 });
-  if (!compressed) {
-    try {
-      for await (const chunk of file) yield chunk as Buffer;
-    } catch (error) {
-      throw new SourceError('read', error);
-    } finally {
-      file.destroy();
-    }
-    return;
-  }
-  const gunzip = createGunzip({ chunkSize: 256 * 1024 });
-  file.on('error', (error) => gunzip.destroy(new SourceError('read', error)));
-  file.pipe(gunzip);
+  let readFailed = false;
+  file.on('error', () => { readFailed = true; });
+  const gunzip = compressed ? createGunzip({ chunkSize: 256 * 1024 }) : null;
+  // pipeline, not pipe: an error or early end on either side destroys both.
+  if (gunzip) pipeline(file, gunzip, () => {});
   try {
-    for await (const chunk of gunzip) yield chunk as Buffer;
+    for await (const chunk of gunzip ?? file) yield chunk as Buffer;
   } catch (error) {
-    throw error instanceof SourceError ? error : new SourceError('gzip', error);
+    throw new SourceError(readFailed || !gunzip ? 'read' : 'gzip', error);
   } finally {
     file.destroy();
-    gunzip.destroy();
+    gunzip?.destroy();
   }
 }
+
+/** What tells a file rewritten or replaced between the reads, even at the same size. */
+const identity = (s: { size: number; mtimeMs: number; ino: number }) => `${s.size}:${s.mtimeMs}:${s.ino}`;
 
 /**
  * Never throws. A reason never quotes the file: parse errors carry snippets of
@@ -287,17 +292,21 @@ export async function summarizeTraceFile(
   options: { compressed: boolean; maxBytes?: number }
 ): Promise<{ summary: BoundedSummary } | { skipped: string }> {
   const cap = options.maxBytes ?? SUMMARY_MAX_BYTES;
+  let before: string;
   try {
     // Before the read: a file the stat shows over the cap is not opened.
-    const onDisk = (await stat(path)).size;
-    if (onDisk > cap) {
-      return { skipped: `The trace is ${size(onDisk)}, over the ${size(cap)} summary limit; ${DEVTOOLS}` };
+    const st = await stat(path);
+    if (st.size > cap) {
+      return { skipped: `The trace is ${size(st.size)}, over the ${size(cap)} summary limit; ${DEVTOOLS}` };
     }
+    before = identity(st);
   } catch (error) {
     return { skipped: `The trace file could not be read (${codeOf(error)})` };
   }
   try {
-    return await summarizeTraceSource(() => fileChunks(path, options.compressed), { compressed: options.compressed, maxBytes: cap });
+    const result = await summarizeTraceSource(() => fileChunks(path, options.compressed), { compressed: options.compressed, maxBytes: cap });
+    if ('summary' in result && identity(await stat(path)) !== before) return { skipped: 'The trace file changed while it was read' };
+    return result;
   } catch (error) {
     if (error instanceof SourceError && error.kind === 'gzip') return { skipped: 'The trace file is not valid gzip' };
     if (error instanceof SourceError) return { skipped: `The trace file could not be read (${codeOf(error.cause)})` };

@@ -173,7 +173,8 @@ Performance panel records. `start` takes `categories` and `compress`; `stop`
 writes the file (a fresh private temp directory, or `outPath` with
 `overwrite`) and returns its path and, unless `summary: false`, a short
 summary: long tasks, frames, LCP, CLS and the hottest functions. The summary
-streams the file and keeps only what it reads, up to 1GB decompressed. DevTools and
+streams the file, up to 1GB decompressed, and holds only the events it reads; its
+memory grows with those, not with the file. DevTools and
 Perfetto open the file. `profile` does trace, an optional `scroll`, and stop
 in one call over `durationMs`, with the same trace options. `metrics` is the
 cheap check: node and document counts, the heap, and the page's LCP, CLS and

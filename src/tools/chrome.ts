@@ -2463,11 +2463,12 @@ export const chromeTool: Tool = {
        longTasks: [{ startMs, durationMs }], categoryMs: { scripting, ... },
        frames: { fps, p95Ms, ... }, vitals: { lcp, cls, shifts },
        profile: { hot: [{ name, url, line, selfMs, selfPct }] } } }
-  The summary streams the file twice and keeps only the events it reads, so
-  memory follows what it keeps, not the file: a real 8s profile (184MB
-  decompressed) took about 130MB and 2s. No summary for a trace over 1024MB
-  decompressed, one that keeps over 1000000 events, or one that takes over
-  60s. What it returns is limited by count and length: the 10 longest tasks with a total
+  The summary streams the file twice and holds only the events it reads, so
+  memory grows with those, not with the file: a real 8s profile (184MB
+  decompressed) took about 130MB and 2-3s. No summary for a trace over
+  1024MB decompressed, one with over 1000000 events to keep, or one whose two
+  reads take over 60s (the analysis after them, about 0.2s at that cap, is
+  not timed). What it returns is limited by count and length: the 10 longest tasks with a total
   count, the 10 hottest functions, 10 shifts, strings cut at 200 characters,
   numbers rounded to 2 decimals. When it is skipped, summarySkipped says why
   and the file is still there. Function names, URLs and node names in it

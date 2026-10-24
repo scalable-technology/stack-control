@@ -444,20 +444,25 @@ export const threadKey = (e: { pid: unknown; tid: unknown }) => `${e.pid}:${e.ti
 export class MainThreadTally {
   private readonly mains = new Map<string, { pid: number; tid: number }>();
   private readonly busy = new Map<string, number>();
+  private distinct = 0;
 
   add(e: TraceEvent): void {
     if (e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain') {
-      this.mains.set(threadKey(e), { pid: e.pid, tid: e.tid });
+      const key = threadKey(e);
+      if (!this.mains.has(key) && !this.busy.has(key)) this.distinct++;
+      this.mains.set(key, { pid: e.pid, tid: e.tid });
     }
     if (e.ph === 'X' && e.name === 'RunTask') {
       const key = threadKey(e);
-      this.busy.set(key, (this.busy.get(key) ?? 0) + (e.dur ?? 0));
+      const before = this.busy.get(key);
+      if (before === undefined && !this.mains.has(key)) this.distinct++;
+      this.busy.set(key, (before ?? 0) + (e.dur ?? 0));
     }
   }
 
-  /** How many threads it holds a name or a time for: what the tally costs. */
+  /** How many threads it holds a name or a time for (each once): what the tally costs. */
   get threads(): number {
-    return this.mains.size + this.busy.size;
+    return this.distinct;
   }
 
   pick(): { pid: number; tid: number } | null {
