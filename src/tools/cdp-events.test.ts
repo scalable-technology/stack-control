@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ExecutionContextMap, MAX_EXECUTION_CONTEXTS, waitForCdpEvent, waitForCdpEventMatching } from './cdp-events.js';
+import { OwnWorldSlot, contextRecord, waitForCdpEvent, waitForCdpEventMatching } from './cdp-events.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -164,30 +164,46 @@ describe('waitForCdpEventMatching', () => {
   });
 });
 
-describe('ExecutionContextMap', () => {
-  const created = (context: Record<string, unknown>) => ({ method: 'Runtime.executionContextCreated', params: { context } });
+describe('OwnWorldSlot', () => {
+  const OURS = 'control-metrics-0123456789ab';
+  const created = (context: unknown) => ({ method: 'Runtime.executionContextCreated', params: { context } as Record<string, unknown> });
   const world = (id: number, extra: Record<string, unknown> = {}) => ({
     id,
     uniqueId: `U-${id}`,
-    name: 'control-metrics',
+    name: OURS,
     origin: 'http://page.example',
     auxData: { frameId: 'F1', isDefault: false, type: 'isolated' },
     ...extra,
   });
+  const page = (id: number) => world(id, { uniqueId: `P-${id}`, name: '', auxData: { frameId: 'F1', isDefault: true, type: 'default' } });
+  const slotWith = (...contexts: unknown[]) => {
+    const s = new OwnWorldSlot(OURS);
+    for (const c of contexts) s.onEvent(created(c));
+    return s;
+  };
 
-  it('keeps a trimmed record of each announced context, never its origin', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3)));
-    expect(m.get(3)).toEqual({ id: 3, uniqueId: 'U-3', name: 'control-metrics', type: 'isolated', frameId: 'F1' });
-    expect(JSON.stringify(m.get(3))).not.toMatch(/page\.example|isDefault/);
+  it('keeps a trimmed record of our world, never its origin', () => {
+    const s = slotWith(world(3));
+    expect(s.get()).toEqual({ id: 3, uniqueId: 'U-3', name: OURS, type: 'isolated', frameId: 'F1' });
+    expect(JSON.stringify(s.get())).not.toMatch(/page\.example|isDefault/);
+    expect(s.size).toBe(1);
   });
 
-  it('lets a later context under the same number replace the earlier one', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3)));
-    m.onEvent(created(world(3, { uniqueId: 'PAGE', name: '', auxData: { frameId: 'F1', type: 'default' } })));
-    expect(m.get(3)).toMatchObject({ uniqueId: 'PAGE', name: '', type: 'default' });
-    expect(m.size).toBe(1);
+  it('takes a newer announcement of our world in place of the older one (a new document)', () => {
+    expect(slotWith(world(3), world(9)).get()?.uniqueId).toBe('U-9');
+  });
+
+  it.each([
+    ['another name', world(3, { name: 'control-metrics' })],
+    ['our name with type default', world(3, { auxData: { frameId: 'F1', type: 'default' } })],
+    ['our name with no auxData', world(3, { auxData: undefined })],
+    ['the page world', page(3)],
+    ['a context that is not an object', 'x'],
+    ['a context without a finite id', world(Number.NaN)],
+  ])('does not take %s', (_label, context) => {
+    const s = slotWith(context);
+    expect(s.get()).toBeUndefined();
+    expect(s.size).toBe(0);
   });
 
   it.each([
@@ -195,104 +211,71 @@ describe('ExecutionContextMap', () => {
     ['not a string', 7],
     ['empty', ''],
     ['10k characters', 'u'.repeat(10_000)],
-  ])('skips a context whose unique id is %s, and forgets what had its number', (_label, uniqueId) => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3)));
-    m.onEvent(created(world(3, { uniqueId })));
-    expect(m.get(3)).toBeUndefined();
+  ])('does not take our world with a unique id %s, and forgets the older one', (_label, uniqueId) => {
+    expect(slotWith(world(3, { uniqueId })).get()).toBeUndefined();
+    // A newer world of ours exists that cannot be addressed: the older one is no longer the world.
+    expect(slotWith(world(2), world(3, { uniqueId })).get()).toBeUndefined();
   });
 
-  it('keeps a 200-character unique id', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3, { uniqueId: 'u'.repeat(200) })));
-    expect(m.get(3)?.uniqueId).toBe('u'.repeat(200));
+  it('keeps a 200-character unique id, and an over-long frame id as empty', () => {
+    expect(slotWith(world(3, { uniqueId: 'u'.repeat(200) })).get()?.uniqueId).toBe('u'.repeat(200));
+    expect(slotWith(world(3, { auxData: { frameId: 'f'.repeat(201), type: 'isolated' } })).get()?.frameId).toBe('');
   });
 
-  it('stores an over-long or non-string name, type or frame id as empty, so it matches nothing', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3, { name: 'control-metrics' + 'x'.repeat(10_000) })));
-    m.onEvent(created(world(4, { name: 5, auxData: { frameId: 'f'.repeat(201), type: 't'.repeat(33) } })));
-    m.onEvent(created(world(5, { auxData: null })));
-    expect(m.get(3)!.name).toBe('');
-    expect(m.get(4)).toMatchObject({ name: '', frameId: '', type: '' });
-    expect(m.get(5)).toMatchObject({ frameId: '', type: '' });
-    expect(JSON.stringify([m.get(3), m.get(4)]).length).toBeLessThan(300);
+  it("forgets our world when another context is announced under its number (the number was reused)", () => {
+    expect(slotWith(world(3), page(3)).get()).toBeUndefined();
+    expect(slotWith(world(3), world(3, { name: 'other' })).get()).toBeUndefined();
   });
 
-  it('ignores a context that is not an object or has no finite numeric id', () => {
-    const m = new ExecutionContextMap();
-    for (const context of [null, 'x', { ...world(1), id: '1' }, { ...world(1), id: NaN }, { ...world(1), id: Infinity }]) {
-      m.onEvent({ method: 'Runtime.executionContextCreated', params: { context: context as Record<string, unknown> } });
-    }
-    m.onEvent({ method: 'Runtime.executionContextCreated' });
-    expect(m.size).toBe(0);
+  it('keeps our world through contexts under other numbers', () => {
+    expect(slotWith(world(3), page(4), world(5, { name: 'other' })).get()?.id).toBe(3);
   });
 
-  it('removes a destroyed context by numeric id, and by unique id', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3)));
-    m.onEvent(created(world(4)));
-    m.onEvent({ method: 'Runtime.executionContextDestroyed', params: { executionContextId: 3 } });
-    m.onEvent({ method: 'Runtime.executionContextDestroyed', params: { executionContextUniqueId: 'U-4' } });
-    expect(m.get(3)).toBeUndefined();
-    expect(m.get(4)).toBeUndefined();
+  it('holds nothing for a flood of 5000 other contexts', () => {
+    const s = slotWith(world(1));
+    for (let id = 2; id <= 5001; id++) s.onEvent(created(page(id)));
+    expect(s.get()).toEqual({ id: 1, uniqueId: 'U-1', name: OURS, type: 'isolated', frameId: 'F1' });
+    expect(s.size).toBe(1);
+    const empty = new OwnWorldSlot(OURS);
+    for (let id = 2; id <= 5001; id++) empty.onEvent(created(page(id)));
+    expect(empty.size).toBe(0);
   });
 
-  it('forgets everything on executionContextsCleared and on clear', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(world(3)));
-    m.onEvent({ method: 'Runtime.executionContextsCleared', params: {} });
-    expect(m.size).toBe(0);
-    m.onEvent(created(world(4)));
-    m.clear();
-    expect(m.size).toBe(0);
+  it('forgets our world when it is destroyed, by numeric id or by unique id, and not for another', () => {
+    const destroyed = (params: Record<string, unknown>) => ({ method: 'Runtime.executionContextDestroyed', params });
+    const s = slotWith(world(3));
+    s.onEvent(destroyed({ executionContextId: 4, executionContextUniqueId: 'U-4' }));
+    expect(s.get()?.id).toBe(3);
+    s.onEvent(destroyed({ executionContextId: 3 }));
+    expect(s.get()).toBeUndefined();
+    const t = slotWith(world(3));
+    t.onEvent(destroyed({ executionContextUniqueId: 'U-3' }));
+    expect(t.get()).toBeUndefined();
   });
 
-  it(`holds at most ${MAX_EXECUTION_CONTEXTS} contexts, dropping the oldest first`, () => {
-    const m = new ExecutionContextMap();
-    for (let id = 1; id <= MAX_EXECUTION_CONTEXTS + 5; id++) m.onEvent(created(world(id)));
-    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
-    for (let id = 1; id <= 5; id++) expect(m.get(id)).toBeUndefined();
-    expect(m.get(6)).toBeDefined();
-    expect(m.get(MAX_EXECUTION_CONTEXTS + 5)).toBeDefined();
+  it('forgets our world on executionContextsCleared and on clear', () => {
+    const s = slotWith(world(3));
+    s.onEvent({ method: 'Runtime.executionContextsCleared', params: {} });
+    expect(s.get()).toBeUndefined();
+    const t = slotWith(world(3));
+    t.clear();
+    expect(t.get()).toBeUndefined();
   });
 
   it('ignores other events', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent({ method: 'Network.requestWillBeSent', params: { context: world(1) } });
-    expect(m.size).toBe(0);
+    expect(new OwnWorldSlot(OURS).get()).toBeUndefined();
+    const s = new OwnWorldSlot(OURS);
+    s.onEvent({ method: 'Network.requestWillBeSent', params: { context: world(1) } });
+    expect(s.get()).toBeUndefined();
   });
 });
 
-describe('ExecutionContextMap: a protected name', () => {
-  const created = (id: number, name: string) => ({
-    method: 'Runtime.executionContextCreated',
-    params: { context: { id, uniqueId: `U-${id}`, name, auxData: { frameId: 'F1', type: 'isolated' } } },
-  });
-
-  it('never evicts a context with that name; the others go oldest first', () => {
-    const m = new ExecutionContextMap({ protectedName: 'ours-nonce' });
-    m.onEvent(created(1, 'ours-nonce'));
-    for (let id = 2; id <= MAX_EXECUTION_CONTEXTS + 10; id++) m.onEvent(created(id, ''));
-    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
-    expect(m.get(1)?.name).toBe('ours-nonce');
-    for (let id = 2; id <= 11; id++) expect(m.get(id)).toBeUndefined();
-    expect(m.get(12)).toBeDefined();
-    expect(m.get(MAX_EXECUTION_CONTEXTS + 10)).toBeDefined();
-  });
-
-  it('evicts the oldest when every context has the protected name', () => {
-    const m = new ExecutionContextMap({ protectedName: 'p' });
-    for (let id = 1; id <= MAX_EXECUTION_CONTEXTS + 1; id++) m.onEvent(created(id, 'p'));
-    expect(m.size).toBe(MAX_EXECUTION_CONTEXTS);
-    expect(m.get(1)).toBeUndefined();
-    expect(m.get(2)).toBeDefined();
-  });
-
-  it('protects nothing without the option', () => {
-    const m = new ExecutionContextMap();
-    m.onEvent(created(1, ''));
-    for (let id = 2; id <= MAX_EXECUTION_CONTEXTS + 1; id++) m.onEvent(created(id, 'x'));
-    expect(m.get(1)).toBeUndefined();
+describe('contextRecord', () => {
+  it('trims an announcement to ids, name, type and frame, or nothing without a usable id', () => {
+    const context = { id: 3, uniqueId: '1.2', name: 'n', origin: 'o', auxData: { frameId: 'F', type: 't', isDefault: false } };
+    expect(contextRecord({ context })).toEqual({ id: 3, uniqueId: '1.2', name: 'n', type: 't', frameId: 'F' });
+    expect(contextRecord({ context: { ...context, uniqueId: '' } })).toBeUndefined();
+    expect(contextRecord({ context: { ...context, id: '3' } })).toBeUndefined();
+    expect(contextRecord({})).toBeUndefined();
   });
 });

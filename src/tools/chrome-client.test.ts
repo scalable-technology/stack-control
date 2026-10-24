@@ -1,7 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer, type WebSocket as ServerSocket } from 'ws';
-import { MAX_EXECUTION_CONTEXTS } from './cdp-events.js';
 import { METRICS_WORLD_NAME } from './chrome-metrics.js';
 import { ChromeCDPClient } from './chrome.js';
 
@@ -132,48 +131,45 @@ describe('ChromeCDPClient: commands in flight when the connection ends', () => {
   });
 });
 
-describe('ChromeCDPClient: the execution contexts Chrome announced', () => {
-  const context = { id: 5, uniqueId: '1.2', name: 'control-metrics', origin: 'http://page', auxData: { frameId: 'T1', type: 'isolated' } };
+describe("ChromeCDPClient: the metrics world Chrome announced", () => {
+  const context = (id: number, name = METRICS_WORLD_NAME) => ({
+    id, uniqueId: `U-${id}`, name, origin: 'http://page', auxData: { frameId: 'T1', type: name === METRICS_WORLD_NAME ? 'isolated' : 'default' },
+  });
   const until = async (ok: () => boolean) => {
-    for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 10));
+    for (let i = 0; i < 300 && !ok(); i++) await new Promise((r) => setTimeout(r, 10));
   };
 
-  it('keeps them from the events, before re-emitting each, and forgets them when the session ends', async () => {
+  it('keeps it from the event before re-emitting it, and forgets it when the session ends', async () => {
     const { chrome, client } = await connected([]);
-    let inMapWhenEmitted: unknown;
-    client.on('cdp', () => (inMapWhenEmitted = client.executionContext(5)));
-    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context } });
-    await until(() => client.executionContext(5) !== undefined);
-    expect(client.executionContext(5)).toEqual({ id: 5, uniqueId: '1.2', name: 'control-metrics', type: 'isolated', frameId: 'T1' });
-    expect(inMapWhenEmitted).toEqual(client.executionContext(5));
+    let keptWhenEmitted: unknown;
+    client.on('cdp', () => (keptWhenEmitted = client.metricsWorld()));
+    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context: context(5) } });
+    await until(() => client.metricsWorld() !== undefined);
+    expect(client.metricsWorld()).toEqual({ id: 5, uniqueId: 'U-5', name: METRICS_WORLD_NAME, type: 'isolated', frameId: 'T1' });
+    expect(keptWhenEmitted).toEqual(client.metricsWorld());
     chrome.dropSockets();
-    await until(() => client.executionContext(5) === undefined);
-    expect(client.executionContext(5)).toBeUndefined();
+    await until(() => client.metricsWorld() === undefined);
+    expect(client.metricsWorld()).toBeUndefined();
   });
 
-  it('forgets them on disconnect', async () => {
+  it('forgets it on disconnect', async () => {
     const { chrome, client } = await connected([]);
-    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context } });
-    await until(() => client.executionContext(5) !== undefined);
-    expect(client.executionContext(5)).toBeDefined();
+    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context: context(5) } });
+    await until(() => client.metricsWorld() !== undefined);
     client.disconnect();
-    expect(client.executionContext(5)).toBeUndefined();
+    expect(client.metricsWorld()).toBeUndefined();
   });
-});
 
-describe('ChromeCDPClient: the metrics world survives a page of many frames', () => {
-  it(`keeps its world when more than ${MAX_EXECUTION_CONTEXTS} other contexts follow it`, async () => {
+  it('keeps it, and nothing else, through 5000 other contexts', async () => {
     const { chrome, client } = await connected([]);
-    const ctx = (id: number, name: string) => ({
-      method: 'Runtime.executionContextCreated',
-      params: { context: { id, uniqueId: `U-${id}`, name, auxData: { frameId: 'T1', type: name ? 'isolated' : 'default' } } },
-    });
-    chrome.emit(ctx(1, METRICS_WORLD_NAME));
-    const last = MAX_EXECUTION_CONTEXTS + 50;
-    for (let id = 2; id <= last; id++) chrome.emit(ctx(id, ''));
-    for (let i = 0; i < 200 && client.executionContext(last) === undefined; i++) await new Promise((r) => setTimeout(r, 10));
-    expect(client.executionContext(last)).toBeDefined();
-    expect(client.executionContext(1)?.name).toBe(METRICS_WORLD_NAME);
-    expect(client.executionContext(2)).toBeUndefined();
+    chrome.emit({ method: 'Runtime.executionContextCreated', params: { context: context(1) } });
+    await until(() => client.metricsWorld() !== undefined);
+    let seen = 0;
+    client.on('cdp', () => seen++);
+    for (let id = 2; id <= 5001; id++) chrome.emit({ method: 'Runtime.executionContextCreated', params: { context: context(id, '') } });
+    await until(() => seen >= 5000);
+    expect(seen).toBe(5000);
+    expect(client.metricsWorld()?.id).toBe(1);
+    expect((client as unknown as { ownWorld: { size: number } }).ownWorld.size).toBe(1);
   });
 });

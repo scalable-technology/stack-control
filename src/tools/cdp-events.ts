@@ -1,6 +1,7 @@
 /**
  * Wait for one CDP event on an emitter that re-emits every event as 'cdp' and
- * announces the end of its connection as 'teardown'.
+ * announces the end of its connection as 'teardown'; and keep, from those
+ * events, the one isolated world of ours that Chrome announced (OwnWorldSlot).
  */
 
 import type { EventEmitter } from 'node:events';
@@ -73,71 +74,67 @@ export function waitForCdpEventMatching(
 }
 
 /**
- * What is kept of one Runtime.executionContextCreated: the numeric and unique ids, and the name, type
- * and frame id, each trimmed. Origin and every other field of the event are dropped.
+ * What is kept of our world's Runtime.executionContextCreated: the numeric and unique ids, the name,
+ * the type and the frame id. Origin and every other field of the event are dropped.
  */
 export interface ExecutionContextRecord {
   id: number;
   uniqueId: string;
-  /** '' when Chrome sent no string or a longer one than any world of ours has. */
   name: string;
   type: string;
+  /** '' when Chrome sent no string or a longer one than a frame id is. */
   frameId: string;
 }
 
-/**
- * The page controls how many frames, so how many contexts, exist; past this the oldest is dropped,
- * except a context with the protected name.
- */
-export const MAX_EXECUTION_CONTEXTS = 1000;
 const MAX_UNIQUE_ID = 200;
-const MAX_NAME = 64;
-const MAX_TYPE = 32;
 const MAX_FRAME_ID = 200;
 
 /** A string of Chrome's within max characters, or '' (which matches nothing of ours). */
 const short = (value: unknown, max: number): string => (typeof value === 'string' && value.length <= max ? value : '');
 
 /**
- * The live execution contexts of one session, by numeric id, from the Runtime events Chrome sends.
- * A lookup answers what Chrome last announced for an id: a world it rebuilt on navigation, announced
- * before anyone asked, or a page world that took over a number. Losing an entry (evicted, skipped)
- * only turns a lookup into a miss.
+ * The record of one Runtime.executionContextCreated params, or undefined without a finite numeric id
+ * or a usable unique id. Name and type are kept only to be compared with ours.
  */
-export class ExecutionContextMap {
-  private contexts = new Map<number, ExecutionContextRecord>();
-  private protectedName: string | undefined;
+export function contextRecord(params: Record<string, unknown>): ExecutionContextRecord | undefined {
+  const c = params.context as Record<string, unknown> | null | undefined;
+  if (typeof c !== 'object' || c === null || typeof c.id !== 'number' || !Number.isFinite(c.id)) return undefined;
+  const uniqueId = short(c.uniqueId, MAX_UNIQUE_ID);
+  if (uniqueId === '') return undefined;
+  const aux = (typeof c.auxData === 'object' && c.auxData !== null ? c.auxData : {}) as Record<string, unknown>;
+  return {
+    id: c.id,
+    uniqueId,
+    name: typeof c.name === 'string' ? c.name : '',
+    type: typeof aux.type === 'string' ? aux.type : '',
+    frameId: short(aux.frameId, MAX_FRAME_ID),
+  };
+}
 
-  /**
-   * protectedName: contexts with this name are never chosen for eviction, so a world of ours
-   * announced before a thousand frames is still found. If all have it, the oldest goes.
-   */
-  constructor(options: { protectedName?: string } = {}) {
-    this.protectedName = options.protectedName;
-  }
+/**
+ * The last isolated world with our name that Chrome announced on one session, from its Runtime
+ * events, and nothing about any other context: a page controls how many of those exist. Chrome keeps
+ * one world per frame and name and rebuilds it on navigation, so this is the world createIsolatedWorld
+ * answers with. It is forgotten when Chrome says it is gone, when a newer world of ours is announced
+ * that cannot be kept, and when any other context is announced under its number: that number now
+ * names something else.
+ */
+export class OwnWorldSlot {
+  private world: ExecutionContextRecord | undefined;
 
+  constructor(private readonly name: string) {}
+
+  /** 1 while a world is kept, else 0: nothing else is ever held. */
   get size(): number {
-    return this.contexts.size;
+    return this.world ? 1 : 0;
   }
 
-  get(id: number): ExecutionContextRecord | undefined {
-    return this.contexts.get(id);
+  get(): ExecutionContextRecord | undefined {
+    return this.world;
   }
 
   clear(): void {
-    this.contexts.clear();
-  }
-
-  /** The oldest context without the protected name, or the oldest of all when every one has it. */
-  private evictOne(): void {
-    let victim: number | undefined;
-    for (const [id, record] of this.contexts) {
-      if (record.name !== this.protectedName) {
-        victim = id;
-        break;
-      }
-    }
-    this.contexts.delete(victim ?? (this.contexts.keys().next().value as number));
+    this.world = undefined;
   }
 
   /** Feed one CDP event; any other event is ignored. */
@@ -145,34 +142,23 @@ export class ExecutionContextMap {
     const params = event.params ?? {};
     switch (event.method) {
       case 'Runtime.executionContextCreated': {
-        const c = params.context as Record<string, unknown> | null | undefined;
-        if (typeof c !== 'object' || c === null || typeof c.id !== 'number' || !Number.isFinite(c.id)) return;
-        // A new context under this number replaces whatever had it, even when it cannot be kept.
-        this.contexts.delete(c.id);
-        const uniqueId = short(c.uniqueId, MAX_UNIQUE_ID);
-        if (uniqueId === '') return;
-        const aux = (typeof c.auxData === 'object' && c.auxData !== null ? c.auxData : {}) as Record<string, unknown>;
-        if (this.contexts.size >= MAX_EXECUTION_CONTEXTS) this.evictOne();
-        this.contexts.set(c.id, {
-          id: c.id,
-          uniqueId,
-          name: short(c.name, MAX_NAME),
-          type: short(aux.type, MAX_TYPE),
-          frameId: short(aux.frameId, MAX_FRAME_ID),
-        });
+        const record = contextRecord(params);
+        const c = params.context as { id?: unknown; name?: unknown; auxData?: { type?: unknown } | null } | null | undefined;
+        const named = typeof c === 'object' && c !== null && c.name === this.name && c.auxData?.type === 'isolated';
+        if (named && record) this.world = record;
+        else if (named || (this.world !== undefined && c?.id === this.world.id)) this.world = undefined;
         return;
       }
-      case 'Runtime.executionContextDestroyed': {
-        if (typeof params.executionContextId === 'number') this.contexts.delete(params.executionContextId);
-        if (typeof params.executionContextUniqueId === 'string') {
-          for (const [id, record] of this.contexts) {
-            if (record.uniqueId === params.executionContextUniqueId) this.contexts.delete(id);
-          }
+      case 'Runtime.executionContextDestroyed':
+        if (
+          this.world !== undefined &&
+          (params.executionContextId === this.world.id || params.executionContextUniqueId === this.world.uniqueId)
+        ) {
+          this.world = undefined;
         }
         return;
-      }
       case 'Runtime.executionContextsCleared':
-        this.contexts.clear();
+        this.world = undefined;
         return;
     }
   }
