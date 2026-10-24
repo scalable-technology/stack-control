@@ -2507,10 +2507,10 @@ export const chromeTool: Tool = {
   null when there was no interaction, never 0. INP is an estimate: event
   timing buffers only about 150 entries and only events of 40ms or more, so a
   long session can lose interactions. The vitals are read in a separate JS
-  world Chrome makes for the tool, so the page's scripts cannot replace what
-  the probe uses, except in a rare race with a navigation that replaces the
-  page between creating the world and reading it; what comes back is
-  validated and bounded in Node either way. At most 500 entries of each kind
+  world Chrome makes for the tool (one per frame, reused across calls),
+  addressed by the unique context id Chrome announced for it, so the page's
+  scripts cannot replace what the probe uses; what comes back is validated
+  and bounded in Node either way. At most 500 entries of each kind
   are read, numbers outside a sane range are ignored, and strings are cut at
   200 characters. If that world cannot be made (for example while the page
   navigates), vitals is null and vitalsError says why; the metrics still come
