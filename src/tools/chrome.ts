@@ -44,7 +44,7 @@ import WebSocket from 'ws';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '../types.js';
 import { withRemoteObject } from './cdp-object.js';
-import { ExecutionContextMap, waitForCdpEvent, waitForCdpEventMatching, type ExecutionContextRecord } from './cdp-events.js';
+import { OwnWorldSlot, waitForCdpEvent, waitForCdpEventMatching, type ExecutionContextRecord } from './cdp-events.js';
 import {
   TRACE_GONE,
   TraceRecorder,
@@ -211,8 +211,8 @@ export class ChromeCDPClient extends EventEmitter {
   private connected = false;
   private currentTarget: ChromeTarget | null = null;
 
-  /** Runtime is enabled at connect, so Chrome announces every context; see ExecutionContextMap. */
-  private contexts = new ExecutionContextMap({ protectedName: METRICS_WORLD_NAME });
+  /** Runtime is enabled at connect, so Chrome announces every context; we keep only the metrics world's. */
+  private ownWorld = new OwnWorldSlot(METRICS_WORLD_NAME);
 
   // Event collection buffers
   private networkRequests: NetworkRequest[] = [];
@@ -367,8 +367,8 @@ export class ChromeCDPClient extends EventEmitter {
 
   private handleCDPEvent(event: CDPResponse): void {
     const params = event.params || {};
-    // Before the re-emit, so a listener woken by an announcement finds it in the map.
-    this.contexts.onEvent(event);
+    // Before the re-emit, so a listener woken by an announcement finds it kept.
+    this.ownWorld.onEvent(event);
     this.emit('cdp', event);
 
     switch (event.method) {
@@ -515,9 +515,9 @@ export class ChromeCDPClient extends EventEmitter {
     return waitForCdpEvent(this, method, timeoutMs, signal);
   }
 
-  /** What Chrome last announced, on this session, for the context with this numeric id. */
-  executionContext(id: number): ExecutionContextRecord | undefined {
-    return this.contexts.get(id);
+  /** The metrics world kept from this session's events; see OwnWorldSlot for when it is dropped. */
+  metricsWorld(): ExecutionContextRecord | undefined {
+    return this.ownWorld.get();
   }
 
   /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
@@ -571,7 +571,7 @@ export class ChromeCDPClient extends EventEmitter {
    */
   private endSession(): void {
     this.epoch++;
-    this.contexts.clear();
+    this.ownWorld.clear();
     // Chrome ends a session's trace with the session; listeners drop what depended on it.
     this.emit('teardown');
     const pending = [...this.pendingCommands.values()];

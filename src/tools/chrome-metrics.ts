@@ -18,7 +18,7 @@ import { randomBytes } from 'node:crypto';
 import type { ToolResult } from '../types.js';
 import { truncate } from './chrome-trace-summary.js';
 import { worstSessionWindow } from './chrome-trace.js';
-import type { ExecutionContextRecord } from './cdp-events.js';
+import { contextRecord, type ExecutionContextRecord } from './cdp-events.js';
 
 export interface ChromeMetrics {
   nodes: number | null;
@@ -200,8 +200,8 @@ export interface MetricsCdp {
     params?: Record<string, unknown>,
     timeoutMs?: number
   ): Promise<{ result?: unknown; error?: { code?: number; message: string } }>;
-  /** What Chrome last announced for the context with this numeric id; see ExecutionContextMap. */
-  executionContext(id: number): ExecutionContextRecord | undefined;
+  /** The world with METRICS_WORLD_NAME the client keeps; see OwnWorldSlot for when it is dropped. */
+  metricsWorld(): ExecutionContextRecord | undefined;
   /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
   waitForEventMatching(
     method: string,
@@ -233,7 +233,10 @@ const WORLD_NAME = METRICS_WORLD_NAME;
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
-const unannounced = 'Chrome did not announce the JS world it made for the vitals (the page may be navigating); run metrics again.';
+// Also what a number held by a context announced earlier that is not ours gives: the client keeps
+// nothing about such a context, so the wait for ours under that number runs out.
+const unannounced =
+  'Chrome did not announce the JS world it made for the vitals, or the number it gave is held by a context that is not ours (the page may be navigating); run metrics again.';
 const unusableId = 'Chrome announced the JS world it made for the vitals with no usable id; run metrics again.';
 const navigated = 'The page navigated while measuring the vitals; run metrics again.';
 
@@ -249,7 +252,7 @@ const notOurs = 'The id Chrome gave for the vitals world names another context (
  * addressed by the unique id: a numeric context id can be reused by a new document after a
  * cross-process navigation, the page's own world among them. Chrome keeps one world per frame and
  * name, rebuilds it on navigation and announces it then, so createIsolatedWorld may answer with the
- * id of a world announced long before; the client's map of announced contexts has it. A world made
+ * id of a world announced long before; the client keeps the last one announced. A world made
  * now is announced before the answer, or may still be announced for contextWaitMs after it.
  */
 async function makeWorld(
@@ -266,11 +269,13 @@ async function makeWorld(
   } catch {
     return { vitalsError: noWorld };
   }
-  let context = cdp.executionContext(id);
-  if (context === undefined) {
-    // Registered in the same step that found no entry, so nothing announced in between is missed.
+  let context = cdp.metricsWorld();
+  if (context?.id !== id) {
+    // Registered in the same step that found no world under this number, so nothing announced in
+    // between is missed.
+    let announced: Record<string, unknown>;
     try {
-      await cdp.waitForEventMatching(
+      announced = await cdp.waitForEventMatching(
         'Runtime.executionContextCreated',
         (params) => (params.context as { id?: unknown } | null | undefined)?.id === id,
         contextWaitMs
@@ -278,13 +283,11 @@ async function makeWorld(
     } catch {
       return { vitalsError: unannounced };
     }
-    // The map holds only contexts it could trim: an announcement it skipped had no usable id.
-    context = cdp.executionContext(id);
-    if (context === undefined) return { vitalsError: unusableId };
+    context = cdp.metricsWorld();
+    if (context?.id !== id) return { vitalsError: contextRecord(announced) ? notOurs : unusableId };
   }
-  if (context.name !== WORLD_NAME || context.type !== 'isolated' || context.frameId !== frameId) {
-    return { vitalsError: notOurs };
-  }
+  // The client keeps only an isolated world with our name; the frame is the one thing left to check.
+  if (context.frameId !== frameId) return { vitalsError: notOurs };
   return { uniqueId: context.uniqueId };
 }
 

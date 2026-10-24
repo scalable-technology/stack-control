@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { ExecutionContextMap, waitForCdpEventMatching } from './cdp-events.js';
+import { OwnWorldSlot, waitForCdpEventMatching } from './cdp-events.js';
 import {
   MAX_VITAL_ENTRIES,
   METRICS_WORLD_NAME,
@@ -352,10 +352,10 @@ const CREATED = 'Runtime.executionContextCreated';
 function fakeCdp(options: FakeMetricsOptions = {}) {
   const sent: { method: string; params?: Record<string, unknown>; timeoutMs?: number }[] = [];
   const emitter = new EventEmitter();
-  // As the client does: the map first, then the re-emit.
-  const contexts = new ExecutionContextMap();
+  // As the client does: the slot first, then the re-emit.
+  const slot = new OwnWorldSlot(METRICS_WORLD_NAME);
   const emit = (event: { method: string; params?: Record<string, unknown> }) => {
-    contexts.onEvent(event);
+    slot.onEvent(event);
     emitter.emit('cdp', event);
   };
   const waits: number[] = [];
@@ -390,7 +390,7 @@ function fakeCdp(options: FakeMetricsOptions = {}) {
       }
       return { result: answer };
     },
-    executionContext: (id) => contexts.get(id),
+    metricsWorld: () => slot.get(),
     waitForEventMatching: (method, predicate, timeoutMs, signal) => {
       waits.push(timeoutMs);
       return waitForCdpEventMatching(emitter, method, predicate, timeoutMs, signal);
@@ -475,7 +475,9 @@ describe('readMetrics', () => {
     expect(r.success).toBe(true);
     expect(d.metrics.nodes).toBe(42);
     expect(d.vitals).toBeNull();
-    expect(d.vitalsError).toMatch(/did not announce/);
+    expect(d.vitalsError).toBe(
+      'Chrome did not announce the JS world it made for the vitals, or the number it gave is held by a context that is not ours (the page may be navigating); run metrics again.'
+    );
     expect(f.methods()).not.toContain('Runtime.evaluate');
     expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
   });
@@ -496,37 +498,53 @@ describe('readMetrics', () => {
   const page = { name: '', auxData: { frameId: 'T1', isDefault: true, type: 'default' } };
   const refused = /names another context/;
   const missing = /did not announce/;
+  // Before the answer, a context that is not ours leaves nothing to find, so the wait for an
+  // announcement times out; after it, the announcement under the number is seen and refused.
   it.each([
-    ["the page's own world, with the same numeric id (the reuse hazard)", (id: number) => [ourWorld(id, page)], refused],
-    ['a world of another name', (id: number) => [ourWorld(id, { name: 'other-tool' })], refused],
-    ['our world name in another frame', (id: number) => [ourWorld(id, { auxData: { frameId: 'F2', isDefault: false, type: 'isolated' } })], refused],
-    ['our world name with type default', (id: number) => [ourWorld(id, { auxData: { frameId: 'T1', isDefault: false, type: 'default' } })], refused],
-    ['a context without auxData', (id: number) => [ourWorld(id, { auxData: undefined })], refused],
-    ['our world in this frame with another numeric id', (id: number) => [ourWorld(id + 100)], missing],
-    ['a context that is not an object', () => ['control-metrics'], missing],
-  ])('ignores %s: vitals null and no probe', async (_label, contexts, why) => {
-    const f = fakeCdp({ contexts });
+    ["the page's own world, with the same numeric id (the reuse hazard)", (id: number) => [ourWorld(id, page)], missing, refused],
+    ['a world of another name', (id: number) => [ourWorld(id, { name: 'other-tool' })], missing, refused],
+    ['our world name in another frame', (id: number) => [ourWorld(id, { auxData: { frameId: 'F2', isDefault: false, type: 'isolated' } })], refused, refused],
+    ['our world name with type default', (id: number) => [ourWorld(id, { auxData: { frameId: 'T1', isDefault: false, type: 'default' } })], missing, refused],
+    ['a context without auxData', (id: number) => [ourWorld(id, { auxData: undefined })], missing, refused],
+    ['our world in this frame with another numeric id', (id: number) => [ourWorld(id + 100)], missing, missing],
+    ['a context that is not an object', () => ['control-metrics'], missing, missing],
+  ])('ignores %s: vitals null and no probe', async (_label, contexts, before, after) => {
+    for (const [announce, why] of [['before', before], ['after', after]] as const) {
+      const f = fakeCdp({ announce, contexts });
+      const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+      expect((r.data as VitalsData).vitals).toBeNull();
+      expect((r.data as VitalsData).vitalsError).toMatch(why);
+      expect(f.evaluates()).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['before', missing],
+    ['after', refused],
+  ] as const)('refuses when the page takes over the number after our world was announced %s the answer', async (announce, why) => {
+    const f = fakeCdp({ announce, contexts: (id) => [ourWorld(id), ourWorld(id, { ...page, uniqueId: 'PAGE' })] });
     const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
-    expect((r.data as VitalsData).vitals).toBeNull();
     expect((r.data as VitalsData).vitalsError).toMatch(why);
     expect(f.evaluates()).toEqual([]);
   });
 
-  it('refuses when the page took over the number after our world was announced', async () => {
-    const f = fakeCdp({ contexts: (id) => [ourWorld(id), ourWorld(id, { ...page, uniqueId: 'PAGE' })] });
+  it("never uses our world once Chrome announced the page's own world under its number", async () => {
+    const f = fakeCdp({ announce: 'never' });
+    f.announce(ourWorld(77, { uniqueId: 'OURS' }));
+    f.announce(ourWorld(77, { ...page, uniqueId: 'PAGE' }));
     const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
-    expect((r.data as VitalsData).vitalsError).toMatch(refused);
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toMatch(missing);
     expect(f.evaluates()).toEqual([]);
+    expect(f.waits).toEqual([50]);
   });
 
-  it("refuses, without waiting, a number Chrome last announced as the page's own world", async () => {
+  it("does not take the page's own world announced under the number the answer gives", async () => {
     const f = fakeCdp({ announce: 'never' });
     f.announce(ourWorld(77, { ...page, uniqueId: 'PAGE' }));
-    const r = await readMetrics(f.cdp, always, 'T1');
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
     expect((r.data as VitalsData).vitals).toBeNull();
-    expect((r.data as VitalsData).vitalsError).toMatch(refused);
     expect(f.evaluates()).toEqual([]);
-    expect(f.waits).toEqual([]);
   });
 
   it('uses the world Chrome rebuilt and announced on navigation, when the answer brings no announcement', async () => {
@@ -601,11 +619,14 @@ describe('readMetrics', () => {
     ["the plain name another tool or an extension could use", { name: 'control-metrics' }],
     ['our nonce name with type default', { auxData: { frameId: 'T1', isDefault: true, type: 'default' } }],
   ])('refuses an isolated context with %s', async (_label, extra) => {
-    const f = fakeCdp({ contexts: (id) => [ourWorld(id, extra)] });
-    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
-    expect((r.data as VitalsData).vitals).toBeNull();
-    expect((r.data as VitalsData).vitalsError).toMatch(/names another context/);
-    expect(f.evaluates()).toEqual([]);
+    // Before the answer it is never kept, so nothing is found; after it, it is seen and refused.
+    for (const [announce, why] of [['before', /did not announce/], ['after', /names another context/]] as const) {
+      const f = fakeCdp({ announce, contexts: (id) => [ourWorld(id, extra)] });
+      const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+      expect((r.data as VitalsData).vitals).toBeNull();
+      expect((r.data as VitalsData).vitalsError).toMatch(why);
+      expect(f.evaluates()).toEqual([]);
+    }
   });
 
   it.each([
