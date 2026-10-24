@@ -475,7 +475,9 @@ describe('readMetrics', () => {
     expect(r.success).toBe(true);
     expect(d.metrics.nodes).toBe(42);
     expect(d.vitals).toBeNull();
-    expect(d.vitalsError).toMatch(/did not announce/);
+    expect(d.vitalsError).toBe(
+      'Chrome did not announce the JS world it made for the vitals, or the number it gave is held by a context that is not ours (the page may be navigating); run metrics again.'
+    );
     expect(f.methods()).not.toContain('Runtime.evaluate');
     expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
   });

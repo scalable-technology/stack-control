@@ -253,6 +253,44 @@ describe('OwnWorldSlot', () => {
     expect(t.get()).toBeUndefined();
   });
 
+  it('matches a destroyed context by its unique id when Chrome gives one, never by a reused number', () => {
+    const destroyed = (params: Record<string, unknown>) => ({ method: 'Runtime.executionContextDestroyed', params });
+    // Our rebuilt world B holds number 3; the old renderer's context A, also number 3, dies late.
+    const s = slotWith(world(3, { uniqueId: 'U-B' }));
+    s.onEvent(destroyed({ executionContextId: 3, executionContextUniqueId: 'U-A' }));
+    expect(s.get()?.uniqueId).toBe('U-B');
+    s.onEvent(destroyed({ executionContextId: 3, executionContextUniqueId: 'U-B' }));
+    expect(s.get()).toBeUndefined();
+    // Without a unique id (or with one that is not a string), the number is all there is.
+    const t = slotWith(world(3, { uniqueId: 'U-B' }));
+    t.onEvent(destroyed({ executionContextId: 3 }));
+    expect(t.get()).toBeUndefined();
+    const u = slotWith(world(3, { uniqueId: 'U-B' }));
+    u.onEvent(destroyed({ executionContextId: 3, executionContextUniqueId: 42 }));
+    expect(u.get()).toBeUndefined();
+  });
+
+  it('never holds a record with another name or type, whatever is announced', () => {
+    const s = new OwnWorldSlot(OURS);
+    const stream = [
+      world(1), world(2, { name: 'control-metrics' }), page(3), world(4, { auxData: { frameId: 'F1', type: 'default' } }),
+      world(5, { name: OURS + 'x' }), world(6, { name: 'CONTROL' }), world(1, { auxData: { frameId: 'F2', type: 'isolated' } }),
+      world(7, { auxData: { frameId: 'F1', type: 'Isolated' } }), page(8),
+    ];
+    let held = 0;
+    for (const c of stream) {
+      s.onEvent(created(c));
+      const w = s.get();
+      if (w) {
+        held++;
+        expect(w.name).toBe(OURS);
+        expect(w.type).toBe('isolated');
+      }
+    }
+    expect(held).toBeGreaterThan(0);
+    expect(s.get()).toMatchObject({ id: 1, frameId: 'F2' });
+  });
+
   it('forgets our world on executionContextsCleared and on clear', () => {
     const s = slotWith(world(3));
     s.onEvent({ method: 'Runtime.executionContextsCleared', params: {} });

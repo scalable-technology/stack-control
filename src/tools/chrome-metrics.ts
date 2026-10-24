@@ -200,7 +200,7 @@ export interface MetricsCdp {
     params?: Record<string, unknown>,
     timeoutMs?: number
   ): Promise<{ result?: unknown; error?: { code?: number; message: string } }>;
-  /** The last world with METRICS_WORLD_NAME Chrome announced, while nothing replaced it; see OwnWorldSlot. */
+  /** The world with METRICS_WORLD_NAME the client keeps; see OwnWorldSlot for when it is dropped. */
   metricsWorld(): ExecutionContextRecord | undefined;
   /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
   waitForEventMatching(
@@ -233,7 +233,10 @@ const WORLD_NAME = METRICS_WORLD_NAME;
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
-const unannounced = 'Chrome did not announce the JS world it made for the vitals (the page may be navigating); run metrics again.';
+// Also what a number held by a context announced earlier that is not ours gives: the client keeps
+// nothing about such a context, so the wait for ours under that number runs out.
+const unannounced =
+  'Chrome did not announce the JS world it made for the vitals, or the number it gave is held by a context that is not ours (the page may be navigating); run metrics again.';
 const unusableId = 'Chrome announced the JS world it made for the vitals with no usable id; run metrics again.';
 const navigated = 'The page navigated while measuring the vitals; run metrics again.';
 

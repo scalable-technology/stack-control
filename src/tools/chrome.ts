@@ -515,7 +515,7 @@ export class ChromeCDPClient extends EventEmitter {
     return waitForCdpEvent(this, method, timeoutMs, signal);
   }
 
-  /** The metrics world Chrome last announced on this session, while nothing has replaced it; see OwnWorldSlot. */
+  /** The metrics world kept from this session's events; see OwnWorldSlot for when it is dropped. */
   metricsWorld(): ExecutionContextRecord | undefined {
     return this.ownWorld.get();
   }

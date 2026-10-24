@@ -75,7 +75,9 @@ export function waitForCdpEventMatching(
 
 /**
  * What is kept of our world's Runtime.executionContextCreated: the numeric and unique ids, the name,
- * the type and the frame id. Origin and every other field of the event are dropped.
+ * the type and the frame id. Origin and every other field of the event are dropped. Name and type
+ * are kept only so the slot's invariant (it holds our name and type 'isolated', nothing else) can be
+ * tested through them; nothing downstream checks them again.
  */
 export interface ExecutionContextRecord {
   id: number;
@@ -112,12 +114,19 @@ export function contextRecord(params: Record<string, unknown>): ExecutionContext
 }
 
 /**
- * The last isolated world with our name that Chrome announced on one session, from its Runtime
- * events, and nothing about any other context: a page controls how many of those exist. Chrome keeps
- * one world per frame and name and rebuilds it on navigation, so this is the world createIsolatedWorld
- * answers with. It is forgotten when Chrome says it is gone, when a newer world of ours is announced
- * that cannot be kept, and when any other context is announced under its number: that number now
- * names something else.
+ * Our isolated world on one session, from its Runtime events, and nothing about any other context: a
+ * page controls how many of those exist. Chrome keeps one world per frame and name and rebuilds it on
+ * navigation. This assumes the client makes the named world in ONE frame (the target's main frame),
+ * so the last one announced is the one createIsolatedWorld answers with; a world of that name in a
+ * second frame would replace the record, and the caller's frame check would then refuse it. It also
+ * assumes, as puppeteer does, that Chrome sends executionContextsCleared before it announces the
+ * rebuilt world, never after.
+ *
+ * The rule: an announcement with our name, type 'isolated' and a usable unique id becomes the record.
+ * The record is dropped when a world of ours with no usable unique id is announced, when any other
+ * context is announced under its number (the number now names something else), when Chrome destroys
+ * it (matched by unique id when the event has one, else by number), on executionContextsCleared, and
+ * when the session ends (clear).
  */
 export class OwnWorldSlot {
   private world: ExecutionContextRecord | undefined;
@@ -149,14 +158,16 @@ export class OwnWorldSlot {
         else if (named || (this.world !== undefined && c?.id === this.world.id)) this.world = undefined;
         return;
       }
-      case 'Runtime.executionContextDestroyed':
-        if (
-          this.world !== undefined &&
-          (params.executionContextId === this.world.id || params.executionContextUniqueId === this.world.uniqueId)
-        ) {
-          this.world = undefined;
-        }
+      case 'Runtime.executionContextDestroyed': {
+        // Unique ids are never reused; numbers are, so a late death of an old context under our
+        // number must not take our rebuilt world with it. The number is used only without one.
+        const gone =
+          typeof params.executionContextUniqueId === 'string'
+            ? params.executionContextUniqueId === this.world?.uniqueId
+            : params.executionContextId === this.world?.id;
+        if (gone) this.world = undefined;
         return;
+      }
       case 'Runtime.executionContextsCleared':
         this.world = undefined;
         return;
