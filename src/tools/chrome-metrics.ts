@@ -14,6 +14,7 @@
 import type { ToolResult } from '../types.js';
 import { truncate } from './chrome-trace-summary.js';
 import { worstSessionWindow } from './chrome-trace.js';
+import type { ExecutionContextRecord } from './cdp-events.js';
 
 export interface ChromeMetrics {
   nodes: number | null;
@@ -195,6 +196,15 @@ export interface MetricsCdp {
     params?: Record<string, unknown>,
     timeoutMs?: number
   ): Promise<{ result?: unknown; error?: { message: string } }>;
+  /** What Chrome last announced for the context with this numeric id; see ExecutionContextMap. */
+  executionContext(id: number): ExecutionContextRecord | undefined;
+  /** See waitForCdpEventMatching: the first event of this method the predicate accepts. */
+  waitForEventMatching(
+    method: string,
+    predicate: (params: Record<string, unknown>) => boolean,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>>;
 }
 
 export const TAB_CHANGED = 'The selected tab changed while measuring; run metrics again.';
@@ -202,30 +212,87 @@ export const TAB_CHANGED = 'The selected tab changed while measuring; run metric
 /** A page that blocks its main thread holds the vitals probe; this bounds the wait for it. */
 const VITALS_TIMEOUT_MS = 10_000;
 
+/** How long after Chrome answers createIsolatedWorld its announcement of the world may still come. */
+const CONTEXT_WAIT_MS = 2000;
+
+/** createIsolatedWorld runs on the page's main thread, which a busy page holds. */
+const CREATE_TIMEOUT_MS = 30_000;
+
+const WORLD_NAME = 'control-metrics';
+
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-/** The vitals, read in a world of our own, or our own words for why not. Never the page's text. */
+const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
+const unannounced = 'Chrome did not announce the JS world it made for the vitals (the page may be navigating); run metrics again.';
+const unusableId = 'Chrome announced the JS world it made for the vitals with no usable id; run metrics again.';
+const notOurs = 'The id Chrome gave for the vitals world names another context (the page may have navigated); run metrics again.';
+
+/**
+ * Get the world of ours in the frame and return its unique id, or our words for why not. The probe is
+ * addressed by the unique id: a numeric context id can be reused by a new document after a
+ * cross-process navigation, the page's own world among them. Chrome keeps one world per frame and
+ * name, rebuilds it on navigation and announces it then, so createIsolatedWorld may answer with the
+ * id of a world announced long before; the client's map of announced contexts has it. A world made
+ * now is announced before the answer, or may still be announced for contextWaitMs after it.
+ */
+async function makeWorld(
+  cdp: MetricsCdp,
+  frameId: string,
+  contextWaitMs: number
+): Promise<{ uniqueId: string } | { vitalsError: string }> {
+  let id: number;
+  try {
+    const world = await cdp.sendCommand('Page.createIsolatedWorld', { frameId, worldName: WORLD_NAME }, CREATE_TIMEOUT_MS);
+    const answered = (world.result as { executionContextId?: unknown } | undefined)?.executionContextId;
+    if (world.error || !finite(answered)) return { vitalsError: noWorld };
+    id = answered;
+  } catch {
+    return { vitalsError: noWorld };
+  }
+  let context = cdp.executionContext(id);
+  if (context === undefined) {
+    // Registered in the same step that found no entry, so nothing announced in between is missed.
+    try {
+      await cdp.waitForEventMatching(
+        'Runtime.executionContextCreated',
+        (params) => (params.context as { id?: unknown } | null | undefined)?.id === id,
+        contextWaitMs
+      );
+    } catch {
+      return { vitalsError: unannounced };
+    }
+    // The map holds only contexts it could trim: an announcement it skipped had no usable id.
+    context = cdp.executionContext(id);
+    if (context === undefined) return { vitalsError: unusableId };
+  }
+  if (context.name !== WORLD_NAME || context.type !== 'isolated' || context.frameId !== frameId) {
+    return { vitalsError: notOurs };
+  }
+  return { uniqueId: context.uniqueId };
+}
+
+export interface ReadMetricsOptions {
+  /** How long after createIsolatedWorld answers to wait for Chrome to announce the world. */
+  contextWaitMs?: number;
+}
+
 /**
  * The vitals, read in a world of our own, or our own words for why not. Never the page's text.
  * frameId is the page target's id, which is its main frame's id: asking for the frame tree would
  * bring every frame's name and URL (page data, any size) into Node just to find it.
  */
-async function readVitals(cdp: MetricsCdp, frameId: string | undefined): Promise<{ vitals: PageVitals } | { vitalsError: string }> {
-  const noWorld = 'Could not make a separate JS world in the page to read its vitals (it may be navigating); run metrics again.';
+async function readVitals(
+  cdp: MetricsCdp,
+  frameId: string | undefined,
+  options: ReadMetricsOptions
+): Promise<{ vitals: PageVitals } | { vitalsError: string }> {
   if (frameId === undefined) return { vitalsError: noWorld };
-  let contextId: number;
-  try {
-    const world = await cdp.sendCommand('Page.createIsolatedWorld', { frameId, worldName: 'control-metrics' });
-    const id = (world.result as { executionContextId?: unknown } | undefined)?.executionContextId;
-    if (world.error || !finite(id)) return { vitalsError: noWorld };
-    contextId = id;
-  } catch {
-    return { vitalsError: noWorld };
-  }
+  const world = await makeWorld(cdp, frameId, options.contextWaitMs ?? CONTEXT_WAIT_MS);
+  if ('vitalsError' in world) return world;
   try {
     const r = await cdp.sendCommand(
       'Runtime.evaluate',
-      { expression: VITALS_PROBE, contextId, returnByValue: true, awaitPromise: true },
+      { expression: VITALS_PROBE, uniqueContextId: world.uniqueId, returnByValue: true, awaitPromise: true },
       VITALS_TIMEOUT_MS
     );
     const result = r.result as { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
@@ -247,7 +314,8 @@ async function readVitals(cdp: MetricsCdp, frameId: string | undefined): Promise
 export async function readMetrics(
   cdp: MetricsCdp,
   stillSelected: () => boolean,
-  frameId: string | undefined
+  frameId: string | undefined,
+  options: ReadMetricsOptions = {}
 ): Promise<ToolResult> {
   const changed = { success: false, error: TAB_CHANGED };
   if (!stillSelected()) return changed;
@@ -269,7 +337,7 @@ export async function readMetrics(
     return { success: false, error: `Could not read Chrome's metrics: ${messageOf(error)}` };
   }
   if (!stillSelected()) return changed;
-  const vitals = await readVitals(cdp, frameId);
+  const vitals = await readVitals(cdp, frameId, options);
   if (!stillSelected()) return changed;
   return { success: true, data: { metrics, ...('vitals' in vitals ? vitals : { vitals: null, ...vitals }) } };
 }

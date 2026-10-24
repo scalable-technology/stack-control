@@ -903,6 +903,26 @@ const BIG_FRAME_NAME_PAGE = `<!doctype html><body style="margin:0">
   document.body.appendChild(f);
 </script></body>`;
 
+// A page that feeds made-up entries to any probe run in its own worlds: the main frame's and those of
+// n same-origin iframes (n from the query), so the numeric context ids 1..n+1 of its process are all
+// page worlds. A layout shift of 0.777 marks the page's entries.
+const FAKE_ENTRIES_PAGE = `<!doctype html><body>
+<script>
+  const fake = 'window.PerformanceObserver = class { constructor(cb) { this.cb = cb; } observe() {} ' +
+    'takeRecords() { return [{ startTime: 5, value: 0.777, duration: 5, size: 5, interactionId: 0, hadRecentInput: false }]; } disconnect() {} };';
+  eval(fake);
+  const n = Math.min(200, Number(new URLSearchParams(location.search).get('n')) || 0);
+  for (let i = 0; i < n; i++) {
+    const f = document.createElement('iframe');
+    f.srcdoc = '<script>' + fake + '<' + '/script>';
+    document.body.appendChild(f);
+  }
+</script></body>`;
+
+/** The vitals probe's Runtime.evaluate, told apart from the tool's other evaluates by what it observes. */
+const isProbe = (m: { method?: string; params?: { expression?: unknown } }) =>
+  m.method === 'Runtime.evaluate' && typeof m.params?.expression === 'string' && m.params.expression.includes("'largest-contentful-paint'");
+
 interface MetricsData {
   metrics: Record<string, number | null>;
   vitals: {
@@ -961,6 +981,7 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     browser = await launchTestBrowser();
     for (const [name, html] of Object.entries({
       nodes: NODES_PAGE, quiet: QUIET_PAGE, busy: BUSY_PAGE, big: BIG_TEXT_PAGE, click: CLICK_PAGE, hostile: HOSTILE_PAGE, bigFrame: BIG_FRAME_NAME_PAGE,
+      fake: FAKE_ENTRIES_PAGE,
     })) {
       servers[name] = await servePage(html);
     }
@@ -1087,6 +1108,146 @@ describe.skipIf(!chromeAvailable)('chrome metrics: snapshot in headless Chrome',
     expect(d.vitals!.lcp?.element).toBe('h1');
     expect(d.vitals!.lcp!.ms).toBeGreaterThan(0);
     expect(d.vitals!.inp).toBe(null);
+  }, 60_000);
+
+  it('addresses the probe by the unique id of its world, never by a numeric context id', async () => {
+    await open(servers.quiet.url);
+    const probes: Record<string, unknown>[] = [];
+    const real = WebSocket.prototype.send;
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      const m = JSON.parse(String(data)) as { method?: string; params?: Record<string, unknown> };
+      if (isProbe(m)) probes.push(m.params ?? {});
+      return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
+    let d: MetricsData;
+    try {
+      d = await metrics();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(d.vitals, d.vitalsError).not.toBeNull();
+    expect(probes).toHaveLength(1);
+    expect(probes[0].uniqueContextId).toMatch(/^-?\d+\.-?\d+$/);
+    expect(probes[0]).not.toHaveProperty('contextId');
+  }, 60_000);
+
+  it("never reads the page's entries when a cross-process navigation reuses the world's numeric id", async () => {
+    await open(servers.quiet.url);
+    // Another site, so another renderer process whose context ids start again from 1.
+    const otherSite = servers.fake.url.replace('127.0.0.1', 'localhost');
+    const otherOrigin = otherSite.replace(/\/$/, '');
+    let worldId: number | undefined;
+    let createId: number | undefined;
+    let hazard = false;
+    const probes: Record<string, unknown>[] = [];
+    const real = WebSocket.prototype.send as (this: WebSocket, ...a: unknown[]) => void;
+    let raw = 1_000_000_000;
+    // Before the probe reaches Chrome: navigate to the other site with enough iframes that the
+    // world's numeric id now names a page world there, and prove it does by evaluating in it.
+    const rebuildRaceThenSend = async (socket: WebSocket, data: unknown, rest: unknown[]) => {
+      const answers = new Map<number, { result?: { result?: { value?: unknown } } }>();
+      const onMessage = (m: WebSocket.RawData) => {
+        const r = JSON.parse(String(m)) as { id?: number; result?: { result?: { value?: unknown } } };
+        if (r.id !== undefined && r.id >= 1_000_000_000) answers.set(r.id, r);
+      };
+      socket.on('message', onMessage);
+      try {
+        real.call(socket, JSON.stringify({ id: raw++, method: 'Page.navigate', params: { url: `${otherSite}?n=${Math.min(200, worldId! * 2 + 10)}` } }));
+        for (let i = 0; i < 100 && !hazard; i++) {
+          await sleep(50);
+          const id = raw++;
+          // Proof that the id now names a world of the new page: the page's own PerformanceObserver is there.
+          const expression = 'String(new PerformanceObserver(() => {}).takeRecords()[0]?.value) + " " + top.location.origin';
+          real.call(socket, JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, contextId: worldId, returnByValue: true } }));
+          for (let j = 0; j < 20 && !answers.has(id); j++) await sleep(10);
+          hazard = answers.get(id)?.result?.result?.value === `0.777 ${otherOrigin}`;
+        }
+      } finally {
+        socket.off('message', onMessage);
+      }
+      real.call(socket, data, ...rest);
+    };
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      const m = JSON.parse(String(data)) as { id?: number; method?: string; params?: Record<string, unknown> };
+      if (m.method === 'Page.createIsolatedWorld') {
+        createId = m.id;
+        const onAnswer = (raw: WebSocket.RawData) => {
+          const r = JSON.parse(String(raw)) as { id?: number; result?: { executionContextId?: number } };
+          if (r.id !== createId) return;
+          worldId = r.result?.executionContextId;
+          this.off('message', onAnswer);
+        };
+        this.on('message', onAnswer);
+      }
+      if (isProbe(m) && worldId !== undefined) {
+        probes.push(m.params ?? {});
+        void rebuildRaceThenSend(this, data, rest);
+        return;
+      }
+      return real.call(this, data, ...rest);
+    });
+    let r: Awaited<ReturnType<typeof call>>;
+    try {
+      r = await call({ method: 'metrics' });
+    } finally {
+      spy.mockRestore();
+    }
+    console.log(`reuse race: world id ${worldId}, page world now holds it: ${hazard}, vitals ${JSON.stringify((r.data as MetricsData).vitals)}, ${(r.data as MetricsData).vitalsError}`);
+    expect(hazard, 'the numeric id of our world did not come to name a page world on the other site').toBe(true);
+    expect(probes).toHaveLength(1);
+    expect(probes[0]).not.toHaveProperty('contextId');
+    expect(r.success, r.error).toBe(true);
+    const d = r.data as MetricsData;
+    // The probe found its world gone and said so; it never ran where the page's 0.777 shift lives.
+    expect(d.vitals).toBeNull();
+    expect(d.vitalsError).toBe('Chrome refused to run the vitals probe.');
+  }, 60_000);
+
+  it('reuses one world per document: repeated calls and navigations make no extra worlds', async () => {
+    const docs = [servers.quiet.url, `${servers.quiet.url}?same-process`, servers.quiet.url.replace('127.0.0.1', 'localhost')];
+    const creates: string[] = [];
+    const announced: string[] = [];
+    const probed: string[] = [];
+    let doc = '';
+    let socket: WebSocket | undefined;
+    const onMessage = (raw: WebSocket.RawData) => {
+      const m = JSON.parse(String(raw)) as { method?: string; params?: { context?: { name?: string; uniqueId?: string } } };
+      if (m.method === 'Runtime.executionContextCreated' && m.params?.context?.name === 'control-metrics') announced.push(doc);
+    };
+    const real = WebSocket.prototype.send;
+    const spy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: unknown, ...rest: unknown[]) {
+      if (!socket) {
+        socket = this;
+        this.on('message', onMessage);
+      }
+      const m = JSON.parse(String(data)) as { method?: string; params?: Record<string, unknown> };
+      if (m.method === 'Page.createIsolatedWorld') creates.push(doc);
+      if (isProbe(m)) probed.push(`${doc} ${String(m.params?.uniqueContextId)}`);
+      return (real as (...a: unknown[]) => void).call(this, data, ...rest);
+    });
+    try {
+      for (const url of docs) {
+        doc = url;
+        await open(url);
+        for (let i = 0; i < 5; i++) {
+          const d = await metrics();
+          expect(d.vitals, d.vitalsError).toEqual({ lcp: d.vitals?.lcp ?? null, cls: 0, shiftCount: 0, inp: null });
+        }
+      }
+    } finally {
+      spy.mockRestore();
+      socket?.off('message', onMessage);
+    }
+    const per = (list: string[], url: string) => list.filter((x) => x === url).length;
+    for (const url of docs) {
+      const ids = new Set(probed.filter((x) => x.split(' ')[0] === url).map((x) => x.split(' ')[1]));
+      console.log(`${url}: ${per(creates, url)} createIsolatedWorld, ${per(announced, url)} control-metrics announcements, ${ids.size} unique id(s) over 5 calls`);
+      expect(ids.size).toBe(1);
+      expect(probed.filter((x) => x.split(' ')[0] === url)).toHaveLength(5);
+    }
+    // Three documents, three worlds: one per document, never one per call.
+    expect(new Set(probed.map((x) => x.split(' ')[1])).size).toBe(3);
+    expect(announced.length).toBeLessThanOrEqual(3);
   }, 60_000);
 
   it('finds the main frame without the frame tree, so a 5MB iframe name never reaches Node', async () => {

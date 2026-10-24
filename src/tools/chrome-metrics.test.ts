@@ -1,4 +1,6 @@
+import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
+import { ExecutionContextMap, waitForCdpEventMatching } from './cdp-events.js';
 import {
   MAX_VITAL_ENTRIES,
   TAB_CHANGED,
@@ -320,32 +322,89 @@ describe('pageVitals: numbers outside a sane domain', () => {
 interface FakeMetricsOptions {
   /** Per method: 'reject' (no answer), 'error' (Chrome answers with an error), or the result to answer. */
   answers?: Record<string, 'reject' | 'error' | unknown>;
+  /** Per method, answers used one per call, in order, before falling back to answers. */
+  sequence?: Record<string, ('reject' | 'error' | unknown)[]>;
   /** Runs before a method is answered. */
   onSend?: (method: string) => void | Promise<void>;
+  /** When Chrome announces each world it makes: before its answer (Chrome's own order), after it, or never. */
+  announce?: 'before' | 'after' | 'never';
+  /** The contexts announced for the world made with this numeric id; by default that world alone. */
+  contexts?: (id: number) => unknown[];
 }
 
-/** A fake CDP with Chrome's answers for one metrics call; records every command. */
+/** The context Chrome announces for a world made in frame T1 by Page.createIsolatedWorld. */
+const ourWorld = (id: number, extra: Record<string, unknown> = {}) => ({
+  id,
+  uniqueId: `U-${id}`,
+  name: 'control-metrics',
+  origin: 'http://127.0.0.1:1',
+  auxData: { frameId: 'T1', isDefault: false, type: 'isolated' },
+  ...extra,
+});
+
+const CREATED = 'Runtime.executionContextCreated';
+
+/**
+ * A fake CDP with Chrome's answers for metrics calls; records every command. Each world it makes has
+ * the next numeric id from 77, announced as a 'cdp' event on its emitter as Chrome does.
+ */
 function fakeCdp(options: FakeMetricsOptions = {}) {
   const sent: { method: string; params?: Record<string, unknown>; timeoutMs?: number }[] = [];
+  const emitter = new EventEmitter();
+  // As the client does: the map first, then the re-emit.
+  const contexts = new ExecutionContextMap();
+  const emit = (event: { method: string; params?: Record<string, unknown> }) => {
+    contexts.onEvent(event);
+    emitter.emit('cdp', event);
+  };
+  const waits: number[] = [];
+  let nextWorld = 77;
+  const announce = (id: number) => {
+    for (const context of options.contexts?.(id) ?? [ourWorld(id)]) emit({ method: CREATED, params: { context } });
+  };
   const defaults: Record<string, unknown> = {
     'Performance.enable': {},
     'Performance.getMetrics': { metrics: [{ name: 'Nodes', value: 42 }, { name: 'JSHeapUsedSize', value: 1000 }] },
     'Performance.disable': {},
-    'Page.createIsolatedWorld': { executionContextId: 77 },
     'Runtime.evaluate': { result: { value: { lcp: [], shifts: [{ value: 0.25, startTime: 10, hadRecentInput: false }], events: [] } } },
   };
   const cdp: MetricsCdp = {
     sendCommand: async (method, params, timeoutMs) => {
       sent.push({ method, params, timeoutMs });
       await options.onSend?.(method);
-      const answer = options.answers && method in options.answers ? options.answers[method] : defaults[method];
+      const queued = options.sequence?.[method];
+      const answer = queued?.length
+        ? queued.shift()
+        : options.answers && method in options.answers ? options.answers[method] : defaults[method];
       if (answer === 'reject') throw new Error(`Command ${method} timed out after 30s`);
       if (answer === 'error') return { error: { message: `${method} refused` } };
+      if (method === 'Page.createIsolatedWorld' && answer === undefined) {
+        const id = nextWorld++;
+        if (options.announce === 'after') setTimeout(() => announce(id), 5);
+        else if (options.announce !== 'never') announce(id);
+        return { result: { executionContextId: id } };
+      }
       return { result: answer };
     },
+    executionContext: (id) => contexts.get(id),
+    waitForEventMatching: (method, predicate, timeoutMs, signal) => {
+      waits.push(timeoutMs);
+      return waitForCdpEventMatching(emitter, method, predicate, timeoutMs, signal);
+    },
   };
-  return { cdp, sent, methods: () => sent.map((x) => x.method) };
+  return {
+    cdp,
+    sent,
+    emitter,
+    waits,
+    /** Chrome announces a context outside any command, as on a navigation. */
+    announce: (context: unknown) => emit({ method: CREATED, params: { context } }),
+    methods: () => sent.map((x) => x.method),
+    evaluates: () => sent.filter((x) => x.method === 'Runtime.evaluate').map((x) => x.params ?? {}),
+  };
 }
+
+type VitalsData = { metrics: Record<string, unknown>; vitals: unknown; vitalsError?: string };
 
 describe('readMetrics', () => {
   const always = () => true;
@@ -365,8 +424,13 @@ describe('readMetrics', () => {
     // The page target's id is its main frame's id: no frame tree (page names and URLs) is fetched.
     expect(f.sent[3].params).toEqual({ frameId: 'T1', worldName: 'control-metrics' });
     const evaluate = f.sent[4];
-    expect(evaluate.params).toMatchObject({ contextId: 77, returnByValue: true, awaitPromise: true });
+    // The world is addressed by the unique id Chrome announced for it, never by its numeric id.
+    expect(evaluate.params).toMatchObject({ uniqueContextId: 'U-77', returnByValue: true, awaitPromise: true });
+    expect(evaluate.params).not.toHaveProperty('contextId');
     expect(evaluate.timeoutMs).toBe(10_000);
+    // Announced before the answer, so found in the map without waiting.
+    expect(f.waits).toEqual([]);
+    expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
   });
 
   it.each([
@@ -382,6 +446,135 @@ describe('readMetrics', () => {
     expect(d.vitals).toBeNull();
     expect(d.vitalsError).toMatch(/separate JS world/);
     expect(f.methods()).not.toContain('Runtime.evaluate');
+  });
+
+  it('takes the unique id from an announcement that comes after the answer', async () => {
+    const f = fakeCdp({ announce: 'after' });
+    const r = await readMetrics(f.cdp, always, 'T1');
+    expect((r.data as VitalsData).vitals).toEqual({ lcp: null, cls: 0.25, shiftCount: 1, inp: null });
+    expect(f.evaluates()).toHaveLength(1);
+    expect(f.evaluates()[0]).toMatchObject({ uniqueContextId: 'U-77' });
+    expect(f.evaluates()[0]).not.toHaveProperty('contextId');
+    expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
+    // Unless told otherwise, the announcement may come up to 2s after the answer.
+    expect(f.waits.at(-1)).toBe(2000);
+  });
+
+  it('gives vitals null, and sends no probe, when Chrome never announces the world', async () => {
+    const f = fakeCdp({ announce: 'never' });
+    const started = Date.now();
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+    expect(Date.now() - started).toBeLessThan(2000);
+    const d = r.data as VitalsData;
+    expect(r.success).toBe(true);
+    expect(d.metrics.nodes).toBe(42);
+    expect(d.vitals).toBeNull();
+    expect(d.vitalsError).toMatch(/did not announce/);
+    expect(f.methods()).not.toContain('Runtime.evaluate');
+    expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
+  });
+
+  it('stops waiting, with vitals null, when the connection is torn down', async () => {
+    const f = fakeCdp({
+      announce: 'never',
+      onSend: (m) => { if (m === 'Page.createIsolatedWorld') setTimeout(() => f.emitter.emit('teardown'), 5); },
+    });
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 60_000 });
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toMatch(/did not announce/);
+    expect(f.methods()).not.toContain('Runtime.evaluate');
+    expect(f.emitter.listenerCount('cdp') + f.emitter.listenerCount('teardown')).toBe(0);
+  });
+
+  // Each is the only announcement with a chance to match: none is the world the command made.
+  const page = { name: '', auxData: { frameId: 'T1', isDefault: true, type: 'default' } };
+  const refused = /names another context/;
+  const missing = /did not announce/;
+  it.each([
+    ["the page's own world, with the same numeric id (the reuse hazard)", (id: number) => [ourWorld(id, page)], refused],
+    ['a world of another name', (id: number) => [ourWorld(id, { name: 'other-tool' })], refused],
+    ['our world name in another frame', (id: number) => [ourWorld(id, { auxData: { frameId: 'F2', isDefault: false, type: 'isolated' } })], refused],
+    ['our world name with type default', (id: number) => [ourWorld(id, { auxData: { frameId: 'T1', isDefault: false, type: 'default' } })], refused],
+    ['a context without auxData', (id: number) => [ourWorld(id, { auxData: undefined })], refused],
+    ['our world in this frame with another numeric id', (id: number) => [ourWorld(id + 100)], missing],
+    ['a context that is not an object', () => ['control-metrics'], missing],
+  ])('ignores %s: vitals null and no probe', async (_label, contexts, why) => {
+    const f = fakeCdp({ contexts });
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toMatch(why);
+    expect(f.evaluates()).toEqual([]);
+  });
+
+  it('refuses when the page took over the number after our world was announced', async () => {
+    const f = fakeCdp({ contexts: (id) => [ourWorld(id), ourWorld(id, { ...page, uniqueId: 'PAGE' })] });
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+    expect((r.data as VitalsData).vitalsError).toMatch(refused);
+    expect(f.evaluates()).toEqual([]);
+  });
+
+  it("refuses, without waiting, a number Chrome last announced as the page's own world", async () => {
+    const f = fakeCdp({ announce: 'never' });
+    f.announce(ourWorld(77, { ...page, uniqueId: 'PAGE' }));
+    const r = await readMetrics(f.cdp, always, 'T1');
+    expect((r.data as VitalsData).vitals).toBeNull();
+    expect((r.data as VitalsData).vitalsError).toMatch(refused);
+    expect(f.evaluates()).toEqual([]);
+    expect(f.waits).toEqual([]);
+  });
+
+  it('uses the world Chrome rebuilt and announced on navigation, when the answer brings no announcement', async () => {
+    // Measured in headless Chrome: after a same-process navigation the world is announced with the
+    // new document, and createIsolatedWorld then answers with its id and announces nothing.
+    const f = fakeCdp({ announce: 'never' });
+    f.announce(ourWorld(77, { uniqueId: 'REBUILT' }));
+    const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+    expect((r.data as VitalsData).vitals).toEqual({ lcp: null, cls: 0.25, shiftCount: 1, inp: null });
+    expect(f.evaluates()).toEqual([expect.objectContaining({ uniqueContextId: 'REBUILT' })]);
+    expect(f.evaluates()[0]).not.toHaveProperty('contextId');
+    expect(f.waits).toEqual([]);
+  });
+
+  it.each(['before', 'after'] as const)('picks our world out of others announced %s the answer', async (announce) => {
+    const evil = { uniqueId: 'EVIL' };
+    const f = fakeCdp({
+      announce,
+      contexts: (id) => [
+        ourWorld(id, { ...page, ...evil }),
+        ourWorld(id, { name: 'other-tool', ...evil }),
+        ourWorld(id, { auxData: { frameId: 'F2', isDefault: false, type: 'isolated' }, ...evil }),
+        ourWorld(id + 100, evil),
+        ourWorld(id),
+      ],
+    });
+    const r = await readMetrics(f.cdp, always, 'T1');
+    expect((r.data as VitalsData).vitals).not.toBeNull();
+    expect(f.evaluates()).toEqual([expect.objectContaining({ uniqueContextId: 'U-77' })]);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['not a string', 77],
+    ['empty', ''],
+    ['10k characters', 'u'.repeat(10_000)],
+  ])('gives vitals null, in our own words, when the unique id is %s', async (_label, uniqueId) => {
+    // The map skips such a context: announced before the answer it is a miss, after it a refusal.
+    for (const [announce, why] of [['before', /did not announce/], ['after', /no usable id/]] as const) {
+      const f = fakeCdp({ announce, contexts: (id) => [ourWorld(id, { uniqueId })] });
+      const r = await readMetrics(f.cdp, always, 'T1', { contextWaitMs: 50 });
+      const d = r.data as VitalsData;
+      expect(d.vitals).toBeNull();
+      expect(d.vitalsError).toMatch(why);
+      expect(d.vitalsError!.length).toBeLessThan(200);
+      expect(f.evaluates()).toEqual([]);
+    }
+  });
+
+
+  it('accepts a unique id of 200 characters', async () => {
+    const f = fakeCdp({ contexts: (id) => [ourWorld(id, { uniqueId: 'u'.repeat(200) })] });
+    await readMetrics(f.cdp, always, 'T1');
+    expect(f.evaluates()).toEqual([expect.objectContaining({ uniqueContextId: 'u'.repeat(200) })]);
   });
 
   it('gives vitals null, and sends no probe, without a target id to make the world in', async () => {
