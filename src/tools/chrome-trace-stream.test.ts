@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MAX_EVENT_BYTES, TraceEventScanner, scanTraceEvents, type ScanResult } from './chrome-trace-stream.js';
+import { MAX_DEPTH, MAX_EVENT_BYTES, TraceEventScanner, scanTraceEvents, type ScanResult } from './chrome-trace-stream.js';
 
 type Event = Record<string, unknown>;
 
@@ -130,6 +130,64 @@ describe('TraceEventScanner', () => {
     }
   });
 
+  it('limits an element to 4MB and nesting to 100,000 levels', () => {
+    expect(MAX_EVENT_BYTES).toBe(4 * 1024 * 1024);
+    expect(MAX_DEPTH).toBe(100_000);
+  });
+
+  it('parses an element nested exactly MAX_DEPTH deep, and skips and counts one level deeper', () => {
+    const deep = (n: number) => `{"d":${'['.repeat(n - 1)}${']'.repeat(n - 1)}}`;
+    expect(scan(`[${deep(MAX_DEPTH)},{"n":1}]`, 4096)).toMatchObject({ state: 'done', oversized: 0 });
+    expect(scan(`[${deep(MAX_DEPTH)},{"n":1}]`, 4096).events).toHaveLength(2);
+    expect(scan(`[${deep(MAX_DEPTH + 1)},{"n":1}]`, 4096)).toMatchObject({ state: 'done', oversized: 1, events: [{ n: 1 }] });
+  });
+
+  it('keeps its bracket stack small on a 2,000,000-level bomb in the metadata', () => {
+    const scanner = new TraceEventScanner(() => {});
+    scanner.write(Buffer.from('{"m":' + '['.repeat(2_000_000)));
+    expect(scanner.stackBytes).toBeLessThanOrEqual(Math.ceil(MAX_DEPTH / 8) * 2);
+    scanner.write(Buffer.from(']'.repeat(2_000_000) + ',"traceEvents":[{"n":1}]}'));
+    expect(scanner.state).toBe('done');
+  });
+
+  it('says a file that starts with a byte-order mark has no traceEvents array, as JSON.parse refuses it too', () => {
+    expect(scan('\uFEFF{"traceEvents":[]}').state).toBe('noEvents');
+  });
+
+  it('reads primitive and string elements split at every chunk size', () => {
+    const text = '[123456789,"a\\"b\\\\c}]",{"n":1},true,-1.5e10,null,"",{"m":"\\u00e9"}]';
+    const expected = parsedEvents(text);
+    expect(expected).toEqual([{ n: 1 }, { m: 'é' }]);
+    for (let size = 1; size <= text.length; size++) {
+      const r = scan(text, size);
+      expect(r.state, `chunk ${size}`).toBe('done');
+      expect(r.events, `chunk ${size}`).toEqual(expected);
+    }
+  });
+
+  it('holds one growing buffer, not a view per chunk, for an element fed a byte at a time', () => {
+    const element = `{"s":"${'x'.repeat(1024 * 1024)}"}`;
+    const bytes = Buffer.from(`[${element},{"n":1}]`);
+    const events: Event[] = [];
+    const scanner = new TraceEventScanner((e) => { events.push(e); });
+    const started = Date.now();
+    let most = 0;
+    for (let i = 0; i < bytes.length; i++) {
+      scanner.write(bytes.subarray(i, i + 1));
+      most = Math.max(most, scanner.pendingBuffers);
+    }
+    expect(scanner.state).toBe('done');
+    expect(events).toHaveLength(2);
+    expect(most).toBe(1);
+    expect(scanner.pendingBuffers).toBe(0);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('skips an oversized element that spans many chunks at the real limit, then reads the next one', () => {
+    const big = `{"s":"${'x'.repeat(MAX_EVENT_BYTES)}"}`;
+    expect(scan(`[${big},{"n":1}]`, 64 * 1024)).toMatchObject({ state: 'done', oversized: 1, events: [{ n: 1 }] });
+  });
+
   it('handles an element nested 10,000 deep without a stack overflow, and metadata as deep', () => {
     const deep = '['.repeat(10_000) + ']'.repeat(10_000);
     const text = `{"m":${deep},"traceEvents":[{"d":${deep}},{"n":1}]}`;
@@ -139,11 +197,12 @@ describe('TraceEventScanner', () => {
     expect(r.events[1]).toEqual({ n: 1 });
   });
 
-  it('reads an 8MB string inside an element', () => {
-    const big = 'x'.repeat(8 * 1024 * 1024);
+  it('reads a 3.5MB string inside an element, and skips and counts an 8MB one', () => {
+    const big = 'x'.repeat(3.5 * 1024 * 1024);
     const r = scan(`[{"s":"${big}"},{"n":1}]`);
     expect(r.events).toHaveLength(2);
     expect((r.events[0].s as string).length).toBe(big.length);
+    expect(scan(`[{"s":"${'x'.repeat(8 * 1024 * 1024)}"},{"n":1}]`)).toMatchObject({ oversized: 1, events: [{ n: 1 }] });
   });
 
   it('parses an element of exactly the size limit and skips, counts, one byte over', () => {
@@ -154,6 +213,9 @@ describe('TraceEventScanner', () => {
     expect(at.events).toHaveLength(2);
     const over = scan(`[${pad(MAX_EVENT_BYTES + 1)},{"n":1}]`);
     expect(over).toMatchObject({ state: 'done', oversized: 1, events: [{ n: 1 }] });
+    // The same, with each element inside one chunk: the limit holds without the copy path.
+    expect(scan(`[${pad(MAX_EVENT_BYTES)},{"n":1}]`, Infinity)).toMatchObject({ state: 'done', oversized: 0 });
+    expect(scan(`[${pad(MAX_EVENT_BYTES + 1)},{"n":1}]`, Infinity)).toMatchObject({ state: 'done', oversized: 1, events: [{ n: 1 }] });
   });
 
   it('counts an oversized element made of many chunks without keeping them', () => {
@@ -228,6 +290,14 @@ describe('scanTraceEvents', () => {
     expect(seen.finished).toBe(true);
   });
 
+  it('accepts an array that closes at the cap across several chunks, and refuses one that closes a byte past it', async () => {
+    const parts = ['[{"a":', '1},', '{"b":2}', ']'];
+    const total = parts.join('').length;
+    const run = (maxBytes: number) => scanTraceEvents(counted(parts.map((p) => Buffer.from(p))).source, () => {}, options({ maxBytes }));
+    expect(await run(total)).toMatchObject({ end: 'done', events: 2 });
+    expect(await run(total - 1)).toEqual({ end: 'tooBig' });
+  });
+
   it('accepts a source whose array closes exactly at the cap, even with more bytes after it', async () => {
     const text = '[{"a":1}]';
     const { source } = counted([Buffer.from(text + '   garbage')]);
@@ -283,6 +353,77 @@ describe('scanTraceEvents', () => {
   ] as const)('ends %s as %s', async (text, end) => {
     const { source } = counted([Buffer.from(text)]);
     expect(await scanTraceEvents(source, () => {}, options())).toEqual({ end } satisfies ScanResult);
+  });
+
+  describe('closes the source on every way out', () => {
+    /** A source that records return(); next() gives the chunks, then whatever end says. */
+    const tracked = (chunks: string[], end: 'done' | 'throw' | 'stall' = 'done', returnNever = false) => {
+      const state = { returned: 0 };
+      let i = 0;
+      const it: AsyncIterator<Buffer> = {
+        next: () => {
+          if (i < chunks.length) return Promise.resolve({ done: false, value: Buffer.from(chunks[i++]) });
+          if (end === 'throw') return Promise.reject(new Error('disk gone'));
+          if (end === 'stall') return new Promise(() => {});
+          return Promise.resolve({ done: true, value: undefined });
+        },
+        return: () => {
+          state.returned++;
+          return returnNever ? new Promise(() => {}) : Promise.resolve({ done: true, value: undefined });
+        },
+      };
+      return { source: { [Symbol.asyncIterator]: () => it }, state };
+    };
+
+    it.each([
+      ['the end of the array', ['[{"a":1}]', 'more'], {}, { end: 'done' }],
+      ['a normal end of input', ['[{"a":1}', ' '], {}, { end: 'invalid' }],
+      ['no traceEvents', ['{"a":1}'], {}, { end: 'noEvents' }],
+      ['the byte cap', ['[{"a":1},', '{"b":2}]'], { maxBytes: 10 }, { end: 'tooBig' }],
+    ] as const)('on %s', async (_label, chunks, extra, result) => {
+      const t = tracked([...chunks]);
+      expect(await scanTraceEvents(t.source, () => {}, options(extra))).toMatchObject(result);
+      expect(t.state.returned).toBe(1);
+    });
+
+    it('when the consumer stops', async () => {
+      const t = tracked(['[{"a":1},{"b":2}]']);
+      expect(await scanTraceEvents(t.source, () => false, options())).toEqual({ end: 'stopped' });
+      expect(t.state.returned).toBe(1);
+    });
+
+    it('when the consumer throws', async () => {
+      const t = tracked(['[{"a":1}]']);
+      await expect(scanTraceEvents(t.source, () => { throw new Error('consumer'); }, options())).rejects.toThrow('consumer');
+      expect(t.state.returned).toBe(1);
+    });
+
+    it('when the source throws', async () => {
+      const t = tracked(['[{"a":1},'], 'throw');
+      await expect(scanTraceEvents(t.source, () => {}, options())).rejects.toThrow('disk gone');
+      expect(t.state.returned).toBe(1);
+    });
+
+    it('at the deadline on its clock', async () => {
+      let now = 0;
+      const t = tracked(['[', '{"a":1},', '{"a":1},', '{"a":1}]']);
+      expect(await scanTraceEvents(t.source, () => {}, options({ deadline: 3, now: () => now++ }))).toEqual({ end: 'timeout' });
+      expect(t.state.returned).toBe(1);
+    });
+
+    it('at the deadline while the source stalls: asked, not awaited', async () => {
+      const t = tracked(['['], 'stall', true);
+      expect(await scanTraceEvents(t.source, () => {}, options({ deadline: Date.now() + 50 }))).toEqual({ end: 'timeout' });
+      expect(t.state.returned).toBe(1);
+    });
+
+    it.each(['done', 'invalid'] as const)('and returns even when return() never answers (%s)', async (how) => {
+      const t = tracked([how === 'done' ? '[{"a":1}]' : '[{"a":1}'], 'done', true);
+      const started = Date.now();
+      expect(await scanTraceEvents(t.source, () => {}, options({ closeWaitMs: 50 }))).toMatchObject({ end: how });
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(t.state.returned).toBe(1);
+    });
   });
 
   it('throws what the source throws', async () => {

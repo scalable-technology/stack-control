@@ -4,18 +4,35 @@
  * A trace is one JSON document: an object with a traceEvents array, or a bare array of events.
  * Parsing it whole holds the text and every event at once (a real 8s profile is 184MB of text and
  * about 1GB of memory). This scanner walks the bytes instead and hands each element of the event
- * array to JSON.parse on its own, so memory is what the caller keeps.
+ * array to JSON.parse on its own. What it holds besides what the caller keeps: the element being
+ * read (at most MAX_EVENT_BYTES, in one growing buffer), its decoded text and parsed value while
+ * it is parsed, and a bit per open bracket up to MAX_DEPTH levels (12.5KB).
  *
  * It reads raw UTF-8: every byte it looks at ({ } [ ] " \ , : and whitespace) is ASCII, and no
  * byte of a multi-byte character is in that range, so an element's bytes are decoded only once it
- * is whole. It is iterative (a depth counter and a bit per level, no recursion), checks strings,
- * brackets and the array's commas, and leaves the rest of each element to JSON.parse. The top
- * object's other values are skipped with the same checks. It stops at the end of the array:
- * whatever follows (metadata, garbage) is not read.
+ * is whole. It is iterative (a depth counter and a bit per level, no recursion). It checks only
+ * what it reads: strings, brackets up to MAX_DEPTH, the keys and colons and commas of the top
+ * object, and the commas of the event array. JSON.parse checks each element. The top object's
+ * other values are skipped with the bracket and string checks alone, so {"metadata":[tru],
+ * "traceEvents":[...]} is read; and it stops at the end of the array, so whatever follows
+ * (metadata, garbage, a missing closing brace) is not read either. A byte-order mark is not
+ * JSON (JSON.parse refuses it), so a file that starts with one has no traceEvents array.
  */
 
-/** An element over this many bytes is skipped and counted, not parsed. A real event is a few KB. */
-export const MAX_EVENT_BYTES = 16 * 1024 * 1024;
+/**
+ * An element over this many bytes is skipped and counted, not parsed. Real events are a few KB
+ * (a screenshot, the largest, a few hundred KB). Parsing one costs more than its text: the text
+ * as a JS string and the parsed value. Measured at 4MB (node 22): nested empty arrays took up to
+ * 230MB while parsed and 90-260ms, arrays 50,000 deep 320ms; strings and numbers under 20ms.
+ */
+export const MAX_EVENT_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Brackets nested deeper than this are not matched, so the stack of open brackets stays 12.5KB
+ * however deep a hostile file goes; an element that goes deeper is skipped and counted with the
+ * oversized ones. Real events nest about 6 deep.
+ */
+export const MAX_DEPTH = 100_000;
 
 export type ScanState = 'scanning' | 'done' | 'invalid' | 'noEvents' | 'stopped';
 
@@ -49,7 +66,7 @@ export class TraceEventScanner {
   state: ScanState = 'scanning';
   /** Object elements handed to the callback. */
   events = 0;
-  /** Elements skipped for being over the size limit. */
+  /** Elements skipped for being over the size or depth limit. */
   oversized = 0;
   /** Bytes read up to the end of the array, or up to now. */
   position = 0;
@@ -67,7 +84,8 @@ export class TraceEventScanner {
   private inString = false;
   private escaped = false;
   private primitive = false;
-  private pieces: Buffer[] = [];
+  /** The bytes of an element that began in an earlier chunk: one buffer, grown by doubling. */
+  private pending: Buffer | null = null;
   private valueBytes = 0;
   private tooLarge = false;
 
@@ -189,6 +207,16 @@ export class TraceEventScanner {
     this.position += i;
   }
 
+  /** Buffers held for the element being read: 0 or 1, however many chunks it came in. */
+  get pendingBuffers(): number {
+    return this.pending ? 1 : 0;
+  }
+
+  /** The bytes the stack of open brackets takes. */
+  get stackBytes(): number {
+    return this.levels.length;
+  }
+
   /** The input ended. Anything short of the end of the array is not a whole document. */
   end(): void {
     if (this.state === 'scanning') this.state = 'invalid';
@@ -213,7 +241,7 @@ export class TraceEventScanner {
     this.inString = false;
     this.escaped = false;
     this.primitive = false;
-    this.pieces = [];
+    this.pending = null;
     this.valueBytes = 0;
     this.tooLarge = false;
   }
@@ -267,6 +295,11 @@ export class TraceEventScanner {
   }
 
   private push(isArray: boolean): void {
+    if (this.depth >= MAX_DEPTH) {
+      this.depth++;
+      this.drop();
+      return;
+    }
     const byte = this.depth >> 3;
     if (byte >= this.levels.length) {
       const grown = new Uint8Array(this.levels.length * 2);
@@ -282,19 +315,30 @@ export class TraceEventScanner {
   private pop(isArray: boolean): boolean {
     if (this.depth === 0) return false;
     this.depth--;
+    if (this.depth >= MAX_DEPTH) return true; // not recorded, so not checked
     const wasArray = (this.levels[this.depth >> 3] & (1 << (this.depth & 7))) !== 0;
     return wasArray === isArray;
   }
 
-  /** Holds the part of an element in this chunk, unless the element is already too large to parse. */
+  /** The element will not be parsed: let go of its bytes. */
+  private drop(): void {
+    this.tooLarge = true;
+    this.pending = null;
+  }
+
+  /** Copies the part of an element in this chunk, unless the element is already too large to parse. */
   private keepPiece(chunk: Buffer, start: number, end: number): void {
-    if (!this.capture) return;
+    if (!this.capture || this.tooLarge) return;
+    const length = this.valueBytes;
     this.valueBytes += end - start;
-    if (this.valueBytes > this.maxEventBytes) {
-      this.tooLarge = true;
-      this.pieces = [];
+    if (this.valueBytes > this.maxEventBytes) return this.drop();
+    if (!this.pending || this.pending.length < this.valueBytes) {
+      // Doubling keeps the copying linear in the element's size, however small its chunks.
+      const grown = Buffer.allocUnsafe(Math.min(this.maxEventBytes, Math.max(this.valueBytes, 2 * (this.pending?.length ?? 1024))));
+      this.pending?.copy(grown, 0, 0, length);
+      this.pending = grown;
     }
-    if (!this.tooLarge) this.pieces.push(chunk.subarray(start, end));
+    chunk.copy(this.pending, length, start, end);
   }
 
   private finishValue(chunk: Buffer, start: number, end: number): void {
@@ -304,17 +348,26 @@ export class TraceEventScanner {
       return;
     }
     this.mode = AFTER_ELEMENT;
-    this.keepPiece(chunk, Math.max(start, 0), end);
+    start = Math.max(start, 0);
+    let text: string;
+    if (this.pending === null && !this.tooLarge) {
+      // The whole element is in this chunk: decoded from it, no copy.
+      if (end - start > this.maxEventBytes) this.tooLarge = true;
+      text = this.tooLarge ? '' : chunk.toString('utf8', start, end);
+    } else {
+      this.keepPiece(chunk, start, end);
+      text = this.tooLarge ? '' : this.pending!.toString('utf8', 0, this.valueBytes);
+    }
+    this.pending = null;
     if (this.tooLarge) {
       this.oversized++;
       return;
     }
-    const pieces = this.pieces;
-    this.pieces = [];
     let value: unknown;
     try {
-      value = JSON.parse((pieces.length === 1 ? pieces[0] : Buffer.concat(pieces)).toString('utf8'));
+      value = JSON.parse(text);
     } catch {
+      // A syntax error, or a RangeError V8 throws for a value it cannot hold: either fails the whole scan.
       this.state = 'invalid';
       return;
     }
@@ -339,22 +392,29 @@ export interface ScanOptions {
   /** Bytes read between ticks. */
   yieldBytes?: number;
   maxEventBytes?: number;
+  /** How long to wait for the source to confirm it closed; then the scan returns anyway. */
+  closeWaitMs?: number;
 }
 
 const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 const STALLED = Symbol('stalled');
 
 /**
- * Scans a source of bytes to the end of its event array. Async, and it yields every yieldBytes
- * (1MB), so a large or hostile file never holds the event loop for long; a sync loop could not
- * be stopped. The source is closed when the scan ends, however it ends. Throws what the source throws.
+ * Scans a source of bytes to the end of its event array. Async: it gives the event loop a turn
+ * about every yieldBytes (1MB) scanned, and checks the deadline then and between chunks. What runs
+ * between turns is the scan of up to 1MB plus the JSON.parse of the elements that end in it; one
+ * parse is synchronous, bounded by MAX_EVENT_BYTES (measured worst: 320ms).
+ * However the scan ends, the source is asked to close (its return()); the scan waits up to
+ * closeWaitMs (2s) for that, and not at all when the source stalled, since a source stuck in an
+ * await cannot close until it wakes. Whoever made the source owns what it holds open (a file
+ * stream's fd). Throws what the source throws, or the callback.
  */
 export async function scanTraceEvents(
   source: AsyncIterable<Buffer>,
   onEvent: (event: Record<string, unknown>) => boolean | void,
   options: ScanOptions
 ): Promise<ScanResult> {
-  const { maxBytes, deadline, now = Date.now, tick = nextTurn, yieldBytes = 1024 * 1024 } = options;
+  const { maxBytes, deadline, now = Date.now, tick = nextTurn, yieldBytes = 1024 * 1024, closeWaitMs = 2000 } = options;
   const scanner = new TraceEventScanner(onEvent, options.maxEventBytes);
   const it = source[Symbol.asyncIterator]();
   let pulled = 0;
@@ -402,9 +462,12 @@ export async function scanTraceEvents(
     }
     scanner.end();
   } finally {
-    // A source stuck in an await cannot run its cleanup until it wakes: ask, but do not wait for it.
-    const closing = Promise.resolve(it.return?.()).catch(() => {});
-    if (!stalled) await closing;
+    const closing = (async () => it.return?.())().catch(() => {});
+    if (!stalled) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([closing, new Promise<void>((resolve) => { timer = setTimeout(resolve, closeWaitMs); })]);
+      clearTimeout(timer);
+    }
   }
   if (scanner.state === 'done') {
     return { end: 'done', events: scanner.events, bytes: scanner.position, oversized: scanner.oversized };
