@@ -45,8 +45,8 @@ async function expectExitOnStdinClose(preload: string[]) {
     const [code] = await Promise.race([exited, timeout]);
     expect(code).toBe(0);
   } finally {
-      proc.kill('SIGKILL');
-    }
+    proc.kill('SIGKILL');
+  }
 }
 
 describe('mcp entry', () => {
