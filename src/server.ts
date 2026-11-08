@@ -79,14 +79,18 @@ export async function runControlServer(config: ControlServerConfig = {}) {
 
   await server.connect(transport);
 
-  // Graceful shutdown
-  process.on('SIGINT', async () => {
+  // Graceful shutdown. A closed stdin means the client is gone (MCP stdio
+  // lifecycle); exit then, or any open handle keeps an orphan alive for days.
+  let closing = false;
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
     await server.close();
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', async () => {
-    await server.close();
-    process.exit(0);
-  });
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.stdin.on('end', shutdown);
+  process.stdin.on('close', shutdown);
 }
