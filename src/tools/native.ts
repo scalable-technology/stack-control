@@ -65,7 +65,8 @@ function cleanupSessions(): void {
   }
 }
 
-setInterval(cleanupSessions, 5 * 60 * 1000);
+// Housekeeping only: it must not keep the process alive after the client leaves.
+setInterval(cleanupSessions, 5 * 60 * 1000).unref();
 
 function destroySession(sessionId: string): void {
   const session = sessions.get(sessionId);
